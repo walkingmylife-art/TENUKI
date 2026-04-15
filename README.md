@@ -6,13 +6,13 @@ TENUKI is a XUnity Auto Translator tool built in Rust and powered by a local LLM
 
 **1.1.0**
 
-Setup Overhaul
-Initial setup has been fully automated.
-Pushing automation too far can create its own problems, including the risk of being treated like suspicious software, but the ideal experience is still simple: double-click once and it just works, and when you no longer need it, you can throw the whole folder into the trash.
+Setup Overhaul  
+Initial setup has been fully automated.  
+Pushing automation too far can create its own problems, including the risk of being treated like suspicious software, but the ideal experience is still simple: double-click once and it just works, and when you no longer need it, you can throw the whole folder into the trash.  
 It was a huge amount of work, but I rebuilt the setup process from scratch to make that possible.
 
-Arabic Support
-Arabic support had been quietly added behind the scenes. I spent a lot of time thinking about right-to-left handling and related processing, but since patches already seem to exist for some environments, I decided it was still worth exposing Arabic as a selectable language for people who are fine with direct left-to-right translated output.
+Arabic Support  
+Arabic support had been quietly added behind the scenes. I spent a lot of time thinking about right-to-left handling and related processing, but since patches already seem to exist for some environments, I decided it was still worth exposing Arabic as a selectable language for people who are fine with direct left-to-right translated output.  
 Line-wrapping insertion is now disabled by default for this case.
 
 ## What It Is
@@ -41,6 +41,8 @@ In normal mode, the GUI, core backend, translation server, dictionary handling, 
 ## Endpoints
 
 XUnity Auto Translator
+
+```ini
 [Service]
 Endpoint=CustomTranslate
 FallbackEndpoint=
@@ -49,45 +51,51 @@ FallbackEndpoint=
 Url=http://127.0.0.1:14371/translate
 EnableShortDelay=False
 DisableSpamChecks=True
+````
 
-- `GET /translate?text=...` : text translation
-- `POST /translate` : text translation
+* `GET /translate?text=...` : text translation
+* `POST /translate` : text translation
 
 ### 2. Launcher
-- `src/launcher/`
+
+* `src/launcher/`
 
 Handles initial setup, repair, and pre-launch checks.
 
 ### 3. Separated Configuration
-- `config.toml`
-- `launcher_config.toml`
 
-`config.toml` stores translation behavior, UI settings, and TENUKI server settings.  
+* `config.toml`
+* `launcher_config.toml`
+
+`config.toml` stores translation behavior, UI settings, and TENUKI server settings.
 `launcher_config.toml` stores backend, model, and `llama-server` startup conditions as launcher-specific settings.
 
 ### 4. Translation Modes
-- `structural`
-- `passthrough`
 
-In game mode, TENUKI protects structural boundaries while extracting visible text for translation.  
+* `structural`
+* `passthrough`
+
+In game mode, TENUKI protects structural boundaries while extracting visible text for translation.
 In passthrough mode, it sends the input directly to translation as-is.
 
 ### Public Contents
+
 This repository is mainly intended to publish source code and documentation files.
 
-- `src/`
-- `Cargo.toml`
-- `Cargo.lock`
-- `README.md`
-- `Release Notes.txt`
+* `src/`
+* `Cargo.toml`
+* `Cargo.lock`
+* `README.md`
+* `Release Notes.txt`
 
 ### Runtime Data
+
 The following are used at runtime and are not intended to be included directly in the public repository.
 
-- `runtime/` : downloaded llama.cpp runtime files
-- `models/` : downloaded GGUF model files
-- `dicts/` : dictionary data
-- `profiles/` : structural processing profiles
+* `runtime/` : downloaded llama.cpp runtime files
+* `models/` : downloaded GGUF model files
+* `dicts/` : dictionary data
+* `profiles/` : structural processing profiles
 
 ## Setup
 
@@ -106,16 +114,15 @@ If `launcher_config.toml` does not exist, it is generated automatically.
 
 ## Requirements
 
-- Windows
-- Rust
-- Cargo
+* Windows
+* Rust
+* Cargo
 
 ## Build
 
-``bash
+```bash
 cargo build --release
-
-
+```
 
 # TENUKI
 
@@ -142,57 +149,61 @@ XUnity などの外部入力からテキストを受け取り前処理をして�
 このプロジェクトは、大きく分けて以下の役割に分かれています。
 
 ### 1. 通常動作本体
-- `src/main.rs`
-- `src/backend/`
-- `src/ui/`
+
+* `src/main.rs`
+* `src/backend/`
+* `src/ui/`
 
 通常モードでは、GUI、本体バックエンド、翻訳サーバー、辞書処理、モデル通信をここで扱います。ランタイムとモデルが揃っていれば、起動後そのまま通常モードに入ります。
 
 ## エンドポイント
 
-TENUKI はローカル翻訳サーバーとして動作します。  
+TENUKI はローカル翻訳サーバーとして動作します。
 デフォルトのポートは `14371` です。
 
-- `GET /translate?text=...` : テキスト翻訳
-- `POST /translate` : テキスト翻訳
+* `GET /translate?text=...` : テキスト翻訳
+* `POST /translate` : テキスト翻訳
 
 ### 2. ランチャー
-- `src/launcher/`
+
+* `src/launcher/`
 
 初回セットアップ、修復、起動前チェックを担当します。
 
-
 ### 3. 設定の分離
-- `config.toml`
-- `launcher_config.toml`
 
-`config.toml` は翻訳挙動、UI、TENUKI サーバー設定を持ちます。  
+* `config.toml`
+* `launcher_config.toml`
+
+`config.toml` は翻訳挙動、UI、TENUKI サーバー設定を持ちます。
 `launcher_config.toml` は backend、モデル、`llama-server` 起動条件を持つ、ランチャー専用設定です。
 
 ### 4. 翻訳処理のモード
-- `structural`
-- `passthrough`
 
-ゲームモードでは、構造境界を保護しながら可視テキストを抽出して翻訳します。  
+* `structural`
+* `passthrough`
+
+ゲームモードでは、構造境界を保護しながら可視テキストを抽出して翻訳します。
 パススルーモードでは、入力をそのまま翻訳に渡します。
 
-
 ### 公開対象
+
 このリポジトリでは、主にソースコードと説明ファイルを公開対象としています。
 
-- `src/`
-- `Cargo.toml`
-- `Cargo.lock`
-- `README.md`
-- `Release Notes.txt`
+* `src/`
+* `Cargo.toml`
+* `Cargo.lock`
+* `README.md`
+* `Release Notes.txt`
 
 ### 実行時に使うもの
+
 以下は実行時に使われるデータであり、公開リポジトリにそのまま含める前提ではありません。
 
-- `runtime/` : ダウンロードされた llama.cpp ランタイム
-- `models/` : ダウンロードされた GGUF モデル
-- `dicts/` : 辞書データ
-- `profiles/` : 構造処理内容
+* `runtime/` : ダウンロードされた llama.cpp ランタイム
+* `models/` : ダウンロードされた GGUF モデル
+* `dicts/` : 辞書データ
+* `profiles/` : 構造処理内容
 
 ## セットアップ
 
@@ -211,11 +222,12 @@ TENUKI はダブルクリック1回で自動セットアップ後、起動しま
 
 ## 必要環境
 
-- Windows
-- Rust
-- Cargo
+* Windows
+* Rust
+* Cargo
 
 ## ビルド
 
 ```bash
 cargo build --release
+```
