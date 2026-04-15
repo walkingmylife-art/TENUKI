@@ -1,6 +1,6 @@
 # TENUKI
 
-TENUKI is a game text translation tool built in Rust and powered by a local LLM.
+TENUKI is a XUnity Auto Translator tool built in Rust and powered by a local LLM.
 
 ## Current Version
 
@@ -40,8 +40,15 @@ In normal mode, the GUI, core backend, translation server, dictionary handling, 
 
 ## Endpoints
 
-TENUKI runs as a local translation server.  
-The default port is `14371`.
+XUnity Auto Translator
+[Service]
+Endpoint=CustomTranslate
+FallbackEndpoint=
+
+[Custom]
+Url=http://127.0.0.1:14371/translate
+EnableShortDelay=False
+DisableSpamChecks=True
 
 - `GET /translate?text=...` : text translation
 - `POST /translate` : text translation
