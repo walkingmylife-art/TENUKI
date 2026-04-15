@@ -29,6 +29,14 @@ This project is broadly divided into the following roles.
 
 In normal mode, the GUI, core backend, translation server, dictionary handling, and model communication are handled here. If the runtime and model are already available, the application enters normal mode immediately after launch.
 
+## Endpoints
+
+TENUKI runs as a local translation server.  
+The default port is `14371`.
+
+- `GET /translate?text=...` : text translation
+- `POST /translate` : text translation
+
 ### 2. Launcher
 - `src/launcher/`
 
@@ -123,6 +131,14 @@ XUnity などの外部入力からテキストを受け取り前処理をして�
 - `src/ui/`
 
 通常モードでは、GUI、本体バックエンド、翻訳サーバー、辞書処理、モデル通信をここで扱います。ランタイムとモデルが揃っていれば、起動後そのまま通常モードに入ります。
+
+## エンドポイント
+
+TENUKI はローカル翻訳サーバーとして動作します。  
+デフォルトのポートは `14371` です。
+
+- `GET /translate?text=...` : テキスト翻訳
+- `POST /translate` : テキスト翻訳
 
 ### 2. ランチャー
 - `src/launcher/`
