@@ -6,6 +6,15 @@ TENUKI is a game text translation tool built in Rust and powered by a local LLM.
 
 **1.1.0**
 
+Setup Overhaul
+Initial setup has been fully automated.
+Pushing automation too far can create its own problems, including the risk of being treated like suspicious software, but the ideal experience is still simple: double-click once and it just works, and when you no longer need it, you can throw the whole folder into the trash.
+It was a huge amount of work, but I rebuilt the setup process from scratch to make that possible.
+
+Arabic Support
+Arabic support had been quietly added behind the scenes. I spent a lot of time thinking about right-to-left handling and related processing, but since patches already seem to exist for some environments, I decided it was still worth exposing Arabic as a selectable language for people who are fine with direct left-to-right translated output.
+Line-wrapping insertion is now disabled by default for this case.
+
 ## What It Is
 
 TENUKI receives text from external inputs such as XUnity, preprocesses it, sends it to `llama-server`, stores the local LLM translation result in its dictionary, and returns the response.
