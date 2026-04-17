@@ -29,11 +29,11 @@ This project is broadly divided into the following roles.
 
 In normal mode, the GUI, core backend, translation server, dictionary handling, and model communication are handled here. If the runtime and model are already available, the application enters normal mode immediately after launch.
 
-## Endpoints
+## Endpoint
 
-XUnity Auto Translator
-Config.ini
+XUnity Auto Translator `Config.ini`
 
+```ini
 [Service]
 Endpoint=CustomTranslate
 FallbackEndpoint=
