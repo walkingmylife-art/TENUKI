@@ -2,15 +2,15 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-mod config;
-mod logic;
-mod ui;
-mod messages;
 mod backend;
+mod config;
 mod launcher;
+mod logic;
+mod messages;
+mod ui;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use anyhow::anyhow;
 use serde::Serialize;
 
 use backend::processor::{ProcessorData, ProcessorFactory, TranslationMode};
-use launcher::{show_launcher_screen, LaunchProgress, LauncherUiState};
+use launcher::{show_launcher_screen, LaunchProgress, LauncherStep, LauncherUiState};
 use messages::{BackendEvent, FrontendCommand, LogLevel};
 use ui::container::{LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
 
@@ -78,6 +78,58 @@ fn wait_for_translation_server(port: u16, client: &reqwest::blocking::Client) ->
         thread::sleep(Duration::from_millis(250));
     }
     false
+}
+
+fn provision_launcher_config_from_misplaced(misplaced_path: &Path, launcher_config_path: &Path) {
+    if !misplaced_path.exists() {
+        return;
+    }
+
+    if launcher_config_path.exists() {
+        let backup = misplaced_path.with_extension("toml.bak");
+        let _ = std::fs::rename(misplaced_path, &backup);
+        eprintln!(
+            "[WARN] Misplaced launcher_config.toml at {} - canonical exists, retired to {}",
+            misplaced_path.display(),
+            backup.display()
+        );
+        return;
+    }
+
+    if let Err(e) = std::fs::copy(misplaced_path, launcher_config_path) {
+        eprintln!(
+            "[WARN] Failed to migrate misplaced launcher_config.toml: {}",
+            e
+        );
+    } else {
+        let backup = misplaced_path.with_extension("toml.bak");
+        let _ = std::fs::rename(misplaced_path, &backup);
+        eprintln!(
+            "[INFO] Migrated misplaced launcher_config.toml to {}",
+            launcher_config_path.display()
+        );
+    }
+}
+
+fn provision_runtime_config_before_normal(config_path: &Path) -> bool {
+    match launcher::preflight_runtime_config_for_startup(config_path) {
+        Ok(outcome) => {
+            eprintln!(
+                "[INFO] Runtime config preflight at {} => {:?}",
+                config_path.display(),
+                outcome
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[WARN] Runtime config preflight failed at {}: {}",
+                config_path.display(),
+                e
+            );
+            false
+        }
+    }
 }
 
 fn model_inputs_from_context(ctx: &crate::backend::processor::TranslationContext) -> Vec<String> {
@@ -248,33 +300,7 @@ impl TenukiApp {
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         if let Some(ref dir) = exe_dir {
             let wrong_debug = dir.join("launcher_config.toml");
-            if wrong_debug.exists() {
-                if launcher_config_path.exists() {
-                    // 正配置がすでにあるので、誤配置ファイルは .bak へ退避
-                    let backup = wrong_debug.with_extension("toml.bak");
-                    let _ = std::fs::rename(&wrong_debug, &backup);
-                    eprintln!(
-                        "[WARN] Misplaced launcher_config.toml at {} - canonical exists, retired to {}",
-                        wrong_debug.display(),
-                        backup.display()
-                    );
-                } else {
-                    // 正配置へ移設してから .bak へ退避
-                    if let Err(e) = std::fs::copy(&wrong_debug, &launcher_config_path) {
-                        eprintln!(
-                            "[WARN] Failed to migrate misplaced launcher_config.toml: {}",
-                            e
-                        );
-                    } else {
-                        let backup = wrong_debug.with_extension("toml.bak");
-                        let _ = std::fs::rename(&wrong_debug, &backup);
-                        eprintln!(
-                            "[INFO] Migrated misplaced launcher_config.toml to {}",
-                            launcher_config_path.display()
-                        );
-                    }
-                }
-            }
+            provision_launcher_config_from_misplaced(&wrong_debug, &launcher_config_path);
         }
 
         // 起動ログ
@@ -289,13 +315,19 @@ impl TenukiApp {
         let launcher_cancel = Arc::new(AtomicBool::new(false));
         let launcher_thread = None;
 
-        let config_result = if config_path.exists() {
-            config::load(&config_path)
+        let config_ready_for_normal = if config_path.exists() {
+            provision_runtime_config_before_normal(&config_path)
         } else {
-            Err(anyhow!("Config file not found"))
+            false
         };
 
-        let mode = if launcher::check_ready(&base_dir) {
+        let config_result = if config_ready_for_normal {
+            config::load(&config_path)
+        } else {
+            Err(anyhow!("config.toml is not ready for normal startup"))
+        };
+
+        let mode = if config_ready_for_normal && launcher::check_ready(&base_dir) {
             AppMode::Normal
         } else {
             AppMode::Launcher
@@ -311,14 +343,17 @@ impl TenukiApp {
             .map(|c| c.tgt_lang.clone())
             .unwrap_or_else(|_| "ja".to_string());
 
-        let initial_dict_slot = config_result.as_ref().ok().and_then(|c| c.dict_slot.clone());
+        let initial_dict_slot = config_result
+            .as_ref()
+            .ok()
+            .and_then(|c| c.dict_slot.clone());
 
         let initial_profile = config_result
             .as_ref()
             .map(|c| c.profile.clone())
             .unwrap_or_else(|_| "game".to_string());
-        let initial_profile_runtime = config::load_profile(&config_path, &initial_profile)
-            .unwrap_or_default();
+        let initial_profile_runtime =
+            config::load_profile(&config_path, &initial_profile).unwrap_or_default();
 
         let initial_ui_lang = config_result
             .as_ref()
@@ -387,6 +422,25 @@ impl TenukiApp {
 
     fn start_backend_after_setup(&mut self) {
         if let Some(command_rx) = self.command_rx.take() {
+            if !provision_runtime_config_before_normal(&self.config_path) {
+                self.ui.add_log(
+                    ui::container::LogSource::Tenuki,
+                    "config.toml を current shape に再構成できなかったため launcher へ戻します"
+                        .to_string(),
+                    messages::LogLevel::Error,
+                    messages::current_timestamp(),
+                );
+                self.mode = AppMode::Launcher;
+                self.launcher_state = LauncherUiState::error(
+                    "config.toml を再構成できませんでした。Retry してください。".to_string(),
+                );
+                self.launcher_cancel
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.launcher_thread = None;
+                self.command_rx = Some(command_rx);
+                return;
+            }
+
             let config = match config::load(&self.config_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -401,13 +455,20 @@ impl TenukiApp {
                     );
                     self.ui
                         .set_status(StatusKey::ConfigError, StatusIcon::Warning, true);
-                    // return command_rx so a retry can use it
+                    self.mode = AppMode::Launcher;
+                    self.launcher_state = LauncherUiState::error(format!(
+                        "config.toml 読み込み失敗: {e}"
+                    ));
+                    self.launcher_cancel
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.launcher_thread = None;
                     self.command_rx = Some(command_rx);
                     return;
                 }
             };
 
-            let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
+            let launcher_config_path =
+                launcher::resolve_install_root().join("launcher_config.toml");
             let app_config = match launcher::app_config::AppConfig::load(&launcher_config_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -420,9 +481,10 @@ impl TenukiApp {
                         messages::LogLevel::Error,
                         messages::current_timestamp(),
                     );
-                    // Route back to Launcher so the user can repair/re-run setup
                     self.mode = AppMode::Launcher;
-                    self.launcher_state = LauncherUiState::default();
+                    self.launcher_state = LauncherUiState::error(format!(
+                        "launcher_config.toml 読み込み失敗: {e}"
+                    ));
                     self.launcher_cancel
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.launcher_thread = None;
@@ -482,7 +544,8 @@ impl eframe::App for TenukiApp {
                     self.ui.set_dictionary_loaded(count);
                 }
                 BackendEvent::DictionaryNewEntry(timestamp, original, translated) => {
-                    self.ui.add_dictionary_entry(timestamp, original, translated);
+                    self.ui
+                        .add_dictionary_entry(timestamp, original, translated);
                 }
                 BackendEvent::DictionaryLogEntry(timestamp, original, translated) => {
                     self.ui
@@ -518,7 +581,8 @@ impl eframe::App for TenukiApp {
                     // 停止中に Tenuki が落ちたら Stopped へ遷移する
                     if !running && pt == ProcessType::Tenuki {
                         if self.ui.display.status_key == StatusKey::Stopping {
-                            self.ui.set_status(StatusKey::Stopped, StatusIcon::None, true);
+                            self.ui
+                                .set_status(StatusKey::Stopped, StatusIcon::None, true);
                         }
                     }
                 }
@@ -546,9 +610,11 @@ impl eframe::App for TenukiApp {
                     translator_success,
                 } => {
                     if engine_success && translator_success {
-                        self.ui.set_status(StatusKey::Ready, StatusIcon::Check, true);
+                        self.ui
+                            .set_status(StatusKey::Ready, StatusIcon::Check, true);
                     } else {
-                        self.ui.set_status(StatusKey::Failed, StatusIcon::Warning, true);
+                        self.ui
+                            .set_status(StatusKey::Failed, StatusIcon::Warning, true);
                     }
                 }
                 BackendEvent::ServerMetrics {
@@ -605,9 +671,11 @@ impl eframe::App for TenukiApp {
                             .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
                         self.command_tx.send(FrontendCommand::Start).ok();
                     } else {
-                        // サーバーがなければ Launcher へ戻す
                         self.mode = AppMode::Launcher;
-                        self.launcher_state = LauncherUiState::default();
+                        self.launcher_state = LauncherUiState::error(
+                            "llama-server が見つかりません。セットアップを再実行してください。"
+                                .to_string(),
+                        );
                         self.launcher_cancel.store(false, Ordering::Relaxed);
                         self.launcher_thread = None;
                     }
@@ -624,7 +692,10 @@ impl eframe::App for TenukiApp {
                         self.command_tx.send(FrontendCommand::Restart).ok();
                     } else {
                         self.mode = AppMode::Launcher;
-                        self.launcher_state = LauncherUiState::default();
+                        self.launcher_state = LauncherUiState::error(
+                            "llama-server が見つかりません。セットアップを再実行してください。"
+                                .to_string(),
+                        );
                         self.launcher_cancel.store(false, Ordering::Relaxed);
                         self.launcher_thread = None;
                     }
@@ -642,19 +713,27 @@ impl eframe::App for TenukiApp {
                 if let Some((src, tgt, tgt_name, dict_slot)) = pending_lang_pair {
                     self.ui.update_src_lang(&src);
                     self.ui.update_tgt_lang(&tgt, tgt_name.as_deref());
+                    // dict_slot は送信前にここで確定する。None は「新規スロットが必要」を意味する。
+                    let resolved_slot = dict_slot.unwrap_or_else(|| {
+                        backend::manager::create_new_slot(&tgt, &self.base_dir)
+                            .to_string_lossy()
+                            .to_string()
+                    });
                     self.command_tx
                         .send(FrontendCommand::SetLanguagePair {
                             src,
                             tgt,
                             tgt_name,
-                            dict_slot,
+                            dict_slot: resolved_slot,
                         })
                         .ok();
                 }
                 if let Some(slot) = commands.set_dict_slot.take() {
-                    self.ui.update_dict_slot(slot.clone());
+                    self.ui.update_dict_slot(Some(slot.clone()));
                     self.load_input_records_or_log();
-                    self.command_tx.send(FrontendCommand::SetDictSlot(slot)).ok();
+                    self.command_tx
+                        .send(FrontendCommand::SetDictSlot(slot))
+                        .ok();
                 }
 
                 if let Some(profile_name) = commands.set_profile.take() {
@@ -669,7 +748,9 @@ impl eframe::App for TenukiApp {
                 }
 
                 if let Some(filename) = commands.select_model.take() {
-                    self.command_tx.send(FrontendCommand::SetModel(filename)).ok();
+                    self.command_tx
+                        .send(FrontendCommand::SetModel(filename))
+                        .ok();
                 }
 
                 if let Some(folder) = commands.set_work_folder.take() {

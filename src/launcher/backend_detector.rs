@@ -108,27 +108,24 @@ impl BackendDetector {
         for cmd in ["hipInfo", "rocminfo"] {
             let mut c = std::process::Command::new(cmd);
             c.stdout(std::process::Stdio::null())
-             .stderr(std::process::Stdio::null());
+                .stderr(std::process::Stdio::null());
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::process::CommandExt;
                 c.creation_flags(0x08000000);
             }
-            let ok = c.status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let ok = c.status().map(|s| s.success()).unwrap_or(false);
             if ok {
                 return true;
             }
         }
         false
     }
-
 }
 
 #[cfg(feature = "dxgi")]
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_DESC1, IDXGIAdapter1, IDXGIFactory1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_DESC1,
 };
 
 #[cfg(feature = "dxgi")]
@@ -216,5 +213,48 @@ mod tests {
         let gpus = BackendDetector::enumerate_gpus().unwrap_or_default();
         let candidates = BackendDetector::build_backend_candidate_names(&gpus);
         assert!(!candidates.is_empty());
+    }
+
+    fn gpu(class: GpuClass) -> GpuInfo {
+        GpuInfo {
+            class,
+            dedicated_video_memory: 8 * 1024 * 1024 * 1024,
+        }
+    }
+
+    // --- GPU 候補順 ---
+
+    #[test]
+    fn amd_legacy_yields_vulkan_only() {
+        let names = BackendDetector::build_backend_candidate_names(&[gpu(GpuClass::AmdLegacy)]);
+        assert_eq!(names, vec!["vulkan"]);
+    }
+
+    #[test]
+    fn nvidia_yields_cuda_then_vulkan() {
+        let names = BackendDetector::build_backend_candidate_names(&[gpu(GpuClass::NvidiaAny)]);
+        assert_eq!(names, vec!["cuda", "vulkan"]);
+    }
+
+    #[test]
+    fn no_gpus_yields_vulkan_fallback() {
+        let names = BackendDetector::build_backend_candidate_names(&[]);
+        assert_eq!(names, vec!["vulkan"]);
+    }
+
+    #[test]
+    fn amd_rx9000_without_rocm_yields_vulkan_only() {
+        // hipInfo/rocminfo not present in test env → quick_check_rocm() == false
+        let names =
+            BackendDetector::build_backend_candidate_names(&[gpu(GpuClass::AmdRx9000OrNewer)]);
+        assert_eq!(names, vec!["vulkan"]);
+    }
+
+    #[test]
+    fn deduplication_across_multiple_gpus() {
+        // Two NVIDIA GPUs should not produce duplicate entries
+        let gpus = vec![gpu(GpuClass::NvidiaAny), gpu(GpuClass::NvidiaAny)];
+        let names = BackendDetector::build_backend_candidate_names(&gpus);
+        assert_eq!(names, vec!["cuda", "vulkan"]);
     }
 }

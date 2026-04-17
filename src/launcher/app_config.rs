@@ -43,10 +43,7 @@ impl RuntimeAssetSet {
         }
     }
 
-    pub fn with_extras(
-        primary: impl Into<String>,
-        extra_assets: Vec<String>,
-    ) -> Self {
+    pub fn with_extras(primary: impl Into<String>, extra_assets: Vec<String>) -> Self {
         Self {
             primary: primary.into(),
             extra_assets,
@@ -180,10 +177,10 @@ struct LegacyAppConfig {
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
-            let config = AppConfig::default();
-            config.save(path)?;
-            // default は expected_size が実値なので validate は不要
-            return Ok(config);
+            anyhow::bail!(
+                "launcher_config.toml not found at {}. Run setup to generate it.",
+                path.display()
+            );
         }
 
         let content = std::fs::read_to_string(path)
@@ -265,20 +262,15 @@ impl AppConfig {
             return Ok(());
         }
 
-        // filename が unknown の場合、URL で known tuple を引く
-        if let Some(known) = known_model_tuple_by_url(&self.model.urls.primary) {
-            let name_matches = self.model.filename == known.filename;
-            let size_matches = self.model.expected_size == known.expected_size;
-            if !name_matches || !size_matches {
-                log::warn!(
-                    "Authority tuple diverged (url match): filename='{}' expected='{}' size_ok={} — repairing from known table",
-                    self.model.filename, known.filename, size_matches
-                );
-                self.model.filename = known.filename.to_string();
-                self.model.expected_size = known.expected_size;
-                self.save(path)?;
-            }
-            return Ok(());
+        // filename が unknown の場合、URL 逆引きで filename を書き換えることは禁止。
+        // url だけが known でも filename の変更は authority 破壊になるため fail fast。
+        if known_model_tuple_by_url(&self.model.urls.primary).is_some() {
+            anyhow::bail!(
+                "Authority tuple unresolvable in {}: filename='{}' is unknown but url matches a known model. \
+                 Set a consistent (filename, url, expected_size) tuple in launcher_config.toml.",
+                path.display(),
+                self.model.filename
+            );
         }
 
         // filename も URL も unknown — tuple内部の整合だけ確認する
@@ -313,8 +305,7 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -325,9 +316,12 @@ impl AppConfig {
     fn normalize(&mut self) {
         // 空文字列・空白文字列はすべて None に正規化する
         self.model.urls.fallback = normalize_fallback(self.model.urls.fallback.take());
-        self.runtime_urls.cuda.fallback = normalize_fallback(self.runtime_urls.cuda.fallback.take());
-        self.runtime_urls.vulkan.fallback = normalize_fallback(self.runtime_urls.vulkan.fallback.take());
-        self.runtime_urls.rocm.fallback = normalize_fallback(self.runtime_urls.rocm.fallback.take());
+        self.runtime_urls.cuda.fallback =
+            normalize_fallback(self.runtime_urls.cuda.fallback.take());
+        self.runtime_urls.vulkan.fallback =
+            normalize_fallback(self.runtime_urls.vulkan.fallback.take());
+        self.runtime_urls.rocm.fallback =
+            normalize_fallback(self.runtime_urls.rocm.fallback.take());
         // llama-server ポートが翻訳サーバー(14371)と衝突している旧設定を修復
         if self.server.port == 14371 {
             self.server.port = 8080;
@@ -371,4 +365,117 @@ pub fn known_model_tuple_by_url(url: &str) -> Option<&'static KnownModelTuple> {
         let t_base = t.url.split('?').next().unwrap_or(t.url);
         t_base == url_base
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_config_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tenuki_appcfg_{}", tag));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("launcher_config.toml")
+    }
+
+    // --- authority tuple 修復 ---
+
+    #[test]
+    fn repair_known_filename_fixes_diverged_url_and_size() {
+        let path = temp_config_path("repair_known");
+        let mut cfg = AppConfig::default();
+        cfg.model.filename = "HY-MT1.5-1.8B-Q6_K.gguf".to_string();
+        cfg.model.urls.primary = "https://wrong.example.com/bad.gguf".to_string();
+        cfg.model.expected_size = 1;
+        cfg.save(&path).unwrap();
+
+        let loaded = AppConfig::load(&path).unwrap();
+        let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
+
+        assert_eq!(loaded.model.filename, "HY-MT1.5-1.8B-Q6_K.gguf");
+        assert_eq!(loaded.model.urls.primary, known.url);
+        assert_eq!(loaded.model.expected_size, known.expected_size);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repair_preserves_filename_when_only_url_diverges() {
+        let path = temp_config_path("repair_url_only");
+        let mut cfg = AppConfig::default();
+        cfg.model.filename = "HY-MT1.5-1.8B-Q6_K.gguf".to_string();
+        cfg.model.urls.primary = "https://wrong.example.com/bad.gguf".to_string();
+        // size already correct
+        cfg.model.expected_size = 1_474_785_216;
+        cfg.save(&path).unwrap();
+
+        let loaded = AppConfig::load(&path).unwrap();
+        assert_eq!(loaded.model.filename, "HY-MT1.5-1.8B-Q6_K.gguf");
+        let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
+        assert_eq!(loaded.model.urls.primary, known.url);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // --- authority tuple fail fast ---
+
+    #[test]
+    fn unknown_filename_with_known_url_fails() {
+        let path = temp_config_path("unknown_fn_known_url");
+        let mut cfg = AppConfig::default();
+        cfg.model.filename = "not-a-known-model.gguf".to_string();
+        // use the real known URL
+        cfg.model.urls.primary =
+            "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true"
+                .to_string();
+        cfg.model.expected_size = 1_474_785_216;
+        cfg.save(&path).unwrap();
+
+        let result = AppConfig::load(&path);
+        assert!(
+            result.is_err(),
+            "expected Err: unknown filename + known URL is forbidden"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_filename_with_zero_size_fails() {
+        let path = temp_config_path("unknown_fn_zero_size");
+        let mut cfg = AppConfig::default();
+        cfg.model.filename = "not-a-known-model.gguf".to_string();
+        cfg.model.urls.primary = "https://example.com/custom.gguf".to_string();
+        cfg.model.expected_size = 0;
+        cfg.save(&path).unwrap();
+
+        let result = AppConfig::load(&path);
+        assert!(
+            result.is_err(),
+            "expected Err: unknown filename + expected_size=0"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // --- custom unknown model with valid size is accepted ---
+
+    #[test]
+    fn unknown_filename_with_nonzero_size_and_unknown_url_ok() {
+        let path = temp_config_path("unknown_fn_ok");
+        let mut cfg = AppConfig::default();
+        cfg.model.filename = "my-custom-model.gguf".to_string();
+        cfg.model.urls.primary = "https://example.com/custom.gguf".to_string();
+        cfg.model.expected_size = 9_000_000;
+        cfg.save(&path).unwrap();
+
+        let result = AppConfig::load(&path);
+        assert!(
+            result.is_ok(),
+            "custom tuple with valid size should load: {:?}",
+            result
+        );
+
+        let _ = fs::remove_file(&path);
+    }
 }

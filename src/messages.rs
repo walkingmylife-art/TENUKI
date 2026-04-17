@@ -29,9 +29,14 @@ pub enum FrontendCommand {
     Start,
     Stop,
     Restart,
-    /// dict_slot=Some(path) のとき指定スロットを使用、None のとき新規スロットを作成
-    SetLanguagePair { src: String, tgt: String, tgt_name: Option<String>, dict_slot: Option<String> },
-    SetDictSlot(Option<String>),
+    /// dict_slot は上流で確定済みの commit 済み authority。backend は adopt して save するだけ。
+    SetLanguagePair {
+        src: String,
+        tgt: String,
+        tgt_name: Option<String>,
+        dict_slot: String,
+    },
+    SetDictSlot(String),
     SetProfile(String),
     SetModel(String),
     UpdateSettings {
@@ -48,11 +53,7 @@ impl FrontendCommand {
                 structural,
                 server_port,
                 server_host,
-            } => {
-                structural.is_none()
-                    && server_port.is_none()
-                    && server_host.is_none()
-            }
+            } => structural.is_none() && server_port.is_none() && server_host.is_none(),
             _ => false,
         }
     }
@@ -105,7 +106,7 @@ pub enum LogSource {
 impl std::fmt::Display for LogSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LogSource::Tenuki   => write!(f, "TENUKI"),
+            LogSource::Tenuki => write!(f, "TENUKI"),
             LogSource::LlamaCpp => write!(f, "llama-cpp-2"),
         }
     }

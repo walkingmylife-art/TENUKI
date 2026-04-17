@@ -69,7 +69,10 @@ fn load_txt_files(root_dir: &Path) -> LoadedTxtData {
         let path = entry.path();
 
         if path.is_file() && path.extension().map(|ext| ext == "txt").unwrap_or(false) {
-            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             if !is_excluded(file_name) {
                 read_txt_into(&path, &mut loaded);
             }
@@ -81,9 +84,15 @@ fn load_txt_files(root_dir: &Path) -> LoadedTxtData {
                 for sub_entry in sub_entries.flatten() {
                     let sub_path = sub_entry.path();
                     if sub_path.is_file()
-                        && sub_path.extension().map(|ext| ext == "txt").unwrap_or(false)
+                        && sub_path
+                            .extension()
+                            .map(|ext| ext == "txt")
+                            .unwrap_or(false)
                     {
-                        let sub_name = sub_path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                        let sub_name = sub_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("");
                         if !is_excluded(sub_name) {
                             read_txt_into(&sub_path, &mut loaded);
                         }
@@ -211,7 +220,9 @@ impl Dictionary {
 
                 save_index(&self.bin_file, &self.index);
 
-                let _ = self.event_tx.send(BackendEvent::DictionaryLoaded(self.index.len()));
+                let _ = self
+                    .event_tx
+                    .send(BackendEvent::DictionaryLoaded(self.index.len()));
                 count
             }
             Err(_) => 0,

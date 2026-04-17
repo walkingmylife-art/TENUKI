@@ -19,6 +19,7 @@ pub struct LauncherUiState {
     pub status: String,
     pub sub_status: String,
     pub progress: f32,
+    pub auto_started: bool,
 }
 
 impl Default for LauncherUiState {
@@ -29,6 +30,18 @@ impl Default for LauncherUiState {
             status: String::new(),
             sub_status: String::new(),
             progress: 0.0,
+            auto_started: false,
+        }
+    }
+}
+
+impl LauncherUiState {
+    pub fn error(msg: String) -> Self {
+        Self {
+            step: LauncherStep::Error(msg),
+            stage: LauncherStage::Error,
+            auto_started: true,
+            ..Default::default()
         }
     }
 }
@@ -136,7 +149,10 @@ pub fn show_launcher_screen(
             ui.add_space(20.0);
 
             let (current_step, total_steps) = stage_progress(state.stage);
-            ui.label(format!("{} {} / {}", txt.step_label, current_step, total_steps));
+            ui.label(format!(
+                "{} {} / {}",
+                txt.step_label, current_step, total_steps
+            ));
             ui.add_space(10.0);
 
             let stage_order = [
@@ -253,7 +269,8 @@ pub fn show_launcher_screen(
         });
     });
 
-    if launcher_thread.is_none() {
+    if launcher_thread.is_none() && !state.auto_started {
+        state.auto_started = true;
         *launcher_thread = Some(start_launcher_thread(
             base_dir.to_path_buf(),
             tx.clone(),

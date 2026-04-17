@@ -1,24 +1,24 @@
 //! バックエンドモジュール
 
-mod logger;
-pub(crate) mod process;
-pub mod manager;
 mod analysis;
 mod dictionary;
+mod logger;
+pub mod manager;
 mod normalize;
-pub mod translator;
-mod server;
+pub(crate) mod process;
 pub mod processor;
+mod server;
+pub mod translator;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::messages::{BackendEvent, FrontendCommand, ProcessType};
 use crate::config::Config;
 use crate::launcher::app_config::AppConfig;
+use crate::messages::{BackendEvent, FrontendCommand, ProcessType};
 use manager::{ProcessManager, RestartScope};
 
 /// launcher_config.toml の model.filename が権威。
@@ -30,9 +30,11 @@ fn resolve_selected_model(filename: &str, models: &[PathBuf]) -> Option<PathBuf>
     }
     let authority_name = PathBuf::from(filename);
     let authority_name = authority_name.file_name()?;
-    models.iter().find(|m| m.file_name() == Some(authority_name)).cloned()
+    models
+        .iter()
+        .find(|m| m.file_name() == Some(authority_name))
+        .cloned()
 }
-
 
 pub fn find_available_models(base_dir: &PathBuf) -> Vec<PathBuf> {
     let models_dir = base_dir.join("models");
@@ -63,41 +65,20 @@ pub fn start_backend(
         let selected_model = resolve_selected_model(&app_config.model.filename, &models);
         let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected_model.clone()));
 
-        // dict_slot 初期化
-        let config = {
-            let raw = config.dict_slot.as_deref().map(str::trim).unwrap_or("");
-            let resolved_slot = if raw.is_empty() {
-                Some(manager::find_or_create_slot_under(
-                    &base_dir.join("dicts").join(&config.tgt_lang).join("text"),
-                    &config.tgt_lang,
-                ))
-            } else {
-                let _ = std::fs::create_dir_all(raw);
-                None
-            };
-            if let Some(slot) = resolved_slot {
-                let slot_str = slot.to_string_lossy().to_string();
-                let dict_msg = if config.ui_lang == "en" {
-                    format!("Dictionary folder initialized: {}", slot_str)
-                } else {
-                    format!("辞書フォルダを初期化しました: {}", slot_str)
-                };
+        // dict_slot は preflight で commit 済みの authority。backend は読むだけ。
+        match config.dict_slot.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(slot) => {
+                let _ = std::fs::create_dir_all(slot);
+            }
+            None => {
                 let _ = event_tx.send(BackendEvent::Log(
                     crate::messages::LogSource::Tenuki,
-                    dict_msg,
-                    crate::messages::LogLevel::Info,
+                    "dict_slot が未確定です。preflight が通っていない可能性があります。".to_string(),
+                    crate::messages::LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
-                let _ = event_tx.send(BackendEvent::DictSlotChanged(slot_str.clone()));
-                let config_path = base_dir.join("config.toml");
-                let mut new_config = config;
-                new_config.dict_slot = Some(slot_str);
-                let _ = crate::config::save(&config_path, &new_config);
-                new_config
-            } else {
-                config
             }
-        };
+        }
 
         let mut manager = ProcessManager::new(
             config.clone(),
@@ -144,23 +125,24 @@ pub fn start_backend(
                         manager.stop_all();
                         manager.start_all();
                     }
-                    FrontendCommand::SetLanguagePair { src, tgt, tgt_name, dict_slot } => {
+                    FrontendCommand::SetLanguagePair {
+                        src,
+                        tgt,
+                        tgt_name,
+                        dict_slot,
+                    } => {
                         let mut config = match crate::config::load(&config_path) {
                             Ok(config) => config,
                             Err(_) => return,
                         };
-                        let slot_str = dict_slot.unwrap_or_else(|| {
-                            manager::create_new_slot(&tgt, &base_dir)
-                                .to_string_lossy()
-                                .to_string()
-                        });
+                        let _ = std::fs::create_dir_all(&dict_slot);
                         config.src_lang = src.clone();
                         config.tgt_lang = tgt.clone();
                         config.custom_lang_name = tgt_name.unwrap_or_default();
-                        config.dict_slot = Some(slot_str.clone());
+                        config.dict_slot = Some(dict_slot.clone());
                         let _ = crate::config::save(&config_path, &config);
                         manager.reload_config(&config_path);
-                        let _ = event_tx.send(BackendEvent::DictSlotChanged(slot_str));
+                        let _ = event_tx.send(BackendEvent::DictSlotChanged(dict_slot));
                         let (engine_ok, translator_ok) =
                             manager.apply_restart(RestartScope::TranslatorOnly);
                         let _ = event_tx.send(BackendEvent::BackendReady {
@@ -176,7 +158,9 @@ pub fn start_backend(
                             Ok(mut app_cfg) => {
                                 app_cfg.model.filename = filename.clone();
                                 // known tuple で url / expected_size を原子的に整合
-                                if let Some(known) = crate::launcher::app_config::known_model_tuple(&filename) {
+                                if let Some(known) =
+                                    crate::launcher::app_config::known_model_tuple(&filename)
+                                {
                                     app_cfg.model.urls.primary = known.url.to_string();
                                     app_cfg.model.expected_size = known.expected_size;
                                 }
@@ -191,7 +175,9 @@ pub fn start_backend(
                                     let models = find_available_models(&base_dir);
                                     let selected = resolve_selected_model(&filename, &models);
                                     let _ = event_tx.send(BackendEvent::AvailableModels(models));
-                                    let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected.clone()));
+                                    let _ = event_tx.send(BackendEvent::SelectedModelResolved(
+                                        selected.clone(),
+                                    ));
                                     manager.selected_model = selected;
                                     manager.stop_all();
                                     manager.start_all();
@@ -229,18 +215,18 @@ pub fn start_backend(
                             format!("プロファイルを変更しました: {}", profile_name)
                         };
                         let _ = event_tx.send(BackendEvent::Log(
-                            crate::messages::LogSource::Tenuki, profile_msg,
-                            crate::messages::LogLevel::Info, crate::messages::current_timestamp(),
+                            crate::messages::LogSource::Tenuki,
+                            profile_msg,
+                            crate::messages::LogLevel::Info,
+                            crate::messages::current_timestamp(),
                         ));
                     }
-                    FrontendCommand::SetDictSlot(slot) => {
-                        let selected_slot = slot.map(|raw| {
-                            let path = std::path::PathBuf::from(raw.trim());
-                            let _ = std::fs::create_dir_all(&path);
-                            path.to_string_lossy().to_string()
-                        });
+                    FrontendCommand::SetDictSlot(raw) => {
+                        let path = std::path::PathBuf::from(raw.trim());
+                        let _ = std::fs::create_dir_all(&path);
+                        let slot = path.to_string_lossy().to_string();
                         if let Ok(mut config) = crate::config::load(&config_path) {
-                            config.dict_slot = selected_slot.clone();
+                            config.dict_slot = Some(slot.clone());
                             let _ = crate::config::save(&config_path, &config);
                         }
                         manager.reload_config(&config_path);
@@ -250,9 +236,7 @@ pub fn start_backend(
                             engine_success: engine_ok,
                             translator_success: translator_ok,
                         });
-                        if let Some(s) = &selected_slot {
-                            let _ = event_tx.send(BackendEvent::DictSlotChanged(s.clone()));
-                        }
+                        let _ = event_tx.send(BackendEvent::DictSlotChanged(slot));
                     }
                     FrontendCommand::UpdateSettings {
                         structural,
@@ -264,7 +248,9 @@ pub fn start_backend(
                             manager.set_structural_options(structural_options);
                             if let Ok(config) = crate::config::load(&config_path) {
                                 let _ = crate::config::save_profile_structural(
-                                    &config_path, &config.profile, structural_options,
+                                    &config_path,
+                                    &config.profile,
+                                    structural_options,
                                 );
                             }
                         }

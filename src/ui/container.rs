@@ -207,7 +207,7 @@ pub struct UiCommands {
     pub restart_backend: bool,
     pub set_lang_pair: Option<(String, String, Option<String>, Option<String>)>,
     pub set_ui_lang: Option<String>,
-    pub set_dict_slot: Option<Option<String>>,
+    pub set_dict_slot: Option<String>,
     pub exit_app: bool,
     pub set_structural_options: Option<StructuralOptions>,
     pub set_profile: Option<String>,
@@ -308,7 +308,12 @@ impl UiContainer {
         }
     }
 
-    pub fn add_dictionary_entry(&mut self, timestamp: String, original: String, translated: String) {
+    pub fn add_dictionary_entry(
+        &mut self,
+        timestamp: String,
+        original: String,
+        translated: String,
+    ) {
         self.display.dictionary_new += 1;
         let _ = (timestamp, original, translated);
     }
@@ -425,8 +430,9 @@ impl UiContainer {
     }
 
     pub fn update_input_analysis(&mut self, snapshot: InputAnalysisSnapshot) -> bool {
-        let should_persist =
-            !snapshot.result_stale && !snapshot.raw_text.trim().is_empty() && snapshot.model_calls > 0;
+        let should_persist = !snapshot.result_stale
+            && !snapshot.raw_text.trim().is_empty()
+            && snapshot.model_calls > 0;
         self.display.input_snapshot = Some(snapshot.clone());
         self.state.selected_input_record_id = None;
 

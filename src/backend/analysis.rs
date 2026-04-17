@@ -28,7 +28,10 @@ fn looks_like_assignment_side(text: &str) -> bool {
         return true;
     }
 
-    let ascii_letters = trimmed.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let ascii_letters = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
     ascii_letters >= 3 || trimmed.contains(' ')
 }
 
@@ -60,7 +63,10 @@ fn is_assignment_separator(text: &str, index: usize) -> bool {
         return false;
     }
 
-    if matches!(left.chars().last(), Some('<' | '!' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | ':' | '=')) {
+    if matches!(
+        left.chars().last(),
+        Some('<' | '!' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | ':' | '=')
+    ) {
         return false;
     }
 
@@ -116,7 +122,10 @@ pub fn build_snapshot(
     model_calls: usize,
 ) -> InputAnalysisSnapshot {
     let normalized = normalize_input(raw_text);
-    let extracted_lines: Vec<String> = normalized.split('\n').map(extract_assignment_source).collect();
+    let extracted_lines: Vec<String> = normalized
+        .split('\n')
+        .map(extract_assignment_source)
+        .collect();
 
     let mut visible_lines = Vec::with_capacity(extracted_lines.len());
     let mut model_inputs = Vec::new();
@@ -218,7 +227,10 @@ mod tests {
 
         assert_eq!(snapshot.extracted_text, "Buff: (Round)");
         assert_eq!(snapshot.visible_text, "Buff Round");
-        assert_eq!(snapshot.model_inputs, vec!["Buff".to_string(), "Round".to_string()]);
+        assert_eq!(
+            snapshot.model_inputs,
+            vec!["Buff".to_string(), "Round".to_string()]
+        );
         assert_eq!(snapshot.final_output.as_deref(), Some("バフ: (ラウンド)"));
         assert!(!snapshot.result_stale);
         assert_eq!(snapshot.dict_hits, 0);
