@@ -21,50 +21,18 @@ use crate::config::Config;
 use crate::launcher::app_config::AppConfig;
 use manager::{ProcessManager, RestartScope};
 
-pub use processor::TranslationMode;
-
+/// launcher_config.toml の model.filename が権威。
+/// models/ に一致するファイルがあれば返す。なければ None（launcher が DL する）。
+/// basename スキャンによる別ファイルへの fallback は行わない。
 fn resolve_selected_model(filename: &str, models: &[PathBuf]) -> Option<PathBuf> {
-    if !filename.trim().is_empty() {
-        let saved_path = PathBuf::from(filename);
-        if let Some(found) = models.iter().find(|m| **m == saved_path) {
-            return Some(found.clone());
-        }
-        if let Some(saved_name) = saved_path.file_name() {
-            if let Some(found) = models.iter().find(|m| m.file_name() == Some(saved_name)) {
-                return Some(found.clone());
-            }
-        }
+    if filename.trim().is_empty() {
+        return None;
     }
-    models.first().cloned()
+    let authority_name = PathBuf::from(filename);
+    let authority_name = authority_name.file_name()?;
+    models.iter().find(|m| m.file_name() == Some(authority_name)).cloned()
 }
 
-fn resolve_dict_slot_for_language_pair(
-    config: &Config,
-    base_dir: &PathBuf,
-    tgt: &str,
-    keep_dict: bool,
-) -> String {
-    if !keep_dict {
-        return manager::create_new_slot(tgt, base_dir)
-            .to_string_lossy()
-            .to_string();
-    }
-
-    if config.tgt_lang == tgt {
-        return config.dict_slot.clone().unwrap_or_else(|| {
-            manager::find_or_create_slot_under(
-                &base_dir.join("dicts").join(tgt).join("text"),
-                tgt,
-            )
-            .to_string_lossy()
-            .to_string()
-        });
-    }
-
-    manager::find_or_create_slot_under(&base_dir.join("dicts").join(tgt).join("text"), tgt)
-        .to_string_lossy()
-        .to_string()
-}
 
 pub fn find_available_models(base_dir: &PathBuf) -> Vec<PathBuf> {
     let models_dir = base_dir.join("models");
@@ -93,6 +61,7 @@ pub fn start_backend(
         let models = find_available_models(&base_dir);
         let _ = event_tx.send(BackendEvent::AvailableModels(models.clone()));
         let selected_model = resolve_selected_model(&app_config.model.filename, &models);
+        let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected_model.clone()));
 
         // dict_slot 初期化
         let config = {
@@ -175,19 +144,21 @@ pub fn start_backend(
                         manager.stop_all();
                         manager.start_all();
                     }
-                    FrontendCommand::SetLanguagePair { src, tgt, keep_dict } => {
+                    FrontendCommand::SetLanguagePair { src, tgt, tgt_name, dict_slot } => {
                         let mut config = match crate::config::load(&config_path) {
                             Ok(config) => config,
                             Err(_) => return,
                         };
-                        let slot_str =
-                            resolve_dict_slot_for_language_pair(&config, &base_dir, &tgt, keep_dict);
+                        let slot_str = dict_slot.unwrap_or_else(|| {
+                            manager::create_new_slot(&tgt, &base_dir)
+                                .to_string_lossy()
+                                .to_string()
+                        });
                         config.src_lang = src.clone();
                         config.tgt_lang = tgt.clone();
+                        config.custom_lang_name = tgt_name.unwrap_or_default();
                         config.dict_slot = Some(slot_str.clone());
-                        config.enable_model_wrap = tgt != "ar";
                         let _ = crate::config::save(&config_path, &config);
-                        manager.set_enable_model_wrap(tgt != "ar");
                         manager.reload_config(&config_path);
                         let _ = event_tx.send(BackendEvent::DictSlotChanged(slot_str));
                         let (engine_ok, translator_ok) =
@@ -198,30 +169,47 @@ pub fn start_backend(
                         });
                         let _ = event_tx.send(BackendEvent::LanguageChanged(tgt));
                     }
-                    FrontendCommand::SetCustomLanguage { code, name } => {
-                        if let Ok(mut config) = crate::config::load(&config_path) {
-                            config.custom_lang_code = code.clone();
-                            config.custom_lang_name = name.clone();
-                            let _ = crate::config::save(&config_path, &config);
+                    FrontendCommand::SetModel(filename) => {
+                        let install_root = crate::launcher::resolve_install_root();
+                        let launcher_config_path = install_root.join("launcher_config.toml");
+                        match crate::launcher::app_config::AppConfig::load(&launcher_config_path) {
+                            Ok(mut app_cfg) => {
+                                app_cfg.model.filename = filename.clone();
+                                // known tuple で url / expected_size を原子的に整合
+                                if let Some(known) = crate::launcher::app_config::known_model_tuple(&filename) {
+                                    app_cfg.model.urls.primary = known.url.to_string();
+                                    app_cfg.model.expected_size = known.expected_size;
+                                }
+                                if let Err(e) = app_cfg.save(&launcher_config_path) {
+                                    let _ = event_tx.send(BackendEvent::Log(
+                                        crate::messages::LogSource::Tenuki,
+                                        format!("SetModel: save failed: {}", e),
+                                        crate::messages::LogLevel::Error,
+                                        crate::messages::current_timestamp(),
+                                    ));
+                                } else {
+                                    let models = find_available_models(&base_dir);
+                                    let selected = resolve_selected_model(&filename, &models);
+                                    let _ = event_tx.send(BackendEvent::AvailableModels(models));
+                                    let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected.clone()));
+                                    manager.selected_model = selected;
+                                    manager.stop_all();
+                                    manager.start_all();
+                                    let _ = event_tx.send(BackendEvent::BackendReady {
+                                        engine_success: manager.is_engine_running(),
+                                        translator_success: manager.is_translation_server_running(),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Log(
+                                    crate::messages::LogSource::Tenuki,
+                                    format!("SetModel: load launcher_config failed: {}", e),
+                                    crate::messages::LogLevel::Error,
+                                    crate::messages::current_timestamp(),
+                                ));
+                            }
                         }
-                        manager.reload_config(&config_path);
-                        let (engine_ok, translator_ok) =
-                            manager.apply_restart(RestartScope::TranslatorOnly);
-                        let _ = event_tx.send(BackendEvent::BackendReady {
-                            engine_success: engine_ok,
-                            translator_success: translator_ok,
-                        });
-                        let display_name = if name.trim().is_empty() { code.clone() }
-                            else { format!("{} ({})", name, code) };
-                        let lang_msg = if ui_lang == "en" {
-                            format!("Custom language updated: {}", display_name)
-                        } else {
-                            format!("カスタム言語を更新しました: {}", display_name)
-                        };
-                        let _ = event_tx.send(BackendEvent::Log(
-                            crate::messages::LogSource::Tenuki, lang_msg,
-                            crate::messages::LogLevel::Info, crate::messages::current_timestamp(),
-                        ));
                     }
                     FrontendCommand::SetProfile(profile_name) => {
                         if let Ok(mut config) = crate::config::load(&config_path) {
@@ -267,59 +255,36 @@ pub fn start_backend(
                         }
                     }
                     FrontendCommand::UpdateSettings {
-                        ctx_size,
-                        model,
                         structural,
-                        translation_mode,
                         server_port,
                         server_host,
                     } => {
                         let mut scope = RestartScope::TranslatorOnly;
-
-                        if let Some(mode) = translation_mode {
-                            if let Ok(mut config) = crate::config::load(&config_path) {
-                                config.translation_mode = mode.clone();
-                                let _ = crate::config::save(&config_path, &config);
-                            }
-                            // server_cfg の差し替えを含むため Full 再起動が必要
-                            manager.reload_config(&config_path);
-                            scope = RestartScope::Full;
-                        }
                         if let Some(structural_options) = structural {
                             manager.set_structural_options(structural_options);
-                            if let Ok(mut config) = crate::config::load(&config_path) {
-                                config.structural = structural_options;
-                                let _ = crate::config::save(&config_path, &config);
+                            if let Ok(config) = crate::config::load(&config_path) {
+                                let _ = crate::config::save_profile_structural(
+                                    &config_path, &config.profile, structural_options,
+                                );
                             }
                         }
                         if let Some(port) = server_port {
-                            manager.set_server_port(port);
-                            scope = RestartScope::Full;
-                            if let Ok(mut config) = crate::config::load(&config_path) {
-                                config.server_port = port;
-                                let _ = crate::config::save(&config_path, &config);
+                            if manager.set_server_port(port) {
+                                scope = RestartScope::Full;
+                                if let Ok(mut config) = crate::config::load(&config_path) {
+                                    config.server_port = port;
+                                    let _ = crate::config::save(&config_path, &config);
+                                }
                             }
                         }
                         if let Some(host) = server_host {
-                            manager.set_server_host(&host);
-                            scope = RestartScope::Full;
-                            if let Ok(mut config) = crate::config::load(&config_path) {
-                                config.server_host = host;
-                                let _ = crate::config::save(&config_path, &config);
-                            }
-                        }
-                        if model.is_some() || ctx_size.is_some() {
-                            scope = RestartScope::Full;
-                            if let Some(model_path) = model.as_ref() {
-                                let launcher_config_path = config_path.parent().unwrap().join("launcher_config.toml");
-                                if let Ok(mut app_config) = AppConfig::load(&launcher_config_path) {
-                                    app_config.model.filename = model_path.file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    let _ = app_config.save(&launcher_config_path);
+                            if manager.set_server_host(&host) {
+                                scope = RestartScope::Full;
+                                if let Ok(mut config) = crate::config::load(&config_path) {
+                                    config.server_host = host;
+                                    let _ = crate::config::save(&config_path, &config);
                                 }
                             }
-                            manager.update_settings(ctx_size, model);
                         }
 
                         let _ = manager.save_dictionary();
@@ -347,74 +312,4 @@ pub fn start_backend(
             crate::messages::current_timestamp(),
         ));
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_dict_slot_for_language_pair;
-    use crate::config::Config;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_base_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("tenuki_backend_slot_test_{}", unique))
-    }
-
-    #[test]
-    fn keeps_existing_slot_when_language_is_unchanged() {
-        let base_dir = unique_base_dir();
-        let slot = base_dir.join("dicts").join("ja").join("text").join("ja_003");
-        std::fs::create_dir_all(&slot).unwrap();
-
-        let mut config = Config::new();
-        config.tgt_lang = "ja".to_string();
-        config.dict_slot = Some(slot.to_string_lossy().to_string());
-
-        let resolved = resolve_dict_slot_for_language_pair(&config, &base_dir, "ja", true);
-        assert_eq!(resolved, slot.to_string_lossy().to_string());
-
-        let _ = std::fs::remove_dir_all(&base_dir);
-    }
-
-    #[test]
-    fn switches_to_target_language_slot_when_language_changes() {
-        let base_dir = unique_base_dir();
-        let ja_slot = base_dir.join("dicts").join("ja").join("text").join("ja_003");
-        std::fs::create_dir_all(&ja_slot).unwrap();
-
-        let mut config = Config::new();
-        config.tgt_lang = "ja".to_string();
-        config.dict_slot = Some(ja_slot.to_string_lossy().to_string());
-
-        let resolved = resolve_dict_slot_for_language_pair(&config, &base_dir, "en", true);
-        let expected = base_dir.join("dicts").join("en").join("text").join("en_001");
-
-        assert_eq!(resolved, expected.to_string_lossy().to_string());
-        assert!(expected.is_dir());
-
-        let _ = std::fs::remove_dir_all(&base_dir);
-    }
-
-    #[test]
-    fn creates_fresh_slot_when_keep_dict_is_disabled() {
-        let base_dir = unique_base_dir();
-        let existing = base_dir.join("dicts").join("en").join("text").join("en_001");
-        std::fs::create_dir_all(&existing).unwrap();
-
-        let mut config = Config::new();
-        config.tgt_lang = "en".to_string();
-        config.dict_slot = Some(existing.to_string_lossy().to_string());
-
-        let resolved = resolve_dict_slot_for_language_pair(&config, &base_dir, "en", false);
-        let expected = base_dir.join("dicts").join("en").join("text").join("en_002");
-
-        assert_eq!(resolved, expected.to_string_lossy().to_string());
-        assert!(expected.is_dir());
-
-        let _ = std::fs::remove_dir_all(&base_dir);
-    }
 }

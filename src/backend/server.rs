@@ -58,7 +58,6 @@ pub struct AppState {
     pub processor: Arc<dyn TextProcessor>,
     pub src_lang: Arc<RwLock<String>>,
     pub tgt_lang: Arc<RwLock<String>>,
-    pub custom_lang_code: Arc<RwLock<String>>,
     pub custom_lang_name: Arc<RwLock<String>>,
     pub prompt_template: String,
     pub translation_settings: TranslationSettings,
@@ -85,12 +84,10 @@ impl AppState {
     pub async fn current_prefix(&self) -> String {
         let src         = self.src_lang.read().await;
         let tgt         = self.tgt_lang.read().await;
-        let custom_code = self.custom_lang_code.read().await;
         let custom_name = self.custom_lang_name.read().await;
         translator::build_lang_prefix(
             &src,
             &tgt,
-            &custom_code,
             &custom_name,
             &self.prompt_template,
         )
@@ -819,7 +816,6 @@ pub async fn run_translation_server(
     processor: Arc<dyn TextProcessor>,
     src_lang: String,
     tgt_lang: String,
-    custom_lang_code: String,
     custom_lang_name: String,
     prompt_template: String,
     translation_settings: TranslationSettings,
@@ -845,7 +841,6 @@ pub async fn run_translation_server(
         processor,
         src_lang: Arc::new(RwLock::new(src_lang)),
         tgt_lang: Arc::new(RwLock::new(tgt_lang)),
-        custom_lang_code: Arc::new(RwLock::new(custom_lang_code)),
         custom_lang_name: Arc::new(RwLock::new(custom_lang_name)),
         prompt_template,
         translation_settings,
@@ -869,23 +864,39 @@ pub async fn run_translation_server(
 
     let _ = event_tx.try_send(BackendEvent::Log(
         LogSource::Tenuki,
-        format!("TENUKI translation server attempting to bind to http://127.0.0.1:{}", port),
+        format!("翻訳サーバー バインド開始: {}:{}", host, port),
         LogLevel::Info,
         crate::messages::current_timestamp(),
     ));
 
-    // バインドリトライ
-    let mut retries = 10;
+    // バインドリトライ（AddrInUse / os error 10048 の両方を捕捉）
+    let max_retries: u32 = 10;
+    let mut retries = max_retries;
     let listener = loop {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => break l,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && retries > 0 => {
+            Err(e) if retries > 0 && (
+                e.kind() == std::io::ErrorKind::AddrInUse
+                || e.raw_os_error() == Some(10048)
+            ) => {
                 retries -= 1;
+                let _ = event_tx.try_send(BackendEvent::Log(
+                    LogSource::Tenuki,
+                    format!(
+                        "翻訳サーバー バインド待機中 ({}:{}, 残り{}回): {}",
+                        host, port, retries, e
+                    ),
+                    LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 continue;
             }
             Err(e) => {
-                let _ = startup_tx.send(Err(format!("Failed to bind translation server: {}", e)));
+                let _ = startup_tx.send(Err(format!(
+                    "Failed to bind translation server: {}:{} (試行{}/{}回後): {}",
+                    host, port, max_retries - retries, max_retries, e
+                )));
                 return;
             }
         }
@@ -923,7 +934,6 @@ mod tests {
         contains_observed_markup, extract_translate_post_text, ListRequest,
     };
     use crate::backend::analysis::find_unescaped_assignment_separator;
-    use crate::backend::processor::StructuralProcessor;
 
     #[test]
     fn extracts_text_from_form_body() {

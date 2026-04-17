@@ -9,48 +9,27 @@ mod messages;
 mod backend;
 mod launcher;
 
-use std::path::{Path, PathBuf};
 use std::fs;
-use std::time::Instant;
-use std::sync::mpsc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use serde::Serialize;
 
 use backend::processor::{ProcessorData, ProcessorFactory, TranslationMode};
-use ui::container::{UiContainer, LogSource, ProcessType, StatusIcon};
+use launcher::{show_launcher_screen, LaunchProgress, LauncherUiState};
 use messages::{BackendEvent, FrontendCommand, LogLevel};
-use launcher::{LaunchProgress, LauncherUiState, show_launcher_screen};
+use ui::container::{LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AppMode {
     Launcher,
     Normal,
-}
-
-fn is_runtime_root(dir: &Path) -> bool {
-    dir.join("models").is_dir() && (dir.join("config.toml").exists() || dir.join("dicts").is_dir())
-}
-
-fn resolve_base_dir() -> PathBuf {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    if let Some(dir) = exe_dir.as_ref() {
-        for candidate in dir.ancestors().take(6) {
-            if is_runtime_root(candidate) {
-                return candidate.to_path_buf();
-            }
-        }
-        return dir.clone();
-    }
-
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 struct TenukiApp {
@@ -78,6 +57,7 @@ fn sanitize_ui_lang(lang: &str) -> String {
     match lang {
         "en" => "en".to_string(),
         "ja" => "ja".to_string(),
+        "zh-CN" => "zh-CN".to_string(),
         _ => "ja".to_string(),
     }
 }
@@ -102,7 +82,9 @@ fn wait_for_translation_server(port: u16, client: &reqwest::blocking::Client) ->
 
 fn model_inputs_from_context(ctx: &crate::backend::processor::TranslationContext) -> Vec<String> {
     match &ctx.processor_data {
-        ProcessorData::Structural { text_tokens, .. } if text_tokens.len() > 1 => text_tokens.clone(),
+        ProcessorData::Structural { text_tokens, .. } if text_tokens.len() > 1 => {
+            text_tokens.clone()
+        }
         _ => ctx.parts_to_translate.clone(),
     }
 }
@@ -168,7 +150,7 @@ impl TenukiApp {
             }
 
             let preview = format!(
-                "[{}] {}\n受信: {}\n抽出: {}\n可視: {}\nモデル送信: {}\nメモ: {}",
+                "[{}] {}\n原文: {}\n抽出: {}\n可視: {}\nモデル入力: {}\nメモ: {}",
                 record.timestamp,
                 if record.occurrences > 1 {
                     format!("x{}", record.occurrences)
@@ -209,17 +191,17 @@ impl TenukiApp {
             .build()
             .expect("Failed to build HTTP client");
         self.ui.set_work_running(true);
-        self.ui.set_work_result(
-            file_path.display().to_string(),
-            "".to_string(),
-            false,
-        );
+        self.ui
+            .set_work_result(file_path.display().to_string(), "".to_string(), false);
 
         thread::spawn(move || {
             let title = file_path.display().to_string();
             let result = (|| -> anyhow::Result<String> {
                 let content = fs::read_to_string(&file_path)?;
-                let texts = content.split('\n').map(|line| line.to_string()).collect::<Vec<_>>();
+                let texts = content
+                    .split('\n')
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>();
                 if texts.is_empty() {
                     return Ok(String::new());
                 }
@@ -235,10 +217,14 @@ impl TenukiApp {
 
             let (text, is_error) = match result {
                 Ok(text) => (text, false),
-                Err(err) => (format!("作業実行に失敗しました: {}", err), true),
+                Err(err) => (format!("ファイル翻訳に失敗しました: {}", err), true),
             };
 
-            let _ = event_tx.send(BackendEvent::WorkResult { title, text, is_error });
+            let _ = event_tx.send(BackendEvent::WorkResult {
+                title,
+                text,
+                is_error,
+            });
         });
     }
 
@@ -252,10 +238,53 @@ impl TenukiApp {
     ) -> Self {
         ui::fonts::setup_fonts(cc);
 
-        let base_dir = resolve_base_dir();
+        // install_root 解決 / launcher_config.toml の権威位置
+        let install_root = launcher::resolve_install_root();
+        let launcher_config_path = install_root.join("launcher_config.toml");
+
+        // 誤配置対策: target/debug または target/release の config を移設
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = exe_dir {
+            let wrong_debug = dir.join("launcher_config.toml");
+            if wrong_debug.exists() {
+                if launcher_config_path.exists() {
+                    // 正配置がすでにあるので、誤配置ファイルは .bak へ退避
+                    let backup = wrong_debug.with_extension("toml.bak");
+                    let _ = std::fs::rename(&wrong_debug, &backup);
+                    eprintln!(
+                        "[WARN] Misplaced launcher_config.toml at {} - canonical exists, retired to {}",
+                        wrong_debug.display(),
+                        backup.display()
+                    );
+                } else {
+                    // 正配置へ移設してから .bak へ退避
+                    if let Err(e) = std::fs::copy(&wrong_debug, &launcher_config_path) {
+                        eprintln!(
+                            "[WARN] Failed to migrate misplaced launcher_config.toml: {}",
+                            e
+                        );
+                    } else {
+                        let backup = wrong_debug.with_extension("toml.bak");
+                        let _ = std::fs::rename(&wrong_debug, &backup);
+                        eprintln!(
+                            "[INFO] Migrated misplaced launcher_config.toml to {}",
+                            launcher_config_path.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        // 起動ログ
+        eprintln!("[INFO] InstallRoot: {}", install_root.display());
+        eprintln!("[INFO] LauncherConfig: {}", launcher_config_path.display());
+
+        let base_dir = install_root.clone();
         let config_path = base_dir.join("config.toml");
 
-        // ランチャー用チャネル
+        // ランチャー用チャンネル
         let (launcher_tx, launcher_rx) = mpsc::channel();
         let launcher_cancel = Arc::new(AtomicBool::new(false));
         let launcher_thread = None;
@@ -266,8 +295,11 @@ impl TenukiApp {
             Err(anyhow!("Config file not found"))
         };
 
-        // runtime と model が揃っていれば直接 Normal モードへ。不足時のみ Launcher (Setup/Repair)。
-        let mode = if launcher::check_ready(&base_dir) { AppMode::Normal } else { AppMode::Launcher };
+        let mode = if launcher::check_ready(&base_dir) {
+            AppMode::Normal
+        } else {
+            AppMode::Launcher
+        };
 
         let initial_src_lang = config_result
             .as_ref()
@@ -279,31 +311,23 @@ impl TenukiApp {
             .map(|c| c.tgt_lang.clone())
             .unwrap_or_else(|_| "ja".to_string());
 
-        let initial_dict_slot = config_result
-            .as_ref()
-            .ok()
-            .and_then(|c| c.dict_slot.clone());
+        let initial_dict_slot = config_result.as_ref().ok().and_then(|c| c.dict_slot.clone());
 
-        let initial_translation_mode = config_result
+        let initial_profile = config_result
             .as_ref()
-            .map(|c| c.translation_mode.clone())
-            .unwrap_or_else(|_| "structural".to_string());
-        let initial_structural = config_result
-            .as_ref()
-            .map(|c| c.structural)
+            .map(|c| c.profile.clone())
+            .unwrap_or_else(|_| "game".to_string());
+        let initial_profile_runtime = config::load_profile(&config_path, &initial_profile)
             .unwrap_or_default();
-
 
         let initial_ui_lang = config_result
             .as_ref()
             .map(|c| c.ui_lang.clone())
-            .unwrap_or_else(|_| "ja".to_string());
+            .unwrap_or_else(|_| "en".to_string());
         let initial_ui_lang = sanitize_ui_lang(&initial_ui_lang);
 
-        let initial_custom_lang_code = config_result.as_ref()
-            .map(|c| c.custom_lang_code.clone())
-            .unwrap_or_default();
-        let initial_custom_lang_name = config_result.as_ref()
+        let initial_custom_lang_name = config_result
+            .as_ref()
             .map(|c| c.custom_lang_name.clone())
             .unwrap_or_default();
 
@@ -331,19 +355,22 @@ impl TenukiApp {
         };
 
         app.ui.update_src_lang(&initial_src_lang);
-        app.ui.update_tgt_lang(&initial_tgt_lang);
+        app.ui
+            .update_tgt_lang(&initial_tgt_lang, Some(&initial_custom_lang_name));
         app.ui.update_dict_slot(initial_dict_slot);
-        app.ui.update_translation_mode(&initial_translation_mode);
-        app.ui.update_structural_options(initial_structural);
+        app.ui.update_profile(&initial_profile);
+        app.ui
+            .update_translation_mode(&initial_profile_runtime.translation_mode);
+        app.ui
+            .update_structural_options(initial_profile_runtime.structural.into());
         app.ui.update_ui_lang(&initial_ui_lang);
-        app.ui.display.custom_lang_code = initial_custom_lang_code;
-        app.ui.display.custom_lang_name = initial_custom_lang_name;
-        app.ui.refresh_available_profiles(&app.base_dir.join("profiles"));
+        app.ui
+            .refresh_available_profiles(&app.base_dir.join("profiles"));
         app.load_input_records_or_log();
 
-        // 通常起動（Launcher をスキップした場合）はここでバックエンドを起動する
+        // 通常起動時は backend を自動起動する
         if app.mode == AppMode::Normal {
-            // Launcher を経由しない場合も profiles/ 等が存在することを保証する
+            // Launcher を経由しない場合でも基本ディレクトリは確保する
             for dir in ["profiles", "logs", "tmp"] {
                 let _ = fs::create_dir_all(app.base_dir.join(dir));
             }
@@ -360,22 +387,61 @@ impl TenukiApp {
 
     fn start_backend_after_setup(&mut self) {
         if let Some(command_rx) = self.command_rx.take() {
-            if let Ok(config) = config::load(&self.config_path) {
-                let launcher_config_path = self.base_dir.join("launcher_config.toml");
-                let app_config = launcher::app_config::AppConfig::load(&launcher_config_path)
-                    .unwrap_or_default();
-                let shutdown_clone = self.shutdown.clone();
-                let event_tx_clone = self.event_tx.clone();
-                let base_dir_clone = self.base_dir.clone();
-                self.backend_thread = Some(backend::start_backend(
-                    config,
-                    app_config,
-                    base_dir_clone,
-                    shutdown_clone,
-                    event_tx_clone,
-                    command_rx,
-                ));
-            }
+            let config = match config::load(&self.config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.ui.add_log(
+                        ui::container::LogSource::Tenuki,
+                        format!(
+                            "config.toml の読み込みに失敗したため backend を起動できません: {}",
+                            e
+                        ),
+                        messages::LogLevel::Error,
+                        messages::current_timestamp(),
+                    );
+                    self.ui
+                        .set_status(StatusKey::ConfigError, StatusIcon::Warning, true);
+                    // return command_rx so a retry can use it
+                    self.command_rx = Some(command_rx);
+                    return;
+                }
+            };
+
+            let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
+            let app_config = match launcher::app_config::AppConfig::load(&launcher_config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.ui.add_log(
+                        ui::container::LogSource::Tenuki,
+                        format!(
+                            "launcher_config.toml の読み込みに失敗したため launcher へ戻ります: {}",
+                            e
+                        ),
+                        messages::LogLevel::Error,
+                        messages::current_timestamp(),
+                    );
+                    // Route back to Launcher so the user can repair/re-run setup
+                    self.mode = AppMode::Launcher;
+                    self.launcher_state = LauncherUiState::default();
+                    self.launcher_cancel
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.launcher_thread = None;
+                    self.command_rx = Some(command_rx);
+                    return;
+                }
+            };
+
+            let shutdown_clone = self.shutdown.clone();
+            let event_tx_clone = self.event_tx.clone();
+            let base_dir_clone = self.base_dir.clone();
+            self.backend_thread = Some(backend::start_backend(
+                config,
+                app_config,
+                base_dir_clone,
+                shutdown_clone,
+                event_tx_clone,
+                command_rx,
+            ));
         }
     }
 }
@@ -401,13 +467,13 @@ impl eframe::App for TenukiApp {
 
         let mut needs_repaint = false;
 
-        // バックエンドイベントの受信（Normal モードで利用）
+        // backend イベント処理。Normal モードで適用する
         while let Ok(event) = self.event_rx.try_recv() {
             needs_repaint = true;
             match event {
                 BackendEvent::Log(source, msg, level, timestamp) => {
                     let src = match source {
-                        messages::LogSource::Tenuki   => LogSource::Tenuki,
+                        messages::LogSource::Tenuki => LogSource::Tenuki,
                         messages::LogSource::LlamaCpp => LogSource::LlamaCpp,
                     };
                     self.ui.add_log(src, msg, level, timestamp);
@@ -419,7 +485,8 @@ impl eframe::App for TenukiApp {
                     self.ui.add_dictionary_entry(timestamp, original, translated);
                 }
                 BackendEvent::DictionaryLogEntry(timestamp, original, translated) => {
-                    self.ui.add_dictionary_log_entry(timestamp, original, translated);
+                    self.ui
+                        .add_dictionary_log_entry(timestamp, original, translated);
                 }
                 BackendEvent::StatisticsUpdate(dict_hits, model_calls) => {
                     self.ui.update_statistics(dict_hits, model_calls);
@@ -434,45 +501,63 @@ impl eframe::App for TenukiApp {
                         self.refresh_pickup_preview();
                     }
                 }
-                BackendEvent::WorkResult { title, text, is_error } => {
+                BackendEvent::WorkResult {
+                    title,
+                    text,
+                    is_error,
+                } => {
                     self.ui.set_work_running(false);
                     self.ui.set_work_result(title, text, is_error);
                 }
                 BackendEvent::ProcessStatus(proc_type, running) => {
                     let pt = match proc_type {
                         messages::ProcessType::InferenceEngine => ProcessType::InferenceEngine,
-                        messages::ProcessType::Tenuki          => ProcessType::Tenuki,
+                        messages::ProcessType::Tenuki => ProcessType::Tenuki,
                     };
                     self.ui.update_process_status(pt, running);
+                    // 停止中に Tenuki が落ちたら Stopped へ遷移する
+                    if !running && pt == ProcessType::Tenuki {
+                        if self.ui.display.status_key == StatusKey::Stopping {
+                            self.ui.set_status(StatusKey::Stopped, StatusIcon::None, true);
+                        }
+                    }
                 }
                 BackendEvent::AvailableModels(models) => {
                     self.ui.update_available_models(models);
+                }
+                BackendEvent::SelectedModelResolved(model) => {
+                    self.ui.update_selected_model(model);
                 }
                 BackendEvent::DictSlotChanged(slot) => {
                     self.ui.update_dict_slot(Some(slot));
                     self.load_input_records_or_log();
                 }
                 BackendEvent::LanguageChanged(lang) => {
-                    self.ui.update_tgt_lang(&lang);
+                    self.ui.update_tgt_lang(&lang, None);
                     self.ui.add_log(
                         LogSource::Tenuki,
-                        format!("言語が {} に切り替わりました", lang),
+                        format!("翻訳先を {} に切り替えました", lang),
                         LogLevel::Info,
                         messages::current_timestamp(),
                     );
                 }
-                BackendEvent::BackendReady { engine_success, translator_success } => {
-                    let ui_lang = &self.ui.display.ui_lang;
+                BackendEvent::BackendReady {
+                    engine_success,
+                    translator_success,
+                } => {
                     if engine_success && translator_success {
-                        let msg = if ui_lang == "en" { "Ready" } else { "起動完了" };
-                        self.ui.set_status(msg, StatusIcon::Check, true);
+                        self.ui.set_status(StatusKey::Ready, StatusIcon::Check, true);
                     } else {
-                        let msg = if ui_lang == "en" { "Startup failed" } else { "起動に失敗しました" };
-                        self.ui.set_status(msg, StatusIcon::Warning, true);
+                        self.ui.set_status(StatusKey::Failed, StatusIcon::Warning, true);
                     }
                 }
-                BackendEvent::ServerMetrics { vram_mb, shared_mb, tokens_per_second } => {
-                    self.ui.update_server_metrics(vram_mb, shared_mb, tokens_per_second);
+                BackendEvent::ServerMetrics {
+                    vram_mb,
+                    shared_mb,
+                    tokens_per_second,
+                } => {
+                    self.ui
+                        .update_server_metrics(vram_mb, shared_mb, tokens_per_second);
                 }
             }
         }
@@ -487,19 +572,20 @@ impl eframe::App for TenukiApp {
                     &mut self.launcher_thread,
                     &self.launcher_cancel,
                     &self.base_dir,
-                    &self.ui.display.ui_lang,
+                    "en",
                 );
                 if repaint {
                     needs_repaint = true;
                 }
 
-                // Launcher から Normal に切り替わった場合、バックエンドを起動
+                // Launcher から Normal へ切り替わったら backend を起動する
                 if switch_to_normal {
                     self.mode = AppMode::Normal;
-                    // profiles/ を再スキャン（launcher が create_directories() で生成済みのはず）
-                    self.ui.refresh_available_profiles(&self.base_dir.join("profiles"));
-                    let msg = if self.ui.display.ui_lang == "en" { "Starting..." } else { "起動しています..." };
-                    self.ui.set_status(msg, StatusIcon::Spinner, true);
+                    // profiles/ は launcher 側でも作られるが、UI 用に再読込しておく
+                    self.ui
+                        .refresh_available_profiles(&self.base_dir.join("profiles"));
+                    self.ui
+                        .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
                     self.start_backend_after_setup();
                     let _ = self.command_tx.send(FrontendCommand::Start);
                 }
@@ -515,11 +601,11 @@ impl eframe::App for TenukiApp {
 
                 if commands.start_backend {
                     if has_server {
-                        let msg = if self.ui.display.ui_lang == "en" { "Starting..." } else { "起動しています..." };
-                        self.ui.set_status(msg, StatusIcon::Spinner, true);
+                        self.ui
+                            .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
                         self.command_tx.send(FrontendCommand::Start).ok();
                     } else {
-                        // サーバーが無ければ Launcher に戻る
+                        // サーバーがなければ Launcher へ戻す
                         self.mode = AppMode::Launcher;
                         self.launcher_state = LauncherUiState::default();
                         self.launcher_cancel.store(false, Ordering::Relaxed);
@@ -527,12 +613,14 @@ impl eframe::App for TenukiApp {
                     }
                 }
                 if commands.stop_backend {
+                    self.ui
+                        .set_status(StatusKey::Stopping, StatusIcon::Spinner, true);
                     self.command_tx.send(FrontendCommand::Stop).ok();
                 }
                 if commands.restart_backend {
                     if has_server {
-                        let msg = if self.ui.display.ui_lang == "en" { "Starting..." } else { "起動しています..." };
-                        self.ui.set_status(msg, StatusIcon::Spinner, true);
+                        self.ui
+                            .set_status(StatusKey::Restarting, StatusIcon::Spinner, true);
                         self.command_tx.send(FrontendCommand::Restart).ok();
                     } else {
                         self.mode = AppMode::Launcher;
@@ -540,9 +628,6 @@ impl eframe::App for TenukiApp {
                         self.launcher_cancel.store(false, Ordering::Relaxed);
                         self.launcher_thread = None;
                     }
-                }
-                if let Some(lang) = commands.set_tgt_lang.take() {
-                    self.ui.update_tgt_lang(&lang);
                 }
                 if let Some(lang) = commands.set_ui_lang.take() {
                     let san = sanitize_ui_lang(&lang);
@@ -553,27 +638,38 @@ impl eframe::App for TenukiApp {
                     }
                 }
 
-                let pending_custom_lang = commands.set_custom_lang.take();
-                if let Some((code, name)) = pending_custom_lang.as_ref() {
-                    self.ui.update_custom_lang(code, name);
-                    if let Ok(mut cfg) = config::load(&self.config_path) {
-                        cfg.custom_lang_code = code.clone();
-                        cfg.custom_lang_name = name.clone();
-                        let _ = config::save(&self.config_path, &cfg);
-                    }
-                }
-
                 let pending_lang_pair = commands.set_lang_pair.take();
-                let has_pending_lang_pair = pending_lang_pair.is_some();
-                if let Some((src, tgt, keep_dict)) = pending_lang_pair {
+                if let Some((src, tgt, tgt_name, dict_slot)) = pending_lang_pair {
                     self.ui.update_src_lang(&src);
-                    self.ui.update_tgt_lang(&tgt);
-                    self.command_tx.send(FrontendCommand::SetLanguagePair { src, tgt, keep_dict }).ok();
+                    self.ui.update_tgt_lang(&tgt, tgt_name.as_deref());
+                    self.command_tx
+                        .send(FrontendCommand::SetLanguagePair {
+                            src,
+                            tgt,
+                            tgt_name,
+                            dict_slot,
+                        })
+                        .ok();
                 }
                 if let Some(slot) = commands.set_dict_slot.take() {
                     self.ui.update_dict_slot(slot.clone());
                     self.load_input_records_or_log();
                     self.command_tx.send(FrontendCommand::SetDictSlot(slot)).ok();
+                }
+
+                if let Some(profile_name) = commands.set_profile.take() {
+                    self.ui.update_profile(&profile_name);
+                    if let Ok(profile) = config::load_profile(&self.config_path, &profile_name) {
+                        self.ui.update_translation_mode(&profile.translation_mode);
+                        self.ui.update_structural_options(profile.structural.into());
+                    }
+                    self.command_tx
+                        .send(FrontendCommand::SetProfile(profile_name))
+                        .ok();
+                }
+
+                if let Some(filename) = commands.select_model.take() {
+                    self.command_tx.send(FrontendCommand::SetModel(filename)).ok();
                 }
 
                 if let Some(folder) = commands.set_work_folder.take() {
@@ -603,17 +699,6 @@ impl eframe::App for TenukiApp {
                     }
                 }
 
-                if !has_pending_lang_pair {
-                    if let Some((code, name)) = pending_custom_lang {
-                        self.command_tx.send(FrontendCommand::SetCustomLanguage { code, name }).ok();
-                    }
-                }
-
-                let translation_mode = commands.set_translation_mode.take();
-                if let Some(ref mode) = translation_mode {
-                    self.ui.update_translation_mode(mode);
-                }
-
                 let structural_options = commands.set_structural_options.take();
                 if let Some(options) = structural_options.as_ref() {
                     self.ui.update_structural_options(*options);
@@ -623,16 +708,8 @@ impl eframe::App for TenukiApp {
                     self.refresh_pickup_preview();
                 }
 
-                let selected_model = commands.select_model.take();
-                if let Some(model_path) = selected_model.as_ref() {
-                    self.ui.display.selected_model = Some(model_path.clone());
-                }
-
                 let update_cmd = FrontendCommand::UpdateSettings {
-                    ctx_size: commands.set_ctx_size.take(),
-                    model: selected_model,
                     structural: structural_options,
-                    translation_mode,
                     server_port: commands.set_server_port.take(),
                     server_host: commands.set_server_host.take(),
                 };
@@ -651,7 +728,7 @@ impl eframe::App for TenukiApp {
                                 self.start_file_work(file_path);
                             } else {
                                 self.ui.set_work_result(
-                                    "作業実行".to_string(),
+                                    "ファイル翻訳".to_string(),
                                     "ファイルが選択されていません。".to_string(),
                                     true,
                                 );
@@ -686,13 +763,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "TENUKI",
         options,
-        Box::new(|cc| Ok(Box::new(TenukiApp::new(
-            cc,
-            command_tx,
-            command_rx,
-            event_tx,
-            event_rx,
-            shutdown,
-        )))),
+        Box::new(|cc| {
+            Ok(Box::new(TenukiApp::new(
+                cc, command_tx, command_rx, event_tx, event_rx, shutdown,
+            )))
+        }),
     )
 }

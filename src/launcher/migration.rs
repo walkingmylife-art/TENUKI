@@ -30,8 +30,9 @@ pub fn migrate_config_if_needed(config_path: &Path) -> Result<bool> {
         .parent()
         .ok_or_else(|| anyhow!("Invalid config path: no parent directory"))?;
 
-    // launcher_config.toml が既存なら移行済み → 毎起動の誤実行を防ぐ
-    if base_dir.join("launcher_config.toml").exists() {
+    let install_root = super::resolve_install_root();
+    let launcher_config_path = install_root.join("launcher_config.toml");
+    if launcher_config_path.exists() {
         return Ok(false);
     }
 
@@ -52,13 +53,15 @@ pub fn migrate_config_if_needed(config_path: &Path) -> Result<bool> {
     std::fs::copy(config_path, &backup_path)
         .with_context(|| format!("Failed to backup config to {}", backup_path.display()))?;
 
-    // launcher_config.toml にランチャー専用設定を書き出す
     let launcher_config = build_app_config(&legacy, &root);
-    launcher_config.save(&base_dir.join("launcher_config.toml"))?;
+    launcher_config.save(&launcher_config_path)?;
 
-    // config.toml をクリーンな Config 形式で上書き
-    // selected_model, backend は AppConfig (launcher_config.toml) で管理するため削除
-    let clean_config = legacy.clone();
+    let mut clean_config = legacy.clone();
+    let old_code = val_str(&root, "custom_lang_code");
+    if !old_code.trim().is_empty() {
+        clean_config.tgt_lang = old_code.trim().to_string();
+        clean_config.custom_lang_name = val_str(&root, "custom_lang_name").to_string();
+    }
     crate::config::save(config_path, &clean_config)
         .with_context(|| "Failed to write updated config.toml")?;
 
@@ -77,8 +80,6 @@ pub fn migrate_config_if_needed(config_path: &Path) -> Result<bool> {
         TranslationProfile::default().save(&default_profile_path)?;
     }
 
-    // legacy の backend を launcher_config.toml に書き戻す（state.json は使わない）
-    let launcher_config_path = base_dir.join("launcher_config.toml");
     if let Ok(mut lc) = AppConfig::load(&launcher_config_path) {
         if lc.backend == AppConfig::default().backend {
             lc.backend = val_str(&root, "backend").to_string();
@@ -92,9 +93,11 @@ pub fn migrate_config_if_needed(config_path: &Path) -> Result<bool> {
 fn val_str<'a>(root: &'a Value, key: &str) -> &'a str {
     root.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
+
 fn val_u32(root: &Value, key: &str) -> u32 {
     root.get(key).and_then(|v| v.as_integer()).unwrap_or(0) as u32
 }
+
 fn val_bool(root: &Value, key: &str, default: bool) -> bool {
     root.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
@@ -116,23 +119,19 @@ fn build_app_config(legacy: &LegacyConfig, raw: &Value) -> AppConfig {
         config.server.port = llama_port as u16;
     }
 
-    let ctx   = val_u32(raw, "ctx_size");      config.server.ctx_size      = if ctx   > 0 { ctx   } else { 1024 };
-    let batch = val_u32(raw, "batch_size");    config.server.batch_size    = if batch > 0 { batch } else { 128  };
-    let ub    = val_u32(raw, "ubatch_size");   config.server.ubatch_size   = if ub    > 0 { ub    } else { 64   };
-    let ngl   = val_u32(raw, "ngl");           config.server.ngl           = if ngl   > 0 { ngl   } else { 999  };
-    let par   = val_u32(raw, "parallel_slots");config.server.parallel_slots= if par   > 0 { par   } else { 2    };
+    let ctx = val_u32(raw, "ctx_size");
+    config.server.ctx_size = if ctx > 0 { ctx } else { 1024 };
+    let batch = val_u32(raw, "batch_size");
+    config.server.batch_size = if batch > 0 { batch } else { 128 };
+    let ub = val_u32(raw, "ubatch_size");
+    config.server.ubatch_size = if ub > 0 { ub } else { 64 };
+    let ngl = val_u32(raw, "ngl");
+    config.server.ngl = if ngl > 0 { ngl } else { 999 };
+    let par = val_u32(raw, "parallel_slots");
+    config.server.parallel_slots = if par > 0 { par } else { 2 };
     config.server.cont_batching = val_bool(raw, "cont_batching", true);
 
-    let selected = val_str(raw, "selected_model");
-    if !selected.trim().is_empty() {
-        config.model.filename = std::path::Path::new(selected)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(selected)
-            .to_string();
-    }
-
-    let _ = legacy; // 翻訳設定側フィールドは build_translation_profile が使う
+    let _ = legacy;
     config
 }
 

@@ -29,8 +29,6 @@ use crate::backend::translator::TranslationSettings;
 use crate::backend::server;
 use crate::backend_info;
 
-pub const DEFAULT_SERVER_PORT: u16 = 14371;
-
 // ============================================================
 // スロット管理ユーティリティ
 // ============================================================
@@ -45,10 +43,6 @@ fn max_existing_slot_num(text_dir: &Path, lang: &str) -> Option<u32> {
         let name = e.file_name().to_string_lossy().into_owned();
         slot_num_from_name(&name, lang)
     }).max()
-}
-
-fn is_slot_dir_name(name: &str) -> bool {
-    slot_num_from_name(name, "").is_some()
 }
 
 fn is_slot_dir_name_for_lang(name: &str, lang: &str) -> bool {
@@ -97,7 +91,7 @@ pub fn is_slot_dir(p: &Path) -> bool {
     parent_is_text
         && p.file_name()
             .and_then(|n| n.to_str())
-            .map(is_slot_dir_name)
+            .map(|name| slot_num_from_name(name, "").is_some())
             .unwrap_or(false)
 }
 
@@ -122,7 +116,10 @@ pub fn find_or_create_slot_under(container: &Path, lang: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_or_create_slot_under, find_slot_ancestor, is_slot_dir, is_slot_dir_name_for_lang, resolve_slot_dir};
+    use super::{
+        create_new_slot, find_or_create_slot_under, find_slot_ancestor, is_slot_dir,
+        is_slot_dir_name_for_lang, resolve_slot_dir,
+    };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -184,6 +181,44 @@ mod tests {
         let resolved = resolve_slot_dir(&config, &base_dir);
 
         assert_eq!(resolved, explicit_dir);
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn create_new_slot_picks_next_number_for_language() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_manager_test_{}", unique));
+        let text_dir = base_dir.join("dicts").join("en").join("text");
+        std::fs::create_dir_all(text_dir.join("en_001")).unwrap();
+
+        let slot = create_new_slot("en", &base_dir);
+
+        assert_eq!(slot, text_dir.join("en_002"));
+        assert!(slot.is_dir());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn resolve_slot_dir_creates_slot_under_current_target_language() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_manager_test_{}", unique));
+
+        let mut config = Config::new();
+        config.tgt_lang = "ar".to_string();
+        config.dict_slot = None;
+
+        let resolved = resolve_slot_dir(&config, &base_dir);
+
+        assert_eq!(resolved, base_dir.join("dicts").join("ar").join("text").join("ar_001"));
+        assert!(resolved.is_dir());
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }
@@ -325,7 +360,9 @@ fn find_llama_exe(base_dir: &Path) -> Option<PathBuf> {
     let name = "llama-server";
 
     // 1. launcher_config.toml の backend から runtime/<backend>/ を直接探索
-    let launcher_config_path = base_dir.join("launcher_config.toml");
+    // launcher_config.toml は install_root（権威位置）から読む
+    let install_root = crate::launcher::resolve_install_root();
+    let launcher_config_path = install_root.join("launcher_config.toml");
     let backend = std::fs::read_to_string(&launcher_config_path)
         .ok()
         .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
@@ -640,7 +677,6 @@ impl ProcessManager {
             let structural_changed = self.config.structural != new_config.structural;
             let language_changed = self.config.src_lang != new_config.src_lang
                 || self.config.tgt_lang != new_config.tgt_lang
-                || self.config.custom_lang_code != new_config.custom_lang_code
                 || self.config.custom_lang_name != new_config.custom_lang_name;
             self.server_port = new_config.server_port;
             self.config = new_config;
@@ -673,8 +709,10 @@ impl ProcessManager {
 
     #[cfg(target_os = "windows")]
     fn terminate_stray_llama_server(&self) -> bool {
+        use std::os::windows::process::CommandExt;
         match Command::new("taskkill")
             .args(["/IM", "llama-server.exe", "/F"])
+            .creation_flags(0x08000000)
             .status()
         {
             Ok(status) => status.success(),
@@ -767,6 +805,7 @@ impl ProcessManager {
             llama_base_url(&server_cfg.host, server_cfg.port)
         )));
         let server_runtime = Runtime::new().expect("Failed to create Tokio runtime");
+        let initial_server_port = config.server_port;
         #[cfg(target_os = "windows")]
         let pdh = pdh_vram::PdhQuery::open();
 
@@ -790,17 +829,13 @@ impl ProcessManager {
             input_replay,
             ctx_size,
             selected_model,
-            server_port: DEFAULT_SERVER_PORT,
+            server_port: initial_server_port,
             llm_slots,
             starting: false,
             shutdown,
             #[cfg(target_os = "windows")]
             pdh,
         }
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.server_handle.is_some() || self.llama_process.is_some()
     }
 
     pub fn is_engine_running(&self) -> bool {
@@ -867,19 +902,6 @@ impl ProcessManager {
     pub fn set_translation_mode(&mut self, mode: TranslationMode) {
         if self.translation_mode == mode { return; }
         self.translation_mode = mode;
-        // モードに応じた server_cfg をメモリ上で差し替える（launcher_config.toml は書かない）
-        let mode_str = match mode {
-            TranslationMode::Passthrough => "passthrough",
-            _ => "structural",
-        };
-        let default_cfg = crate::launcher::app_config::AppConfig::default_for_mode(mode_str);
-        // host/port はユーザー設定を維持し、スループット関連のみ差し替える
-        self.server_cfg.ctx_size = default_cfg.server.ctx_size;
-        self.server_cfg.batch_size = default_cfg.server.batch_size;
-        self.server_cfg.ubatch_size = default_cfg.server.ubatch_size;
-        self.server_cfg.parallel_slots = default_cfg.server.parallel_slots;
-        self.ctx_size = default_cfg.server.ctx_size;
-        self.llm_slots = default_cfg.server.parallel_slots.max(1) as usize;
         self.rebuild_processor();
     }
 
@@ -892,39 +914,18 @@ impl ProcessManager {
         self.rebuild_processor();
     }
 
-    pub fn set_server_port(&mut self, port: u16) {
+    /// ポートを設定する。実際に値が変化した場合のみ true を返す。
+    pub fn set_server_port(&mut self, port: u16) -> bool {
+        if self.server_port == port { return false; }
         self.server_port = port;
+        true
     }
 
-    pub fn set_server_host(&mut self, host: &str) {
+    /// ホストを設定する。実際に値が変化した場合のみ true を返す。
+    pub fn set_server_host(&mut self, host: &str) -> bool {
+        if self.config.server_host == host { return false; }
         self.config.server_host = host.to_string();
-    }
-
-    pub fn set_enable_model_wrap(&mut self, enabled: bool) {
-        self.config.enable_model_wrap = enabled;
-    }
-
-    pub fn set_model_wrap_min_chars(&mut self, value: u32) {
-        self.config.model_wrap_min_chars = value;
-    }
-
-    pub fn set_model_wrap_min_tail_chars(&mut self, value: u32) {
-        self.config.model_wrap_min_tail_chars = value;
-    }
-
-    pub fn set_enable_model_symbol_cleanup(&mut self, enabled: bool) {
-        self.config.enable_model_symbol_cleanup = enabled;
-    }
-
-    pub fn update_settings(
-        &mut self,
-        ctx_size: Option<u32>,
-        model: Option<PathBuf>,
-    ) {
-        if let Some(v) = ctx_size { self.ctx_size = v; }
-        if let Some(v) = model {
-            self.selected_model = Some(v);
-        }
+        true
     }
 
     pub fn reload_config(&mut self, config_path: &PathBuf) {
@@ -935,13 +936,6 @@ impl ProcessManager {
         if self.starting { return; }
 
         self.starting = true;
-
-        let _ = self.event_tx.send(BackendEvent::Log(
-            LogSource::Tenuki,
-            "start_all: launching inference engine...".to_string(),
-            LogLevel::Info,
-            crate::messages::current_timestamp(),
-        ));
 
         let engine_success = if self.has_live_llama_process() {
             true
@@ -989,11 +983,6 @@ impl ProcessManager {
         // 完全に停止してから起動
         thread::sleep(Duration::from_millis(1000));
         self.start_all();
-    }
-
-    pub fn restart_translation_server(&mut self) -> bool {
-        self.stop_translation_server();
-        self.start_translation_server()
     }
 
     /// 設定変更後の再起動を scope に従って実行する。
@@ -1088,12 +1077,34 @@ impl ProcessManager {
 
         let model = match self.resolve_model() {
             Some(m) => m,
-            None => return false,
+            None => {
+                let msg = if self.config.ui_lang == "en" {
+                    "No model file found in models/ directory".to_string()
+                } else {
+                    "models/ ディレクトリにモデルファイルが見つかりません".to_string()
+                };
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki, msg, LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
+                return false;
+            }
         };
 
         let exe = match find_llama_exe(&self.base_dir) {
             Some(e) => e,
-            None => return false,
+            None => {
+                let msg = if self.config.ui_lang == "en" {
+                    "llama-server executable not found".to_string()
+                } else {
+                    "llama-server 実行ファイルが見つかりません".to_string()
+                };
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki, msg, LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
+                return false;
+            }
         };
 
         if is_port_open(self.server_cfg.port) {
@@ -1133,7 +1144,18 @@ impl ProcessManager {
                 }
                 self.stop_llama_server();
             }
-            Err(_) => return false,
+            Err(e) => {
+                let msg = if self.config.ui_lang == "en" {
+                    format!("Failed to launch inference engine: {e}")
+                } else {
+                    format!("推論エンジンの起動に失敗しました: {e}")
+                };
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki, msg, LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
+                return false;
+            }
         }
 
         false
@@ -1168,10 +1190,9 @@ impl ProcessManager {
         let processor = self.current_processor.clone();
         let src_lang = self.config.src_lang.clone();
         let tgt_lang = self.config.tgt_lang.clone();
-        let custom_lang_code = self.config.custom_lang_code.clone();
         let custom_lang_name = self.config.custom_lang_name.clone();
         let prompt_template = self.config.prompt_template.clone();
-        let enable_model_wrap = self.config.enable_model_wrap;
+        let enable_model_wrap = self.config.effective_model_wrap();
         let model_wrap_min_chars = self.config.model_wrap_min_chars;
         let model_wrap_min_tail_chars = self.config.model_wrap_min_tail_chars;
         let enable_model_symbol_cleanup = self.config.enable_model_symbol_cleanup;
@@ -1197,7 +1218,7 @@ impl ProcessManager {
         let handle = self.server_runtime.spawn(
             server::run_translation_server(
                 host.clone(), port, dictionary, processor,
-                src_lang, tgt_lang, custom_lang_code, custom_lang_name,
+                src_lang, tgt_lang, custom_lang_name,
                 prompt_template,
                 translation_settings,
                 llm_client, server_event_tx, startup_tx, shutdown_rx,
@@ -1237,8 +1258,30 @@ impl ProcessManager {
 
                 true
             }
-            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+            Ok(Ok(Err(e))) => {
                 self.server_runtime.block_on(async { let _ = handle.await; });
+                let msg = if self.config.ui_lang == "en" {
+                    format!("Translation server failed to start: {e}")
+                } else {
+                    format!("翻訳サーバーの起動に失敗しました: {e}")
+                };
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki, msg, LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
+                false
+            }
+            Ok(Err(_)) => {
+                self.server_runtime.block_on(async { let _ = handle.await; });
+                let msg = if self.config.ui_lang == "en" {
+                    "Translation server startup channel closed unexpectedly".to_string()
+                } else {
+                    "翻訳サーバー起動チャンネルが予期せず閉じられました".to_string()
+                };
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki, msg, LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
                 false
             }
             Err(_) => {
@@ -1246,6 +1289,15 @@ impl ProcessManager {
                 self.server_runtime.block_on(async {
                     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
                 });
+                let msg = if self.config.ui_lang == "en" {
+                    "Translation server startup timed out (15s)".to_string()
+                } else {
+                    "翻訳サーバーの起動がタイムアウトしました（15秒）".to_string()
+                };
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki, msg, LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
                 false
             }
         }
@@ -1280,38 +1332,28 @@ impl ProcessManager {
         self.t_cache = Arc::new(TranslationCache::default());
         self.n_cache = Arc::new(NewEntriesCache::default());
 
-        // ポート解放を少し待つ
-        thread::sleep(Duration::from_millis(200));
-        
-        backend_info!(self.event_tx, "Translation server stopped");
-    }
-
-    fn resolve_model(&self) -> Option<PathBuf> {
-        if let Some(ref m) = self.selected_model {
-            if m.exists() { return Some(m.clone()); }
-        }
-        self.find_gguf_model()
-    }
-
-    fn find_gguf_model(&self) -> Option<PathBuf> {
-        self.available_gguf_models().into_iter().next()
-    }
-
-    fn available_gguf_models(&self) -> Vec<PathBuf> {
-        let models_dir = self.base_dir.join("models");
-        let mut models = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(&models_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "gguf").unwrap_or(false) {
-                    models.push(path);
-                }
+        // ポートが解放されるまで待つ（最大5秒）
+        let port = self.server_port;
+        if is_port_open(port) {
+            let closed = self.wait_for_port_closed(port, Duration::from_secs(5));
+            if !closed {
+                let _ = self.event_tx.send(BackendEvent::Log(
+                    LogSource::Tenuki,
+                    format!("警告: 翻訳サーバー停止後もポート {} が解放されていません", port),
+                    LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
             }
         }
 
-        models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-        models
+        backend_info!(self.event_tx, "Translation server stopped");
+    }
+
+    /// 権威モデルパスを返す。selected_model（= launcher_config.toml の authority filename）が
+    /// 存在しない場合は None。他の .gguf への fallback は行わない。
+    fn resolve_model(&self) -> Option<PathBuf> {
+        let m = self.selected_model.as_ref()?;
+        if m.exists() { Some(m.clone()) } else { None }
     }
 }
 

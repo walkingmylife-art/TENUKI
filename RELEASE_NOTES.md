@@ -2,6 +2,13 @@
 
 ---
 
+### Version 1.1.1
+
+- **Improved Setup Stability**
+  Enhanced resilience to various network conditions.
+  Significantly overhauled the startup process to ensure the application launches reliably with a single double-click. 
+  This update is practically a complete rebuild.
+	
 ## Version 1.1.0
 - **Setup Overhaul**  
   Initial setup has been fully automated.  
@@ -98,6 +105,9 @@
 # TENUKI - リリースノート
 
 ---
+### バージョン 1.1.0　
+* **セットアップ安定化**　　回線状況への対応を強化　ダブルクリックで起動まで到達できるように色々やった。ほぼ作り直し。
+
 ### バージョン 1.1.0　
 * **セットアップ変更**　　初期セットアップを完全に自動化。　あんまりやるとウイルス扱いされやすいとか色々問題あるけど、最初にダブルクリックしたらもう使える・いらなくなったらフォルダごとゴミ箱に捨てれるのが一番いいので、ほんとに大変だったけど新規に作り直した。
 * **アラビア語対応**　　　こっそり対応してて、右書きとかの処理とかいろいろ考えたが、もうパッチがあるようなので左書きでそのまま翻訳されるだけでいい人がいると判断したので選択言語化。　折り返しの改行処理をデフォルトでオフにするように設定。

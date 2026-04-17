@@ -1,16 +1,18 @@
 // src/ui/container.rs
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use crate::config::StructuralOptions;
+use crate::messages::{InputAnalysisSnapshot, LogLevel};
 use anyhow::Result;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use crate::config::StructuralOptions;
-use crate::messages::{InputAnalysisSnapshot, LogLevel};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 
 const MAX_INPUT_HISTORY: usize = 500;
 
-fn default_occurrences() -> u32 { 1 }
+fn default_occurrences() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LeftPanelTab {
@@ -79,7 +81,7 @@ pub struct UiDisplayData {
     pub tenuki_running: bool,
     pub available_models: Vec<PathBuf>,
     pub selected_model: Option<PathBuf>,
-    pub status_message: String,
+    pub status_key: StatusKey,
     pub status_icon: StatusIcon,
     pub status_visible: bool,
     pub base_dir: PathBuf,
@@ -89,7 +91,6 @@ pub struct UiDisplayData {
     pub server_host: String,
     pub server_port: u16,
     pub local_ip: String,
-    pub custom_lang_code: String,
     pub custom_lang_name: String,
     pub dict_slot: Option<String>,
     pub translation_mode: String,
@@ -101,9 +102,52 @@ pub struct UiDisplayData {
     pub tokens_per_second: f32,
 }
 
-impl UiDisplayData {
-    pub fn total_dictionary_entries(&self) -> usize {
-        self.dictionary_loaded + self.dictionary_new
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum StatusKey {
+    #[default]
+    None,
+    Ready,
+    Failed,
+    Stopped,
+    Starting,
+    Stopping,
+    Restarting,
+    ConfigError,
+}
+
+impl StatusKey {
+    pub fn label(&self, ui_lang: &str) -> &'static str {
+        match (self, ui_lang) {
+            (StatusKey::None, _) => "",
+            (StatusKey::Ready, "en") => "Ready",
+            (StatusKey::Ready, "zh-CN") => "就绪",
+            (StatusKey::Ready, "zh-TW") => "就緒",
+            (StatusKey::Ready, _) => "準備完了",
+            (StatusKey::Failed, "en") => "Failed",
+            (StatusKey::Failed, "zh-CN") => "失败",
+            (StatusKey::Failed, "zh-TW") => "失敗",
+            (StatusKey::Failed, _) => "起動に失敗しました",
+            (StatusKey::Stopped, "en") => "Stopped",
+            (StatusKey::Stopped, "zh-CN") => "已停止",
+            (StatusKey::Stopped, "zh-TW") => "已停止",
+            (StatusKey::Stopped, _) => "停止しました",
+            (StatusKey::Starting, "en") => "Starting...",
+            (StatusKey::Starting, "zh-CN") => "正在启动...",
+            (StatusKey::Starting, "zh-TW") => "正在啟動...",
+            (StatusKey::Starting, _) => "起動しています...",
+            (StatusKey::Stopping, "en") => "Stopping...",
+            (StatusKey::Stopping, "zh-CN") => "正在停止...",
+            (StatusKey::Stopping, "zh-TW") => "正在停止...",
+            (StatusKey::Stopping, _) => "停止しています...",
+            (StatusKey::Restarting, "en") => "Restarting...",
+            (StatusKey::Restarting, "zh-CN") => "正在重启...",
+            (StatusKey::Restarting, "zh-TW") => "正在重新啟動...",
+            (StatusKey::Restarting, _) => "再起動しています...",
+            (StatusKey::ConfigError, "en") => "Config error",
+            (StatusKey::ConfigError, "zh-CN") => "配置错误",
+            (StatusKey::ConfigError, "zh-TW") => "設定錯誤",
+            (StatusKey::ConfigError, _) => "設定エラー",
+        }
     }
 }
 
@@ -117,15 +161,6 @@ pub enum StatusIcon {
 }
 
 impl StatusIcon {
-    pub fn char(&self) -> &'static str {
-        match self {
-            StatusIcon::None => "",
-            StatusIcon::Spinner => "🔄",
-            StatusIcon::Check => "✅",
-            StatusIcon::Warning => "⚠️",
-        }
-    }
-
     pub fn color(&self) -> egui::Color32 {
         match self {
             StatusIcon::None => egui::Color32::GRAY,
@@ -148,25 +183,21 @@ pub struct UiState {
     pub structural_edit: StructuralOptions,
     pub dict_slot_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
     pub work_folder: Option<PathBuf>,
-    pub work_folder_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
     pub selected_work_file: Option<PathBuf>,
-    /// 言語切り替え時の辞書確認ダイアログの待機データ
     pub dict_confirm: Option<DictConfirmPending>,
-    /// カスタム言語バッファ（翻訳用）
-    pub custom_tgt_code_buf: String,
-    /// カスタム言語名バッファ（翻訳用）
+    pub custom_tgt_val_buf: String,
     pub custom_tgt_name_buf: String,
-    /// ネットワーク設定バッファ
+    pub pending_tgt_lang: Option<String>,
     pub network_host_buf: String,
     pub network_port_buf: String,
     pub selected_input_record_id: Option<u64>,
     pub pickup_note_edit: String,
 }
 
-/// 言語切り替え時の辞書確認ダイアログ用
 pub struct DictConfirmPending {
     pub tgt: String,
-    pub current_slot: Option<String>, // None なら確認なしで新規作成
+    pub tgt_name: Option<String>,
+    pub current_slot: Option<String>,
 }
 
 #[derive(Default)]
@@ -174,18 +205,13 @@ pub struct UiCommands {
     pub start_backend: bool,
     pub stop_backend: bool,
     pub restart_backend: bool,
-    pub set_tgt_lang: Option<String>,
-    /// (src, tgt, keep_dict)
-    pub set_lang_pair: Option<(String, String, bool)>,
+    pub set_lang_pair: Option<(String, String, Option<String>, Option<String>)>,
     pub set_ui_lang: Option<String>,
-    pub set_custom_lang: Option<(String, String)>,
     pub set_dict_slot: Option<Option<String>>,
     pub exit_app: bool,
-    pub select_model: Option<PathBuf>,
-    pub set_ctx_size: Option<u32>,
-    pub set_translation_mode: Option<String>,
     pub set_structural_options: Option<StructuralOptions>,
     pub set_profile: Option<String>,
+    pub select_model: Option<String>,
     pub set_input_pickup: Option<(u64, bool)>,
     pub set_input_pickup_note: Option<(u64, String)>,
     pub set_work_folder: Option<PathBuf>,
@@ -193,7 +219,6 @@ pub struct UiCommands {
     pub refresh_pickup_preview: bool,
     pub set_server_port: Option<u16>,
     pub set_server_host: Option<String>,
-    pub set_firewall_rule: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -247,13 +272,16 @@ impl UiContainer {
     }
 
     pub fn add_log(&mut self, source: LogSource, msg: String, level: LogLevel, timestamp: String) {
-        let is_word_log = msg.starts_with("[XUnity]")
-            || msg.starts_with("[Model]");
+        let is_word_log = msg.starts_with("[XUnity]") || msg.starts_with("[Model]");
         let is_server_log = msg.starts_with("TENUKI translation server ")
             || msg.starts_with("Translation server ")
             || msg.starts_with("llama-server ");
 
-        let entry = LogEntry { timestamp, message: msg, level };
+        let entry = LogEntry {
+            timestamp,
+            message: msg,
+            level,
+        };
         match source {
             LogSource::Tenuki => {
                 if is_word_log {
@@ -291,12 +319,14 @@ impl UiContainer {
         original: String,
         translated: String,
     ) {
-        self.display.dictionary_history.push_back((timestamp, original, translated));
+        self.display
+            .dictionary_history
+            .push_back((timestamp, original, translated));
         while self.display.dictionary_history.len() > 100 {
             self.display.dictionary_history.pop_front();
         }
     }
-    
+
     pub fn set_dictionary_loaded(&mut self, count: usize) {
         self.display.dictionary_loaded = count;
     }
@@ -321,18 +351,23 @@ impl UiContainer {
     }
 
     pub fn update_available_models(&mut self, models: Vec<PathBuf>) {
-        self.display.available_models = models;
-        let selected_is_available = self.display.selected_model.as_ref().is_some_and(|selected| {
-            self.display.available_models.iter().any(|model| model == selected)
-        });
-
-        if !selected_is_available {
-            self.display.selected_model = self.display.available_models.first().cloned();
+        let selected_still_valid = self
+            .display
+            .selected_model
+            .as_ref()
+            .is_some_and(|selected| models.iter().any(|m| m == selected));
+        if !selected_still_valid {
+            self.display.selected_model = None;
         }
+        self.display.available_models = models;
     }
 
-    pub fn set_status(&mut self, message: &str, icon: StatusIcon, visible: bool) {
-        self.display.status_message = message.to_string();
+    pub fn update_selected_model(&mut self, model: Option<PathBuf>) {
+        self.display.selected_model = model;
+    }
+
+    pub fn set_status(&mut self, key: StatusKey, icon: StatusIcon, visible: bool) {
+        self.display.status_key = key;
         self.display.status_icon = icon;
         self.display.status_visible = visible;
     }
@@ -346,32 +381,28 @@ impl UiContainer {
     pub fn set_work_running(&mut self, running: bool) {
         self.display.work_running = running;
     }
-    
+
     pub fn update_src_lang(&mut self, lang: &str) {
         self.display.src_lang = lang.to_string();
     }
 
-    pub fn update_tgt_lang(&mut self, lang: &str) {
+    pub fn update_tgt_lang(&mut self, lang: &str, name: Option<&str>) {
         self.display.tgt_lang = lang.to_string();
-        let is_preset = ["en", "ja", "zh-CN", "zh-TW", "ko", "fr", "ar", "es", "it", "pt", "ru"]
-            .contains(&lang);
+        let is_preset = crate::config::is_target_language_preset(lang);
         if is_preset {
-            self.state.custom_tgt_code_buf.clear();
+            self.display.custom_lang_name.clear();
+            self.state.custom_tgt_val_buf.clear();
             self.state.custom_tgt_name_buf.clear();
         } else {
-            self.state.custom_tgt_code_buf = lang.to_string();
-            if self.display.custom_lang_code == lang {
-                self.state.custom_tgt_name_buf = self.display.custom_lang_name.clone();
-            }
+            let n = name.unwrap_or(&self.display.custom_lang_name).to_string();
+            self.display.custom_lang_name = n.clone();
+            self.state.custom_tgt_val_buf = lang.to_string();
+            self.state.custom_tgt_name_buf = n;
         }
     }
 
     pub fn update_dict_slot(&mut self, slot: Option<String>) {
         self.display.dict_slot = slot;
-    }
-
-    pub fn update_server_host(&mut self, host: &str) {
-        self.display.server_host = host.to_string();
     }
 
     pub fn load_input_records(&mut self) -> Result<()> {
@@ -394,9 +425,8 @@ impl UiContainer {
     }
 
     pub fn update_input_analysis(&mut self, snapshot: InputAnalysisSnapshot) -> bool {
-        let should_persist = !snapshot.result_stale
-            && !snapshot.raw_text.trim().is_empty()
-            && snapshot.model_calls > 0;
+        let should_persist =
+            !snapshot.result_stale && !snapshot.raw_text.trim().is_empty() && snapshot.model_calls > 0;
         self.display.input_snapshot = Some(snapshot.clone());
         self.state.selected_input_record_id = None;
 
@@ -444,14 +474,17 @@ impl UiContainer {
 
     pub fn set_input_pickup(&mut self, id: u64, pickup: bool) -> bool {
         let latest_record_id = self.display.input_records.back().map(|record| record.id);
-        if let Some(record) = self.display.input_records.iter_mut().find(|record| record.id == id) {
+        if let Some(record) = self
+            .display
+            .input_records
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
             if record.pickup == pickup {
                 return false;
             }
             record.pickup = pickup;
-            if self.state.selected_input_record_id == Some(id)
-                || latest_record_id == Some(id)
-            {
+            if self.state.selected_input_record_id == Some(id) || latest_record_id == Some(id) {
                 self.state.pickup_note_edit = record.note.clone();
             }
             return true;
@@ -462,15 +495,18 @@ impl UiContainer {
 
     pub fn update_input_pickup_note(&mut self, id: u64, note: String) -> bool {
         let latest_record_id = self.display.input_records.back().map(|record| record.id);
-        if let Some(record) = self.display.input_records.iter_mut().find(|record| record.id == id) {
+        if let Some(record) = self
+            .display
+            .input_records
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
             if record.note == note {
                 return false;
             }
 
             record.note = note.clone();
-            if self.state.selected_input_record_id == Some(id)
-                || latest_record_id == Some(id)
-            {
+            if self.state.selected_input_record_id == Some(id) || latest_record_id == Some(id) {
                 self.state.pickup_note_edit = note;
             }
             return true;
@@ -482,13 +518,11 @@ impl UiContainer {
     pub fn update_ui_lang(&mut self, lang: &str) {
         self.display.ui_lang = lang.to_string();
     }
-    
+
     pub fn update_translation_mode(&mut self, mode: &str) {
         self.display.translation_mode = mode.to_string();
     }
 
-    /// profiles/ ディレクトリを列挙して available_profiles を更新する。
-    /// ファイルが存在しない場合でも空リストをセットして UI を正しく初期化する。
     pub fn refresh_available_profiles(&mut self, profiles_dir: &std::path::Path) {
         let mut names: Vec<String> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(profiles_dir) {
@@ -522,17 +556,14 @@ impl UiContainer {
         shared_mb: Option<f32>,
         tokens_per_second: Option<f32>,
     ) {
-        if let Some(v) = vram_mb { self.display.vram_mb = v; }
-        if let Some(v) = shared_mb { self.display.shared_mb = v; }
-        if let Some(v) = tokens_per_second { self.display.tokens_per_second = v; }
-    }
-
-    pub fn update_custom_lang(&mut self, code: &str, name: &str) {
-        self.display.custom_lang_code = code.to_string();
-        self.display.custom_lang_name = name.to_string();
-        if self.display.tgt_lang == code {
-            self.state.custom_tgt_code_buf = code.to_string();
-            self.state.custom_tgt_name_buf = name.to_string();
+        if let Some(v) = vram_mb {
+            self.display.vram_mb = v;
+        }
+        if let Some(v) = shared_mb {
+            self.display.shared_mb = v;
+        }
+        if let Some(v) = tokens_per_second {
+            self.display.tokens_per_second = v;
         }
     }
 
@@ -558,7 +589,7 @@ mod tests {
             extracted_text: "known".to_string(),
             visible_text: "known".to_string(),
             model_inputs: vec!["known".to_string()],
-            final_output: Some("既知".to_string()),
+            final_output: Some("既存".to_string()),
             result_stale: false,
             dict_hits: 1,
             model_calls: 0,
@@ -579,7 +610,7 @@ mod tests {
             extracted_text: "new text".to_string(),
             visible_text: "new text".to_string(),
             model_inputs: vec!["new text".to_string()],
-            final_output: Some("新しい文".to_string()),
+            final_output: Some("新しい訳".to_string()),
             result_stale: false,
             dict_hits: 0,
             model_calls: 1,
@@ -637,7 +668,7 @@ mod tests {
             extracted_text: "new text".to_string(),
             visible_text: "new text".to_string(),
             model_inputs: vec!["new text".to_string()],
-            final_output: Some("新しい文".to_string()),
+            final_output: Some("新しい訳".to_string()),
             result_stale: false,
             dict_hits: 0,
             model_calls: 1,
@@ -646,12 +677,18 @@ mod tests {
 
         ui.save_input_records().expect("save should be a no-op");
 
-        let history_path = dir.join("dicts").join("ja").join("text").join("input_mode_history.json");
+        let history_path = dir
+            .join("dicts")
+            .join("ja")
+            .join("text")
+            .join("input_mode_history.json");
         assert!(!history_path.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
 
 impl Default for UiContainer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

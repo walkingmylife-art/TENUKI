@@ -29,8 +29,4 @@ impl NewEntriesCache {
     pub fn drain(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.inner.lock().unwrap())
     }
-
-    pub fn clear(&self) {
-        self.inner.lock().unwrap().clear();
-    }
 }

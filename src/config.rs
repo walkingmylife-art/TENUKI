@@ -1,51 +1,55 @@
 //! Configuration management.
-//!
-//! config.toml は翻訳挙動・UI 設定・翻訳サーバー設定のみを保持する。
-//! llama-server 起動条件（backend, ctx_size, ngl, model など）は
-//! launcher_config.toml (AppConfig) が唯一の権威。
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn default_true() -> bool {
     true
 }
+
 fn default_wrap_min_chars() -> u32 {
     30
 }
+
 fn default_wrap_min_tail_chars() -> u32 {
     10
 }
+
 fn default_prompt_template() -> String {
     "Translate the following segment into {target}, without additional explanation.".to_string()
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TranslationProfile {
-    #[serde(default = "default_prompt_template")]
-    pub prompt_template: String,
-    #[serde(default = "default_true")]
-    pub enable_model_wrap: bool,
-    #[serde(default = "default_wrap_min_chars")]
-    pub model_wrap_min_chars: u32,
-    #[serde(default = "default_wrap_min_tail_chars")]
-    pub model_wrap_min_tail_chars: u32,
-    #[serde(default = "default_true")]
-    pub enable_model_symbol_cleanup: bool,
+fn default_profile_version() -> u32 {
+    1
 }
 
-impl Default for TranslationProfile {
-    fn default() -> Self {
-        Self {
-            prompt_template: default_prompt_template(),
-            enable_model_wrap: true,
-            model_wrap_min_chars: default_wrap_min_chars(),
-            model_wrap_min_tail_chars: default_wrap_min_tail_chars(),
-            enable_model_symbol_cleanup: true,
-        }
+fn default_profile_translation_mode() -> String {
+    "structural".to_string()
+}
+
+pub const TARGET_LANGUAGE_PRESETS: &[&str] = &["ja", "en", "zh-CN", "zh-TW", "ko", "ar"];
+
+pub fn is_target_language_preset(code: &str) -> bool {
+    TARGET_LANGUAGE_PRESETS.contains(&code)
+}
+
+fn sanitize_profile_name(name: &str) -> String {
+    if name.is_empty() {
+        return "default".to_string();
+    }
+
+    let filtered: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+
+    if filtered.is_empty() {
+        "default".to_string()
+    } else {
+        filtered
     }
 }
 
@@ -75,8 +79,161 @@ impl Default for StructuralOptions {
     }
 }
 
-/// 翻訳挙動・UI・翻訳サーバー設定。
-/// llama-server 起動条件は含まない。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileStructuralOptions {
+    #[serde(default)]
+    pub protect_tags: bool,
+    #[serde(default)]
+    pub protect_brackets: bool,
+    #[serde(default)]
+    pub protect_escaped_sequences: bool,
+    #[serde(default)]
+    pub protect_placeholders: bool,
+    #[serde(default)]
+    pub split_symbolic_segments: bool,
+}
+
+impl Default for ProfileStructuralOptions {
+    fn default() -> Self {
+        Self {
+            protect_tags: false,
+            protect_brackets: false,
+            protect_escaped_sequences: false,
+            protect_placeholders: false,
+            split_symbolic_segments: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileModelProcessingOptions {
+    #[serde(default)]
+    pub enable_model_wrap: bool,
+    #[serde(default)]
+    pub model_wrap_min_chars: usize,
+    #[serde(default)]
+    pub model_wrap_min_tail_chars: usize,
+    #[serde(default)]
+    pub enable_model_symbol_cleanup: bool,
+}
+
+impl Default for ProfileModelProcessingOptions {
+    fn default() -> Self {
+        Self {
+            enable_model_wrap: false,
+            model_wrap_min_chars: 30,
+            model_wrap_min_tail_chars: 10,
+            enable_model_symbol_cleanup: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TranslationProfile {
+    #[serde(default = "default_profile_version")]
+    pub version: u32,
+    #[serde(default = "default_profile_translation_mode")]
+    pub translation_mode: String,
+    #[serde(default = "default_prompt_template")]
+    pub prompt_template: String,
+    #[serde(default)]
+    pub structural: ProfileStructuralOptions,
+    #[serde(default)]
+    pub model_processing: ProfileModelProcessingOptions,
+}
+
+impl Default for TranslationProfile {
+    fn default() -> Self {
+        Self {
+            version: default_profile_version(),
+            translation_mode: default_profile_translation_mode(),
+            prompt_template: default_prompt_template(),
+            structural: ProfileStructuralOptions::default(),
+            model_processing: ProfileModelProcessingOptions::default(),
+        }
+    }
+}
+
+impl TranslationProfile {
+    pub fn game_default() -> Self {
+        Self {
+            version: default_profile_version(),
+            translation_mode: default_profile_translation_mode(),
+            prompt_template: "Translate the following segment into {target}, preserving all special symbols and tags exactly as they appear. Do not add any explanations.".to_string(),
+            structural: ProfileStructuralOptions {
+                protect_tags: true,
+                protect_brackets: true,
+                protect_escaped_sequences: true,
+                protect_placeholders: true,
+                split_symbolic_segments: true,
+            },
+            model_processing: ProfileModelProcessingOptions {
+                enable_model_wrap: true,
+                model_wrap_min_chars: 30,
+                model_wrap_min_tail_chars: 10,
+                enable_model_symbol_cleanup: true,
+            },
+        }
+    }
+
+    pub fn load(profile_dir: &Path, name: &str) -> Result<Self> {
+        fs::create_dir_all(profile_dir)?;
+
+        let name = sanitize_profile_name(name);
+        let path = profile_dir.join(format!("{}.toml", name));
+
+        if !path.exists() {
+            let default_path = profile_dir.join("default.toml");
+            if !default_path.exists() {
+                TranslationProfile::default().save(&default_path)?;
+            }
+            fs::copy(&default_path, &path)?;
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let mut profile: TranslationProfile = toml::from_str(&content)?;
+        profile.normalize();
+        Ok(profile)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let content = toml::to_string_pretty(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        self.translation_mode = normalize_translation_mode(&self.translation_mode);
+        if self.prompt_template.trim().is_empty() {
+            self.prompt_template = default_prompt_template();
+        }
+    }
+}
+
+impl From<StructuralOptions> for ProfileStructuralOptions {
+    fn from(value: StructuralOptions) -> Self {
+        Self {
+            protect_tags: value.protect_tags,
+            protect_brackets: value.protect_brackets,
+            protect_escaped_sequences: value.protect_escaped_sequences,
+            protect_placeholders: value.protect_placeholders,
+            split_symbolic_segments: value.split_symbolic_segments,
+        }
+    }
+}
+
+impl From<ProfileStructuralOptions> for StructuralOptions {
+    fn from(value: ProfileStructuralOptions) -> Self {
+        Self {
+            protect_tags: value.protect_tags,
+            protect_brackets: value.protect_brackets,
+            protect_escaped_sequences: value.protect_escaped_sequences,
+            protect_placeholders: value.protect_placeholders,
+            split_symbolic_segments: value.split_symbolic_segments,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_src_lang")]
@@ -85,35 +242,30 @@ pub struct Config {
     pub tgt_lang: String,
     #[serde(default)]
     pub dict_slot: Option<String>,
-    #[serde(default = "default_translation_mode")]
+    #[serde(default = "default_translation_mode", skip_serializing)]
     pub translation_mode: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub structural: StructuralOptions,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing)]
     pub enable_model_wrap: bool,
-    #[serde(default = "default_wrap_min_chars")]
+    #[serde(default, skip_serializing)]
+    pub wrap_override: Option<bool>,
+    #[serde(default = "default_wrap_min_chars", skip_serializing)]
     pub model_wrap_min_chars: u32,
-    #[serde(default = "default_wrap_min_tail_chars")]
+    #[serde(default = "default_wrap_min_tail_chars", skip_serializing)]
     pub model_wrap_min_tail_chars: u32,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing)]
     pub enable_model_symbol_cleanup: bool,
-    #[serde(default = "default_prompt_template")]
+    #[serde(default = "default_prompt_template", skip_serializing)]
     pub prompt_template: String,
-    /// 翻訳サーバー（TENUKI 内部）のホスト
     #[serde(default = "default_server_host")]
     pub server_host: String,
-    /// 翻訳サーバー（TENUKI 内部）のポート
     #[serde(default = "default_server_port")]
     pub server_port: u16,
     #[serde(default = "default_ui_lang")]
     pub ui_lang: String,
-    /// Short code for a custom language, for example "vi" or "th".
-    #[serde(default)]
-    pub custom_lang_code: String,
-    /// Display name for a custom language, for example "Vietnamese".
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub custom_lang_name: String,
-    /// プロファイル名（profiles/{name}.toml を読み込む）。省略時は "game"。
     #[serde(default = "default_profile")]
     pub profile: String,
     #[serde(default = "default_language_models")]
@@ -123,24 +275,31 @@ pub struct Config {
 fn default_src_lang() -> String {
     "en".to_string()
 }
+
 fn default_tgt_lang() -> String {
     "ja".to_string()
 }
+
 fn default_translation_mode() -> String {
     "structural".to_string()
 }
+
 fn default_profile() -> String {
     "game".to_string()
 }
+
 fn default_server_host() -> String {
     "127.0.0.1".to_string()
 }
+
 fn default_server_port() -> u16 {
     14371
 }
+
 fn default_ui_lang() -> String {
     "en".to_string()
 }
+
 fn default_language_models() -> HashMap<String, String> {
     HashMap::new()
 }
@@ -156,22 +315,26 @@ fn normalize_ui_lang(value: &str) -> String {
     match value.trim() {
         "en" => "en".to_string(),
         "ja" => "ja".to_string(),
+        "zh-CN" => "zh-CN".to_string(),
         _ => default_ui_lang(),
     }
 }
 
 fn normalize_profile_name(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "default" => "default".to_string(),
-        "game" => "game".to_string(),
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default_profile();
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
         "unity_ja" | "rpgmaker_ja" => "game".to_string(),
-        _ => default_profile(),
+        "default" | "game" => trimmed.to_ascii_lowercase(),
+        _ => sanitize_profile_name(trimmed),
     }
 }
 
 impl Config {
     fn normalize(&mut self) {
-        self.translation_mode = normalize_translation_mode(&self.translation_mode);
         self.profile = normalize_profile_name(&self.profile);
 
         if self.src_lang.trim().is_empty() {
@@ -186,122 +349,108 @@ impl Config {
         if self.server_port == 0 {
             self.server_port = default_server_port();
         }
-        if self.model_wrap_min_chars == 0 {
-            self.model_wrap_min_chars = default_wrap_min_chars();
-        }
-        if self.model_wrap_min_tail_chars == 0 {
-            self.model_wrap_min_tail_chars = default_wrap_min_tail_chars();
-        }
 
         self.ui_lang = normalize_ui_lang(&self.ui_lang);
 
         if self.dict_slot.as_deref().is_some_and(|v| v.trim().is_empty()) {
             self.dict_slot = None;
         }
-        if self.custom_lang_code.trim().is_empty() {
+        if is_target_language_preset(&self.tgt_lang) {
             self.custom_lang_name.clear();
-        }
-        if self.prompt_template.trim().is_empty() {
-            self.prompt_template = default_prompt_template();
         }
     }
 
     pub fn new() -> Self {
+        let profile = TranslationProfile::default();
         Self {
             src_lang: default_src_lang(),
             tgt_lang: default_tgt_lang(),
             dict_slot: None,
-            translation_mode: default_translation_mode(),
-            structural: StructuralOptions::default(),
-            enable_model_wrap: true,
-            model_wrap_min_chars: default_wrap_min_chars(),
-            model_wrap_min_tail_chars: default_wrap_min_tail_chars(),
-            enable_model_symbol_cleanup: true,
-            prompt_template: default_prompt_template(),
+            translation_mode: profile.translation_mode.clone(),
+            structural: profile.structural.into(),
+            enable_model_wrap: profile.model_processing.enable_model_wrap,
+            wrap_override: None,
+            model_wrap_min_chars: profile.model_processing.model_wrap_min_chars as u32,
+            model_wrap_min_tail_chars: profile.model_processing.model_wrap_min_tail_chars as u32,
+            enable_model_symbol_cleanup: profile.model_processing.enable_model_symbol_cleanup,
+            prompt_template: profile.prompt_template.clone(),
             server_host: default_server_host(),
             server_port: default_server_port(),
             ui_lang: default_ui_lang(),
-            custom_lang_code: String::new(),
             custom_lang_name: String::new(),
             profile: default_profile(),
             language_models: default_language_models(),
         }
     }
 
+    pub fn effective_model_wrap(&self) -> bool {
+        self.wrap_override.unwrap_or(self.enable_model_wrap)
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.translation_mode != "structural" && self.translation_mode != "passthrough" {
-            anyhow::bail!(
-                "translation_mode must be 'structural' or 'passthrough', got: {}",
-                self.translation_mode
-            );
-        }
         if self.server_port == 0 {
             anyhow::bail!("server_port must not be 0");
         }
-        if self.prompt_template.trim().is_empty() {
-            anyhow::bail!("prompt_template must not be empty");
-        }
-        if self.model_wrap_min_chars == 0 {
-            anyhow::bail!("model_wrap_min_chars must not be 0");
-        }
-        if self.model_wrap_min_tail_chars == 0 {
-            anyhow::bail!("model_wrap_min_tail_chars must not be 0");
-        }
-        if self.profile != "default" && self.profile != "game" {
-            anyhow::bail!("profile must be 'default' or 'game', got: {}", self.profile);
+        if self.profile.trim().is_empty() {
+            anyhow::bail!("profile must not be empty");
         }
         Ok(())
     }
 }
 
-fn profile_file_path(config_path: &Path, profile_name: &str) -> PathBuf {
-    let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let name = if profile_name.trim().is_empty() {
-        default_profile()
-    } else {
-        profile_name.trim().to_string()
-    };
-    base_dir.join("profiles").join(format!("{}.toml", name))
-}
-
 fn apply_translation_profile(config: &mut Config, profile: &TranslationProfile) {
+    config.translation_mode = profile.translation_mode.clone();
     config.prompt_template = profile.prompt_template.clone();
-    config.enable_model_wrap = profile.enable_model_wrap;
-    config.model_wrap_min_chars = profile.model_wrap_min_chars;
-    config.model_wrap_min_tail_chars = profile.model_wrap_min_tail_chars;
-    config.enable_model_symbol_cleanup = profile.enable_model_symbol_cleanup;
+    config.structural = profile.structural.into();
+    config.enable_model_wrap = profile.model_processing.enable_model_wrap;
+    config.model_wrap_min_chars = profile.model_processing.model_wrap_min_chars as u32;
+    config.model_wrap_min_tail_chars = profile.model_processing.model_wrap_min_tail_chars as u32;
+    config.enable_model_symbol_cleanup = profile.model_processing.enable_model_symbol_cleanup;
 }
 
-pub fn current_translation_profile(config: &Config) -> TranslationProfile {
-    TranslationProfile {
-        prompt_template: config.prompt_template.clone(),
-        enable_model_wrap: config.enable_model_wrap,
-        model_wrap_min_chars: config.model_wrap_min_chars,
-        model_wrap_min_tail_chars: config.model_wrap_min_tail_chars,
-        enable_model_symbol_cleanup: config.enable_model_symbol_cleanup,
+/// Applies a small runtime overlay derived from the current target language.
+fn apply_target_language_policy(config: &mut Config) {
+    match config.tgt_lang.as_str() {
+        "ar" => {
+            config.wrap_override = Some(false);
+        }
+        _ => config.wrap_override = None,
     }
 }
 
-pub fn save_active_profile(config_path: &Path, config: &Config) -> Result<()> {
-    let profile_path = profile_file_path(config_path, &config.profile);
-    if let Some(parent) = profile_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let content = toml::to_string_pretty(&current_translation_profile(config))?;
-    fs::write(profile_path, content)?;
-    Ok(())
+/// Saves structural options into the active profile, not the root config.
+pub fn save_profile_structural(
+    config_path: &Path,
+    profile_name: &str,
+    options: crate::config::StructuralOptions,
+) -> Result<()> {
+    let profile_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("profiles");
+    let mut profile = TranslationProfile::load(&profile_dir, profile_name).unwrap_or_default();
+    profile.structural = options.into();
+    let path = profile_dir.join(format!("{}.toml", sanitize_profile_name(profile_name)));
+    profile.save(&path)
+}
+
+pub fn load_profile(config_path: &Path, profile_name: &str) -> Result<TranslationProfile> {
+    let profile_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("profiles");
+    TranslationProfile::load(&profile_dir, profile_name)
 }
 
 pub fn load(path: &Path) -> Result<Config> {
     let content = fs::read_to_string(path)?;
     let mut config: Config = toml::from_str(&content)?;
     config.normalize();
-    let profile_path = profile_file_path(path, &config.profile);
-    if let Ok(profile_content) = fs::read_to_string(profile_path) {
-        if let Ok(profile) = toml::from_str::<TranslationProfile>(&profile_content) {
-            apply_translation_profile(&mut config, &profile);
-        }
-    }
+
+    let profile = load_profile(path, &config.profile).unwrap_or_default();
+    apply_translation_profile(&mut config, &profile);
+    apply_target_language_policy(&mut config);
+
     config.validate()?;
     Ok(config)
 }
@@ -317,7 +466,8 @@ pub fn save(path: &Path, config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, StructuralOptions};
+    use super::{load, save, Config, StructuralOptions, TranslationProfile};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalizes_missing_values() {
@@ -326,11 +476,9 @@ mod tests {
 src_lang = ""
 tgt_lang = ""
 dict_slot = ""
-translation_mode = "legacy"
 server_port = 0
 ui_lang = "de"
-custom_lang_code = ""
-custom_lang_name = "Vietnamese"
+custom_lang_name = "Brazilian Portuguese"
 "#,
         )
         .unwrap();
@@ -340,36 +488,11 @@ custom_lang_name = "Vietnamese"
         assert_eq!(config.src_lang, "en");
         assert_eq!(config.tgt_lang, "ja");
         assert_eq!(config.dict_slot, None);
-        assert_eq!(config.translation_mode, "structural");
         assert_eq!(config.structural, StructuralOptions::default());
-        assert!(config.enable_model_wrap);
-        assert_eq!(config.model_wrap_min_chars, 30);
-        assert_eq!(config.model_wrap_min_tail_chars, 10);
-        assert!(config.enable_model_symbol_cleanup);
-        assert_eq!(
-            config.prompt_template,
-            "Translate the following segment into {target}, without additional explanation."
-        );
         assert_eq!(config.server_port, 14371);
         assert_eq!(config.ui_lang, "en");
         assert_eq!(config.custom_lang_name, "");
-    }
-
-    #[test]
-    fn normalizes_unknown_translation_mode_to_structural() {
-        let mut config: Config = toml::from_str(
-            r#"
-src_lang = "en"
-tgt_lang = "ja"
-translation_mode = "ANALYSIS"
-"#,
-        )
-        .unwrap();
-
-        config.normalize();
-
-        assert_eq!(config.translation_mode, "structural");
-        assert!(config.validate().is_ok());
+        assert_eq!(config.wrap_override, None);
     }
 
     #[test]
@@ -383,10 +506,10 @@ tgt_lang = "ja"
         .unwrap();
 
         assert_eq!(config.structural, StructuralOptions::default());
-        assert!(config.enable_model_wrap);
+        assert_eq!(config.enable_model_wrap, true);
         assert_eq!(config.model_wrap_min_chars, 30);
         assert_eq!(config.model_wrap_min_tail_chars, 10);
-        assert!(config.enable_model_symbol_cleanup);
+        assert_eq!(config.enable_model_symbol_cleanup, true);
         assert_eq!(
             config.prompt_template,
             "Translate the following segment into {target}, without additional explanation."
@@ -394,8 +517,148 @@ tgt_lang = "ja"
     }
 
     #[test]
+    fn loads_profile_into_runtime_config() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_config_test_{}", unique));
+        std::fs::create_dir_all(base_dir.join("profiles")).unwrap();
+
+        std::fs::write(
+            base_dir.join("config.toml"),
+            r#"
+src_lang = "en"
+tgt_lang = "ja"
+profile = "custom"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            base_dir.join("profiles").join("custom.toml"),
+            r#"
+version = 1
+translation_mode = "passthrough"
+prompt_template = "Profile prompt"
+
+[structural]
+protect_tags = true
+protect_brackets = false
+protect_escaped_sequences = true
+protect_placeholders = false
+split_symbolic_segments = true
+
+[model_processing]
+enable_model_wrap = true
+model_wrap_min_chars = 40
+model_wrap_min_tail_chars = 12
+enable_model_symbol_cleanup = true
+"#,
+        )
+        .unwrap();
+
+        let config = load(&base_dir.join("config.toml")).unwrap();
+
+        assert_eq!(config.profile, "custom");
+        assert_eq!(config.translation_mode, "passthrough");
+        assert_eq!(config.prompt_template, "Profile prompt");
+        assert!(config.structural.protect_tags);
+        assert!(!config.structural.protect_brackets);
+        assert_eq!(config.model_wrap_min_chars, 40);
+        assert_eq!(config.model_wrap_min_tail_chars, 12);
+        assert!(config.enable_model_symbol_cleanup);
+        assert_eq!(config.wrap_override, None);
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn arabic_target_applies_runtime_wrap_override() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_config_ar_test_{}", unique));
+        std::fs::create_dir_all(base_dir.join("profiles")).unwrap();
+
+        std::fs::write(
+            base_dir.join("config.toml"),
+            r#"
+src_lang = "en"
+tgt_lang = "ar"
+profile = "custom"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            base_dir.join("profiles").join("custom.toml"),
+            r#"
+version = 1
+translation_mode = "structural"
+prompt_template = "Profile prompt"
+
+[structural]
+protect_tags = true
+protect_brackets = true
+protect_escaped_sequences = true
+protect_placeholders = true
+split_symbolic_segments = true
+
+[model_processing]
+enable_model_wrap = true
+model_wrap_min_chars = 40
+model_wrap_min_tail_chars = 12
+enable_model_symbol_cleanup = true
+"#,
+        )
+        .unwrap();
+
+        let config = load(&base_dir.join("config.toml")).unwrap();
+
+        assert_eq!(config.profile, "custom");
+        assert!(config.enable_model_wrap);
+        assert_eq!(config.wrap_override, Some(false));
+        assert!(!config.effective_model_wrap());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn save_omits_profile_owned_fields_from_root_config() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_config_save_test_{}", unique));
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let path = base_dir.join("config.toml");
+        let mut config = Config::new();
+        config.profile = "game".to_string();
+        save(&path, &config).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("translation_mode"));
+        assert!(!saved.contains("prompt_template"));
+        assert!(!saved.contains("enable_model_wrap"));
+        assert!(!saved.contains("wrap_override"));
+        assert!(!saved.contains("[structural]"));
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn profile_roundtrip_keeps_translation_mode() {
+        let profile = TranslationProfile::game_default();
+        assert_eq!(profile.translation_mode, "structural");
+        assert!(profile.structural.protect_tags);
+        assert!(profile.model_processing.enable_model_wrap);
+    }
+
+    #[test]
     fn old_llama_fields_in_toml_are_ignored() {
-        // 旧 config.toml に llama 系フィールドが残っていても parse エラーにならない
         let config: Config = toml::from_str(
             r#"
 src_lang = "en"
@@ -417,5 +680,22 @@ selected_model = "model.gguf"
         assert_eq!(config.src_lang, "en");
         assert_eq!(config.tgt_lang, "ja");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn non_ui_target_keeps_custom_lang_name() {
+        let mut config: Config = toml::from_str(
+            r#"
+src_lang = "en"
+tgt_lang = "pt-BR"
+custom_lang_name = "Brazilian Portuguese"
+"#,
+        )
+        .unwrap();
+
+        config.normalize();
+
+        assert_eq!(config.tgt_lang, "pt-BR");
+        assert_eq!(config.custom_lang_name, "Brazilian Portuguese");
     }
 }

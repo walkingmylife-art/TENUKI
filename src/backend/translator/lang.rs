@@ -2,36 +2,25 @@
 
 fn lang_name_en(code: &str) -> &'static str {
     match code {
-        "zh"     => "Chinese",
-        "zh-CN"  => "Simplified Chinese",
-        "zh-Hant"=> "Traditional Chinese",
-        "zh-TW"  => "Traditional Chinese",
-        "en"     => "English",
-        "ja"     => "Japanese",
-        "ko"     => "Korean",
-        "fr"     => "French",
-        "de"     => "German",
-        "es"     => "Spanish",
-        "it"     => "Italian",
-        "pt"     => "Portuguese",
-        "ru"     => "Russian",
-        "ar"     => "Arabic",
-        "th"     => "Thai",
-        "vi"     => "Vietnamese",
-        _        => "",
+        "zh-CN" => "Simplified Chinese",
+        "zh-TW" => "Traditional Chinese",
+        "en" => "English",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "ar" => "Arabic",
+        _ => "",
     }
 }
 
-fn resolve_lang_name(
-    code: &str,
-    custom_code: &str,
-    custom_name: &str,
-) -> String {
-    if !custom_code.is_empty() && code == custom_code && !custom_name.is_empty() {
-        return custom_name.to_string();
-    }
+fn resolve_lang_name(code: &str, custom_name: &str) -> String {
     let preset = lang_name_en(code);
-    if !preset.is_empty() { preset.to_string() } else { code.to_string() }
+    if !preset.is_empty() {
+        preset.to_string()
+    } else if !custom_name.trim().is_empty() {
+        custom_name.to_string()
+    } else {
+        code.to_string()
+    }
 }
 
 /// 言語ペアから翻訳指令を生成する。
@@ -40,11 +29,10 @@ fn resolve_lang_name(
 pub fn build_lang_prefix(
     _src_lang: &str,
     tgt_lang: &str,
-    custom_code: &str,
     custom_name: &str,
     prompt_template: &str,
 ) -> String {
-    let target = resolve_lang_name(tgt_lang, custom_code, custom_name);
+    let target = resolve_lang_name(tgt_lang, custom_name);
     prompt_template
         .replace("{target}", &target)
         .replace("{language}", &target)
@@ -62,7 +50,6 @@ mod tests {
                 "zh-CN",
                 "ja",
                 "",
-                "",
                 "Translate the following segment into {target}, without additional explanation.",
             ),
             "Translate the following segment into Japanese, without additional explanation.",
@@ -76,7 +63,6 @@ mod tests {
                 "ja",
                 "en",
                 "",
-                "",
                 "Translate the following segment into {target}, without additional explanation.",
             ),
             "Translate the following segment into English, without additional explanation.",
@@ -88,19 +74,18 @@ mod tests {
         assert_eq!(
             build_lang_prefix(
                 "ja",
-                "vi",
-                "vi",
-                "Vietnamese",
+                "pt-BR",
+                "Brazilian Portuguese",
                 "Translate the following segment into {target}, without additional explanation.",
             ),
-            "Translate the following segment into Vietnamese, without additional explanation.",
+            "Translate the following segment into Brazilian Portuguese, without additional explanation.",
         );
     }
 
     #[test]
     fn uses_custom_template_placeholders() {
         assert_eq!(
-            build_lang_prefix("ja", "en", "", "", "Only output {language}."),
+            build_lang_prefix("ja", "en", "", "Only output {language}."),
             "Only output English.",
         );
     }

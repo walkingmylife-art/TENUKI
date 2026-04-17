@@ -39,10 +39,6 @@ pub enum GpuClass {
 
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
-    pub description: String,
-    pub vendor_id: u32,
-    pub device_id: u32,
-    pub vendor: GpuVendor,
     pub class: GpuClass,
     pub dedicated_video_memory: u64,
 }
@@ -110,10 +106,15 @@ impl BackendDetector {
 
     pub fn quick_check_rocm() -> bool {
         for cmd in ["hipInfo", "rocminfo"] {
-            let ok = std::process::Command::new(cmd)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+            let mut c = std::process::Command::new(cmd);
+            c.stdout(std::process::Stdio::null())
+             .stderr(std::process::Stdio::null());
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x08000000);
+            }
+            let ok = c.status()
                 .map(|s| s.success())
                 .unwrap_or(false);
             if ok {
@@ -156,10 +157,6 @@ fn enumerate_gpus_dxgi() -> Result<Vec<GpuInfo>> {
             let class = classify_gpu(vendor, desc.DeviceId, &description);
 
             gpus.push(GpuInfo {
-                description,
-                vendor_id: desc.VendorId,
-                device_id: desc.DeviceId,
-                vendor,
                 class,
                 dedicated_video_memory: desc.DedicatedVideoMemory,
             });

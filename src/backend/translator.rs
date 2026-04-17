@@ -44,9 +44,6 @@ pub enum LogEvent {
         translated: String,
         elapsed_secs: f64,
     },
-    Info {
-        message: String,
-    },
     Error {
         message: String,
     },

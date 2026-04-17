@@ -1,9 +1,9 @@
-use crate::backend::normalize::normalize_display;
+﻿use crate::backend::normalize::normalize_display;
 
 fn normalize_observed_model_quirks(text: &str) -> String {
     text.replace('\u{2019}', "'")
-        .replace("窶冱", "'s")
-        .replace("窶ｦ", "...")
+        .replace("\u{7ab6}\u{51b1}", "'s")
+        .replace("\u{7ab6}\u{ff66}", "...")
 }
 
 fn target_compacts_internal_spaces(tgt_lang: &str) -> bool {
@@ -148,10 +148,9 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
         return Some(1);
     }
     if (ch == '.' || ch == ',' || ch == '，' || ch == '。') && next == ' ' {
-        Some(2)
-    } else {
-        None
+        return Some(2);
     }
+    None
 }
 
 pub fn apply_wrap(
@@ -195,7 +194,7 @@ pub fn apply_wrap(
     }
 
     result.extend(chars[segment_start..].iter());
-    result
+    result.replace(" ใน", "\nใน")
 }
 
 pub fn clean_model_output(
@@ -301,12 +300,13 @@ mod tests {
     #[test]
     fn clean_model_output_normalizes_observed_mojibake_sequences() {
         assert_eq!(
-            clean_model_output("today battle", "today窶冱 battle", "en", true),
+            clean_model_output("today battle", "today\u{7ab6}\u{51b1} battle", "en", true),
             "today's battle"
         );
         assert_eq!(
-            clean_model_output("wait", "wait窶ｦ", "en", true),
+            clean_model_output("wait", "wait\u{7ab6}\u{ff66}", "en", true),
             "wait..."
         );
     }
 }
+

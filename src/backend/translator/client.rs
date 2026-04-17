@@ -30,12 +30,6 @@ impl HttpLlmClient {
         }
     }
 
-    pub fn with_timeouts(mut self, connect: Duration, read: Duration) -> Self {
-        self.timeout_connect = connect;
-        self.timeout_read = read;
-        self
-    }
-
     fn call_internal(&self, text: &str, prefix: &str) -> Option<String> {
         if text.trim().is_empty() {
             return Some(text.to_string());

@@ -29,16 +29,13 @@ pub enum FrontendCommand {
     Start,
     Stop,
     Restart,
-    /// keep_dict=true のとき現スロットを維持、false のとき新規スロットを作成
-    SetLanguagePair { src: String, tgt: String, keep_dict: bool },
-    SetCustomLanguage { code: String, name: String },
+    /// dict_slot=Some(path) のとき指定スロットを使用、None のとき新規スロットを作成
+    SetLanguagePair { src: String, tgt: String, tgt_name: Option<String>, dict_slot: Option<String> },
     SetDictSlot(Option<String>),
     SetProfile(String),
+    SetModel(String),
     UpdateSettings {
-        ctx_size: Option<u32>,
-        model: Option<PathBuf>,
         structural: Option<StructuralOptions>,
-        translation_mode: Option<String>,
         server_port: Option<u16>,
         server_host: Option<String>,
     },
@@ -48,17 +45,11 @@ impl FrontendCommand {
     pub fn is_empty_update(&self) -> bool {
         match self {
             FrontendCommand::UpdateSettings {
-                ctx_size,
-                model,
                 structural,
-                translation_mode,
                 server_port,
                 server_host,
             } => {
-                ctx_size.is_none()
-                    && model.is_none()
-                    && structural.is_none()
-                    && translation_mode.is_none()
+                structural.is_none()
                     && server_port.is_none()
                     && server_host.is_none()
             }
@@ -90,6 +81,8 @@ pub enum BackendEvent {
         translator_success: bool,
     },
     AvailableModels(Vec<PathBuf>),
+    /// authority resolved model を UI に通知する。AvailableModels とは分離して送信する。
+    SelectedModelResolved(Option<PathBuf>),
     LanguageChanged(String),
     DictSlotChanged(String),
     ServerMetrics {
@@ -122,7 +115,6 @@ impl std::fmt::Display for LogSource {
 pub enum LogLevel {
     Info,
     Success,
-    Warning,
     Error,
 }
 

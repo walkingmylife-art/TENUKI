@@ -1,9 +1,9 @@
 // src/launcher/launcher_ui.rs
 
 use eframe::egui::{self, CentralPanel, Context, ProgressBar};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::progress::{LaunchProgress, LauncherStage};
 
@@ -26,16 +26,14 @@ impl Default for LauncherUiState {
         Self {
             step: LauncherStep::Launching,
             stage: LauncherStage::Directories,
-            status: String::new(),  // 固定日本語をやめ、空文字に
+            status: String::new(),
             sub_status: String::new(),
             progress: 0.0,
         }
     }
 }
 
-/// ランチャー画面の文言を ui_lang に応じて返す
 pub struct LauncherText {
-    pub preparing: String,
     pub cancel: String,
     pub cancelled: String,
     pub error: String,
@@ -49,7 +47,6 @@ pub struct LauncherText {
 pub fn launcher_text(ui_lang: &str) -> LauncherText {
     match ui_lang {
         "en" => LauncherText {
-            preparing: "Preparing...".to_string(),
             cancel: "Cancel".to_string(),
             cancelled: "Cancelled".to_string(),
             error: "Error".to_string(),
@@ -60,26 +57,24 @@ pub fn launcher_text(ui_lang: &str) -> LauncherText {
             step_label: "Step".to_string(),
         },
         _ => LauncherText {
-            preparing: "準備中...".to_string(),
             cancel: "キャンセル".to_string(),
             cancelled: "キャンセルされました".to_string(),
             error: "エラー".to_string(),
             retry: "再試行".to_string(),
             open_folder: "フォルダを開く".to_string(),
-            unexpected_exit: "起動処理が予期せず終了しました".to_string(),
+            unexpected_exit: "ランチャーが予期せず終了しました".to_string(),
             retrying: "再試行中...".to_string(),
             step_label: "ステップ".to_string(),
         },
     }
 }
 
-/// ステージから (現在ステップ, 総ステップ数) を返す
 fn stage_progress(stage: LauncherStage) -> (usize, usize) {
     match stage {
         LauncherStage::Directories => (1, 6),
         LauncherStage::Gpu => (2, 6),
-        LauncherStage::Runtime => (3, 6),
-        LauncherStage::Model => (4, 6),
+        LauncherStage::Model => (3, 6),
+        LauncherStage::Runtime => (4, 6),
         LauncherStage::Verify => (5, 6),
         LauncherStage::Save => (6, 6),
         LauncherStage::Complete => (6, 6),
@@ -140,17 +135,15 @@ pub fn show_launcher_screen(
             ui.heading("TENUKI");
             ui.add_space(20.0);
 
-            // ステップ表示 (Step 3 / 6)
             let (current_step, total_steps) = stage_progress(state.stage);
             ui.label(format!("{} {} / {}", txt.step_label, current_step, total_steps));
             ui.add_space(10.0);
 
-            // ステージインジケータ（完了／実行中／未着手）- ASCII文字で表記
             let stage_order = [
                 LauncherStage::Directories,
                 LauncherStage::Gpu,
-                LauncherStage::Runtime,
                 LauncherStage::Model,
+                LauncherStage::Runtime,
                 LauncherStage::Verify,
                 LauncherStage::Save,
             ];
@@ -162,26 +155,37 @@ pub fn show_launcher_screen(
 
             ui.horizontal(|ui| {
                 for (idx, &s) in stage_order.iter().enumerate() {
-                    let label = match s {
-                        LauncherStage::Directories => "DIR",
-                        LauncherStage::Gpu => "GPU",
-                        LauncherStage::Runtime => "RUN",
-                        LauncherStage::Model => "MOD",
-                        LauncherStage::Verify => "CHK",
-                        LauncherStage::Save => "CFG",
-                        _ => "",
+                    let label = if ui_lang == "en" {
+                        match s {
+                            LauncherStage::Directories => "Dirs",
+                            LauncherStage::Gpu => "GPU",
+                            LauncherStage::Runtime => "Runtime",
+                            LauncherStage::Model => "Model",
+                            LauncherStage::Verify => "Verify",
+                            LauncherStage::Save => "Save",
+                            _ => "",
+                        }
+                    } else {
+                        match s {
+                            LauncherStage::Directories => "フォルダ",
+                            LauncherStage::Gpu => "GPU",
+                            LauncherStage::Runtime => "ランタイム",
+                            LauncherStage::Model => "モデル",
+                            LauncherStage::Verify => "確認",
+                            LauncherStage::Save => "保存",
+                            _ => "",
+                        }
                     };
 
                     let color = if state.stage == LauncherStage::Error {
-                        // エラー時は警告色（赤ではなく黄土色）
                         egui::Color32::from_rgb(180, 140, 60)
                     } else if let Some(cur) = current_idx {
                         if idx < cur {
-                            egui::Color32::GREEN // 完了
+                            egui::Color32::GREEN
                         } else if idx == cur {
-                            egui::Color32::WHITE // 実行中
+                            egui::Color32::WHITE
                         } else {
-                            egui::Color32::GRAY // 未実行
+                            egui::Color32::GRAY
                         }
                     } else {
                         egui::Color32::GRAY
@@ -199,7 +203,18 @@ pub fn show_launcher_screen(
                         ui.label(&state.sub_status);
                     }
                     ui.add_space(10.0);
-                    ui.add(ProgressBar::new(state.progress).animate(true));
+
+                    let (current_step, total_steps) = stage_progress(state.stage);
+                    let overall = if total_steps == 0 {
+                        0.0_f32
+                    } else {
+                        let completed = current_step.saturating_sub(1) as f32;
+                        (completed + state.progress) / total_steps as f32
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add(ProgressBar::new(overall).animate(true));
+                        ui.label(format!("{:.0}%", overall * 100.0));
+                    });
                     ui.add_space(20.0);
 
                     if ui.button(&txt.cancel).clicked() {
@@ -258,15 +273,28 @@ fn start_launcher_thread(
     ui_lang: String,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let launcher = crate::launcher::AppLauncher::new(base_dir, ui_lang);
+        let install_root = crate::launcher::resolve_install_root();
+        let launcher_config_path = install_root.join("launcher_config.toml");
+        let runtime_config_path = base_dir.join("config.toml");
+        let launcher = crate::launcher::AppLauncher::new(base_dir.clone(), ui_lang);
         match launcher {
             Ok(mut l) => {
-                if let Err(e) = l.run(crate::launcher::SetupMode::Full, tx.clone(), cancel_flag) {
-                    let _ = tx.send(LaunchProgress::Error(format!("{:#}", e)));
+                if let Err(e) = l.run(tx.clone(), cancel_flag) {
+                    let _ = tx.send(LaunchProgress::Error(format!(
+                        "{:#}\n[launcher_config: {}]\n[config: {}]",
+                        e,
+                        launcher_config_path.display(),
+                        runtime_config_path.display(),
+                    )));
                 }
             }
             Err(e) => {
-                let _ = tx.send(LaunchProgress::Error(format!("{:#}", e)));
+                let _ = tx.send(LaunchProgress::Error(format!(
+                    "{:#}\n[launcher_config: {}]\n[config: {}]",
+                    e,
+                    launcher_config_path.display(),
+                    runtime_config_path.display(),
+                )));
             }
         }
     })

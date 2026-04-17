@@ -87,6 +87,8 @@ impl LlamaProcess {
             cmd.current_dir(parent);
         }
 
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
         #[cfg(target_os = "windows")]
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
