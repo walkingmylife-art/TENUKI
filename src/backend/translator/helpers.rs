@@ -1,4 +1,4 @@
-﻿use crate::backend::normalize::normalize_display;
+use crate::backend::normalize::normalize_display;
 
 fn normalize_observed_model_quirks(text: &str) -> String {
     text.replace('\u{2019}', "'")
@@ -47,7 +47,10 @@ fn reapply_source_space_template(src_text: &str, translated_text: &str) -> Optio
         return None;
     }
 
-    let src_chunks: Vec<&str> = src_core.split(' ').filter(|chunk| !chunk.is_empty()).collect();
+    let src_chunks: Vec<&str> = src_core
+        .split(' ')
+        .filter(|chunk| !chunk.is_empty())
+        .collect();
     if src_chunks.len() < 2 {
         return None;
     }
@@ -71,7 +74,11 @@ fn reapply_source_space_template(src_text: &str, translated_text: &str) -> Optio
     Some(rebuilt)
 }
 
-fn fix_extra_spaces(src_text: &str, translated_text: &str, preserve_internal_spaces: bool) -> String {
+fn fix_extra_spaces(
+    src_text: &str,
+    translated_text: &str,
+    preserve_internal_spaces: bool,
+) -> String {
     let leading_spaces = count_leading_spaces(src_text);
     let trailing_spaces = count_trailing_spaces(src_text);
 
@@ -115,9 +122,7 @@ fn fix_extra_spaces(src_text: &str, translated_text: &str, preserve_internal_spa
 }
 
 fn normalize_plus_minus_spacing(text: &str) -> String {
-    let normalized = text
-        .replace('\u{FF0B}', "+")
-        .replace('\u{FF0D}', "-");
+    let normalized = text.replace('\u{FF0B}', "+").replace('\u{FF0D}', "-");
     let chars: Vec<char> = normalized.chars().collect();
     let mut result = String::with_capacity(normalized.len());
     let mut index = 0usize;
@@ -153,12 +158,7 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
     None
 }
 
-pub fn apply_wrap(
-    text: &str,
-    enabled: bool,
-    min_length: usize,
-    min_tail_length: usize,
-) -> String {
+pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, min_tail_length: usize) -> String {
     if !enabled || text.contains('\n') || text.chars().count() < min_length {
         return text.to_string();
     }
@@ -187,7 +187,11 @@ pub fn apply_wrap(
         };
 
         let candidate_width = is_wrap_candidate(&chars, index).unwrap_or(1);
-        let emit_end = if candidate_width == 2 { index + 1 } else { index + candidate_width };
+        let emit_end = if candidate_width == 2 {
+            index + 1
+        } else {
+            index + candidate_width
+        };
         result.extend(chars[segment_start..emit_end].iter());
         result.push('\n');
         segment_start = index + candidate_width;
@@ -230,7 +234,10 @@ mod tests {
 
     #[test]
     fn trims_only_edges_for_english_target() {
-        assert_eq!(clean_model_output("Level 10", "  Level 10  ", "en", true), "Level 10");
+        assert_eq!(
+            clean_model_output("Level 10", "  Level 10  ", "en", true),
+            "Level 10"
+        );
     }
 
     #[test]
@@ -280,13 +287,22 @@ mod tests {
 
     #[test]
     fn clean_model_output_normalizes_fullwidth_plus_minus_spacing() {
-        assert_eq!(clean_model_output("HP+ATK", "HP ＋ ATK", "en", true), "HP+ATK");
-        assert_eq!(clean_model_output("HP-ATK", "HP － ATK", "en", true), "HP-ATK");
+        assert_eq!(
+            clean_model_output("HP+ATK", "HP ＋ ATK", "en", true),
+            "HP+ATK"
+        );
+        assert_eq!(
+            clean_model_output("HP-ATK", "HP － ATK", "en", true),
+            "HP-ATK"
+        );
     }
 
     #[test]
     fn clean_model_output_can_skip_symbol_cleanup() {
-        assert_eq!(clean_model_output("HP+ATK", "HP ＋ ATK", "en", false), "HP + ATK");
+        assert_eq!(
+            clean_model_output("HP+ATK", "HP ＋ ATK", "en", false),
+            "HP + ATK"
+        );
     }
 
     #[test]
@@ -309,4 +325,3 @@ mod tests {
         );
     }
 }
-

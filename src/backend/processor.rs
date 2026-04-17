@@ -132,9 +132,7 @@ static PROTECTED_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 #[allow(dead_code)]
-static NUM_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"[0-9０-９]+(?:\.[0-9０-９]+)*").unwrap()
-});
+static NUM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[0-9０-９]+(?:\.[0-9０-９]+)*").unwrap());
 
 pub struct StructuralProcessor {
     options: StructuralOptions,
@@ -164,8 +162,24 @@ impl StructuralProcessor {
     fn is_segment_boundary(token: &str) -> bool {
         matches!(
             token,
-            "+" | "-" | ":" | "/" | "%" | "(" | ")" | "|" | "[" | "]" | ";"
-                | "（" | "）" | "【" | "】" | "《" | "》" | "：" | "；"
+            "+" | "-"
+                | ":"
+                | "/"
+                | "%"
+                | "("
+                | ")"
+                | "|"
+                | "["
+                | "]"
+                | ";"
+                | "（"
+                | "）"
+                | "【"
+                | "】"
+                | "《"
+                | "》"
+                | "："
+                | "；"
         )
     }
 
@@ -346,7 +360,10 @@ impl StructuralProcessor {
                 + ((source_delta * translated_span + source_span / 2) / source_span);
         }
 
-        anchors.last().map(|(_, translated)| *translated).unwrap_or(0)
+        anchors
+            .last()
+            .map(|(_, translated)| *translated)
+            .unwrap_or(0)
     }
 
     fn reassemble_single_translation(
@@ -420,7 +437,6 @@ impl StructuralProcessor {
 
         result
     }
-
 }
 
 impl TextProcessor for StructuralProcessor {
@@ -458,7 +474,6 @@ impl TextProcessor for StructuralProcessor {
             ProcessorData::Passthrough => translated_parts.join(""),
         }
     }
-
 }
 
 impl Default for StructuralProcessor {

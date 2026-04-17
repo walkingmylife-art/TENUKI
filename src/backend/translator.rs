@@ -81,10 +81,16 @@ pub struct TranslationStats {
 
 impl TranslationStats {
     pub fn dict_hit() -> Self {
-        Self { dict_hits: 1, model_calls: 0 }
+        Self {
+            dict_hits: 1,
+            model_calls: 0,
+        }
     }
     pub fn model_call() -> Self {
-        Self { dict_hits: 0, model_calls: 1 }
+        Self {
+            dict_hits: 0,
+            model_calls: 1,
+        }
     }
     pub fn merge(&mut self, other: &Self) {
         self.dict_hits += other.dict_hits;
@@ -302,7 +308,10 @@ fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
     }
 
     output.push_str(&text[cursor..]);
-    Some(ZmNumberMapping { sent_text: output, replacements })
+    Some(ZmNumberMapping {
+        sent_text: output,
+        replacements,
+    })
 }
 
 /// モデル出力中の数字を元の ZM マーカーに戻す。
@@ -359,11 +368,15 @@ fn restore_zm_number_tokens(text: &str, mapping: &ZmNumberMapping) -> String {
 // ---------------------------------------------------------------------------
 
 fn matching_close_bracket(open: char) -> Option<char> {
-    BRACKET_PAIRS.iter().find_map(|&(l, r)| (l == open).then_some(r))
+    BRACKET_PAIRS
+        .iter()
+        .find_map(|&(l, r)| (l == open).then_some(r))
 }
 
 fn matching_open_bracket(close: char) -> Option<char> {
-    BRACKET_PAIRS.iter().find_map(|&(l, r)| (r == close).then_some(l))
+    BRACKET_PAIRS
+        .iter()
+        .find_map(|&(l, r)| (r == close).then_some(l))
 }
 
 fn split_inner_spaces(text: &str) -> (String, String, String) {
@@ -553,7 +566,10 @@ fn build_line_plan(tokens: Vec<StructureToken>) -> LinePlan {
         }
     }
     segments.push(current);
-    LinePlan { segments, separators }
+    LinePlan {
+        segments,
+        separators,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -603,9 +619,7 @@ fn translate_model_only(
     }
 
     let zm_mapping = build_zm_number_mapping(text);
-    let model_input = zm_mapping
-        .as_ref()
-        .map_or(text, |m| m.sent_text.as_str());
+    let model_input = zm_mapping.as_ref().map_or(text, |m| m.sent_text.as_str());
     let start = std::time::Instant::now();
 
     if let Some(translated_raw) = llm_client.translate_sync(model_input, prefix) {
@@ -685,7 +699,11 @@ where
     result
 }
 
-fn append_translated_piece(result: &mut TranslationResult, rendered: &mut String, piece: TranslationResult) {
+fn append_translated_piece(
+    result: &mut TranslationResult,
+    rendered: &mut String,
+    piece: TranslationResult,
+) {
     rendered.push_str(&piece.text);
     result.absorb(piece);
 }
@@ -705,7 +723,10 @@ where
         return translate_bracket_slot(slot, lookup, prefix, tgt_lang, llm_client, settings);
     }
 
-    if !tokens.iter().any(|token| matches!(token, StructureToken::Bracket(_))) {
+    if !tokens
+        .iter()
+        .any(|token| matches!(token, StructureToken::Bracket(_)))
+    {
         return translate_fragment(
             &reconstruct_segment(tokens),
             lookup,
@@ -727,25 +748,13 @@ where
             StructureToken::Bracket(slot) => {
                 if !buffered_text.is_empty() {
                     let chunk = std::mem::take(&mut buffered_text);
-                    let translated = translate_fragment(
-                        &chunk,
-                        lookup,
-                        prefix,
-                        tgt_lang,
-                        llm_client,
-                        settings,
-                    );
+                    let translated =
+                        translate_fragment(&chunk, lookup, prefix, tgt_lang, llm_client, settings);
                     append_translated_piece(&mut accumulated, &mut rendered, translated);
                 }
 
-                let translated = translate_bracket_slot(
-                    slot,
-                    lookup,
-                    prefix,
-                    tgt_lang,
-                    llm_client,
-                    settings,
-                );
+                let translated =
+                    translate_bracket_slot(slot, lookup, prefix, tgt_lang, llm_client, settings);
                 append_translated_piece(&mut accumulated, &mut rendered, translated);
             }
             StructureToken::Delimiter(_) => {}
@@ -754,14 +763,7 @@ where
 
     if !buffered_text.is_empty() {
         let chunk = std::mem::take(&mut buffered_text);
-        let translated = translate_fragment(
-            &chunk,
-            lookup,
-            prefix,
-            tgt_lang,
-            llm_client,
-            settings,
-        );
+        let translated = translate_fragment(&chunk, lookup, prefix, tgt_lang, llm_client, settings);
         append_translated_piece(&mut accumulated, &mut rendered, translated);
     }
 
@@ -791,9 +793,8 @@ where
     for line in &lines {
         let mut segment_texts = Vec::with_capacity(line.segments.len());
         for seg in &line.segments {
-            let result = translate_segment_tokens(
-                seg, lookup, prefix, tgt_lang, llm_client, settings,
-            );
+            let result =
+                translate_segment_tokens(seg, lookup, prefix, tgt_lang, llm_client, settings);
             segment_texts.push(result.text.clone());
             accumulated.absorb(result);
         }
@@ -881,7 +882,11 @@ mod tests {
         fn translate_sync(&self, text: &str, _prefix: &str) -> Option<String> {
             self.calls.lock().unwrap().push(text.to_string());
             let mut r = self.responses.lock().unwrap();
-            if r.is_empty() { None } else { Some(r.remove(0)) }
+            if r.is_empty() {
+                None
+            } else {
+                Some(r.remove(0))
+            }
         }
     }
 
@@ -897,7 +902,10 @@ mod tests {
     fn mapping(pairs: &[(&str, &str)]) -> ZmNumberMapping {
         ZmNumberMapping {
             sent_text: String::new(),
-            replacements: pairs.iter().map(|(n, m)| (n.to_string(), m.to_string())).collect(),
+            replacements: pairs
+                .iter()
+                .map(|(n, m)| (n.to_string(), m.to_string()))
+                .collect(),
         }
     }
 
@@ -923,7 +931,10 @@ mod tests {
     #[test]
     fn restore_passes_through_unmatched_token() {
         let m = mapping(&[("1", "ZAZ")]);
-        assert_eq!(restore_zm_number_tokens("no numbers here", &m), "no numbers here");
+        assert_eq!(
+            restore_zm_number_tokens("no numbers here", &m),
+            "no numbers here"
+        );
         assert_eq!(restore_zm_number_tokens("value is 99", &m), "value is 99");
     }
 
@@ -969,10 +980,13 @@ mod tests {
 
         assert_eq!(llm.calls(), vec!["Next", "Turn"]);
         assert_eq!(result.text, "Later;Cycle");
-        assert_eq!(result.new_entries, vec![
-            ("Next".to_string(), "Later".to_string()),
-            ("Turn".to_string(), "Cycle".to_string()),
-        ]);
+        assert_eq!(
+            result.new_entries,
+            vec![
+                ("Next".to_string(), "Later".to_string()),
+                ("Turn".to_string(), "Cycle".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -981,12 +995,18 @@ mod tests {
         let result = translate_chunk(
             "(Start;Next)",
             |key| (key == "Start").then(|| "Begin".to_string()),
-            "prefix", "en", &llm, test_settings(),
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
         );
 
         assert_eq!(llm.calls(), vec!["Next"]);
         assert_eq!(result.text, "(Begin;Quest)");
-        assert_eq!(result.new_entries, vec![("Next".to_string(), "Quest".to_string())]);
+        assert_eq!(
+            result.new_entries,
+            vec![("Next".to_string(), "Quest".to_string())]
+        );
     }
 
     #[test]
@@ -1008,6 +1028,9 @@ mod tests {
 
         assert_eq!(llm.calls(), vec!["Next"]);
         assert_eq!(result.text, "Foo(Begin;Quest)Bar");
-        assert_eq!(result.new_entries, vec![("Next".to_string(), "Quest".to_string())]);
+        assert_eq!(
+            result.new_entries,
+            vec![("Next".to_string(), "Quest".to_string())]
+        );
     }
 }

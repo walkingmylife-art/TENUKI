@@ -1,17 +1,15 @@
 // src/backend/process.rs
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::io::{BufRead, BufReader};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 use crate::messages::{BackendEvent, LogLevel, LogSource};
-
-
 
 /// llama-server に渡す引数を組み立てた Command を返す。
 /// launcher 検証起動と本番起動の両方がこれを使うことで引数を1か所に集約する。
@@ -42,7 +40,11 @@ pub fn build_llama_command(
         .args(["--ctx-size", &ctx_size.to_string()])
         .args(["--batch-size", &batch_size.to_string()])
         .args(["-ub", &ubatch_size.to_string()])
-        .arg(if cont_batching { "--cont-batching" } else { "--no-cont-batching" })
+        .arg(if cont_batching {
+            "--cont-batching"
+        } else {
+            "--no-cont-batching"
+        })
         .args(["--parallel", &parallel.to_string()])
         .args(["--cache-ram", "0"])
         .args(["--metrics"]);
@@ -95,7 +97,9 @@ impl LlamaProcess {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn llama-server: {}", e))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn llama-server: {}", e))?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

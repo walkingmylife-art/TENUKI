@@ -177,6 +177,11 @@ impl TranslationProfile {
     }
 
     pub fn load(profile_dir: &Path, name: &str) -> Result<Self> {
+        Self::provision_profile_if_missing(profile_dir, name)?;
+        Self::load_existing_profile(profile_dir, name)
+    }
+
+    fn provision_profile_if_missing(profile_dir: &Path, name: &str) -> Result<()> {
         fs::create_dir_all(profile_dir)?;
 
         let name = sanitize_profile_name(name);
@@ -189,6 +194,13 @@ impl TranslationProfile {
             }
             fs::copy(&default_path, &path)?;
         }
+
+        Ok(())
+    }
+
+    fn load_existing_profile(profile_dir: &Path, name: &str) -> Result<Self> {
+        let name = sanitize_profile_name(name);
+        let path = profile_dir.join(format!("{}.toml", name));
 
         let content = fs::read_to_string(&path)?;
         let mut profile: TranslationProfile = toml::from_str(&content)?;
@@ -352,7 +364,11 @@ impl Config {
 
         self.ui_lang = normalize_ui_lang(&self.ui_lang);
 
-        if self.dict_slot.as_deref().is_some_and(|v| v.trim().is_empty()) {
+        if self
+            .dict_slot
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
             self.dict_slot = None;
         }
         if is_target_language_preset(&self.tgt_lang) {

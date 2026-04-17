@@ -15,8 +15,8 @@ use axum::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 
 use crate::backend::analysis::{self, SharedInputReplayState};
 use crate::backend::dictionary::Dictionary;
@@ -64,16 +64,16 @@ pub struct AppState {
     pub llm_client: Arc<dyn translator::LlmClient>,
     pub event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
     /*
-    /// LLM 生成結果のセッションキャッシュ（揮発・言語変更時にリセット）
-    pub t_cache: Arc<TranslationCache>,
-    /// シャットダウン時に TXT へ書き込む新規エントリ
-    pub n_cache: Arc<NewEntriesCache>,
-    pub input_replay: SharedInputReplayState,
-    pub llm_slots: usize,
-    /// パターン辞書（数値バリエーション対応）
-}
+        /// LLM 生成結果のセッションキャッシュ（揮発・言語変更時にリセット）
+        pub t_cache: Arc<TranslationCache>,
+        /// シャットダウン時に TXT へ書き込む新規エントリ
+        pub n_cache: Arc<NewEntriesCache>,
+        pub input_replay: SharedInputReplayState,
+        pub llm_slots: usize,
+        /// パターン辞書（数値バリエーション対応）
+    }
 
-    */
+        */
     pub t_cache: Arc<TranslationCache>,
     pub n_cache: Arc<NewEntriesCache>,
     pub input_replay: SharedInputReplayState,
@@ -82,15 +82,10 @@ pub struct AppState {
 
 impl AppState {
     pub async fn current_prefix(&self) -> String {
-        let src         = self.src_lang.read().await;
-        let tgt         = self.tgt_lang.read().await;
+        let src = self.src_lang.read().await;
+        let tgt = self.tgt_lang.read().await;
         let custom_name = self.custom_lang_name.read().await;
-        translator::build_lang_prefix(
-            &src,
-            &tgt,
-            &custom_name,
-            &self.prompt_template,
-        )
+        translator::build_lang_prefix(&src, &tgt, &custom_name, &self.prompt_template)
     }
 
     fn emit_persistent_log(&self, message: String, level: LogLevel) {
@@ -112,15 +107,28 @@ impl AppState {
 
     fn emit_log(&self, event: &LogEvent) {
         let (msg, level) = match event {
-            LogEvent::DictHit { elapsed_secs, original, translated } => {
-                (format!("[TENUKI] ({:.2}s) {} -> {}", elapsed_secs, original, translated), LogLevel::Success)
-            }
+            LogEvent::DictHit {
+                elapsed_secs,
+                original,
+                translated,
+            } => (
+                format!(
+                    "[TENUKI] ({:.2}s) {} -> {}",
+                    elapsed_secs, original, translated
+                ),
+                LogLevel::Success,
+            ),
             LogEvent::PreModelCall { original } => {
                 (format!("[XUnity] {}", original), LogLevel::Info)
             }
-            LogEvent::ModelResult { elapsed_secs, translated, .. } => {
-                (format!("[Model] ({:.2}s) {}", elapsed_secs, translated), LogLevel::Info)
-            }
+            LogEvent::ModelResult {
+                elapsed_secs,
+                translated,
+                ..
+            } => (
+                format!("[Model] ({:.2}s) {}", elapsed_secs, translated),
+                LogLevel::Info,
+            ),
             _ => return,
         };
         self.emit_persistent_log(msg, level);
@@ -129,7 +137,8 @@ impl AppState {
     fn emit_stats(&self, stats: &TranslationStats) {
         if stats.dict_hits > 0 || stats.model_calls > 0 {
             let _ = self.event_tx.try_send(BackendEvent::StatisticsUpdate(
-                stats.dict_hits, stats.model_calls,
+                stats.dict_hits,
+                stats.model_calls,
             ));
         }
     }
@@ -155,11 +164,7 @@ impl AppState {
     }
 }
 
-fn dictionary_log_display_pair(
-    key: &str,
-    value: &str,
-    logs: &[LogEvent],
-) -> (String, String) {
+fn dictionary_log_display_pair(key: &str, value: &str, logs: &[LogEvent]) -> (String, String) {
     let trimmed_key = key.trim();
 
     if let Some((translated, elapsed_secs)) = logs.iter().find_map(|event| match event {
@@ -476,11 +481,9 @@ fn translate_texts_batch(
             settings,
         );
 
-        let registration_entries = if result
-            .new_entries
-            .iter()
-            .any(|(key, value)| contains_placeholder_token(key) || contains_placeholder_token(value))
-        {
+        let registration_entries = if result.new_entries.iter().any(|(key, value)| {
+            contains_placeholder_token(key) || contains_placeholder_token(value)
+        }) {
             vec![(text.to_string(), result.text.clone())]
         } else {
             result.new_entries.clone()
@@ -544,8 +547,13 @@ fn translate_texts_batch(
     }
 
     let total = texts.len();
-    let jobs = Arc::new(Mutex::new(texts.into_iter().enumerate().collect::<VecDeque<_>>()));
-    let results = Arc::new(Mutex::new(vec![None::<(TranslationResult, ItemDiagnostics)>; total]));
+    let jobs = Arc::new(Mutex::new(
+        texts.into_iter().enumerate().collect::<VecDeque<_>>(),
+    ));
+    let results = Arc::new(Mutex::new(vec![
+        None::<(TranslationResult, ItemDiagnostics)>;
+        total
+    ]));
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -627,21 +635,16 @@ async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
     let lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
     let batch = tokio::task::spawn_blocking(move || {
         translate_texts_batch(
-            dictionary,
-            processor,
-            llm_client,
-            t_cache,
-            n_cache,
-            event_tx,
-            prefix,
-            llm_slots,
-            tgt_lang,
-            settings,
-            lines,
+            dictionary, processor, llm_client, t_cache, n_cache, event_tx, prefix, llm_slots,
+            tgt_lang, settings, lines,
         )
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    for log in &batch.logs { state.emit_log(log); }
+    for log in &batch.logs {
+        state.emit_log(log);
+    }
     state.emit_stats(&batch.stats);
     emit_batch_diagnostics(state.as_ref(), "translate", &batch);
     emit_observation_logs(
@@ -660,7 +663,9 @@ async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
         batch.stats.dict_hits,
         batch.stats.model_calls,
     );
-    let _ = state.event_tx.try_send(BackendEvent::InputAnalysisUpdated(snapshot));
+    let _ = state
+        .event_tx
+        .try_send(BackendEvent::InputAnalysisUpdated(snapshot));
     translated_text.into_response()
 }
 
@@ -668,16 +673,27 @@ async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
 // ハンドラ
 // ============================================================
 
-async fn health_handler() -> &'static str { "OK" }
+async fn health_handler() -> &'static str {
+    "OK"
+}
 
 #[axum::debug_handler]
 async fn translate_get_handler(
     State(state): State<Arc<AppState>>,
     query: Query<TranslateRequest>,
 ) -> Response {
-    let text = query.text.clone().or(query.content.clone()).unwrap_or_default();
+    let text = query
+        .text
+        .clone()
+        .or(query.content.clone())
+        .unwrap_or_default();
     let raw_request = serde_json::to_string(&query.0).unwrap_or_else(|_| "{}".to_string());
-    state.emit_request_log(build_translate_request_record("query", None, &raw_request, &text));
+    state.emit_request_log(build_translate_request_record(
+        "query",
+        None,
+        &raw_request,
+        &text,
+    ));
     perform_translation(state, text).await
 }
 
@@ -740,21 +756,16 @@ async fn list_handler(
     let raw_text = texts.join("\n");
     let batch = tokio::task::spawn_blocking(move || {
         translate_texts_batch(
-            dictionary,
-            processor,
-            llm_client,
-            t_cache,
-            n_cache,
-            event_tx,
-            prefix,
-            llm_slots,
-            tgt_lang,
-            settings,
-            texts,
+            dictionary, processor, llm_client, t_cache, n_cache, event_tx, prefix, llm_slots,
+            tgt_lang, settings, texts,
         )
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    for log in &batch.logs { state.emit_log(log); }
+    for log in &batch.logs {
+        state.emit_log(log);
+    }
     state.emit_stats(&batch.stats);
     emit_batch_diagnostics(state.as_ref(), "list", &batch);
     emit_observation_logs(
@@ -764,7 +775,10 @@ async fn list_handler(
         &batch.item_diagnostics,
     );
     let translated_text = batch.texts.join("\n");
-    state.emit_request_log(build_list_response_record(&translated_text, batch.texts.len()));
+    state.emit_request_log(build_list_response_record(
+        &translated_text,
+        batch.texts.len(),
+    ));
     let snapshot = analysis::record_completed_translation(
         &state.input_replay,
         &raw_text,
@@ -773,7 +787,9 @@ async fn list_handler(
         batch.stats.dict_hits,
         batch.stats.model_calls,
     );
-    let _ = state.event_tx.try_send(BackendEvent::InputAnalysisUpdated(snapshot));
+    let _ = state
+        .event_tx
+        .try_send(BackendEvent::InputAnalysisUpdated(snapshot));
     translated_text.into_response()
 }
 
@@ -788,7 +804,10 @@ async fn shutdown_handler(State(state): State<Arc<AppState>>) -> &'static str {
         let _ = dict.flush_buffer();
         let _ = state.event_tx.try_send(BackendEvent::Log(
             LogSource::Tenuki,
-            format!("Shutdown: {} new entries flushed to dictionary", entries.len()),
+            format!(
+                "Shutdown: {} new entries flushed to dictionary",
+                entries.len()
+            ),
             LogLevel::Info,
             crate::messages::current_timestamp(),
         ));
@@ -875,10 +894,11 @@ pub async fn run_translation_server(
     let listener = loop {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => break l,
-            Err(e) if retries > 0 && (
-                e.kind() == std::io::ErrorKind::AddrInUse
-                || e.raw_os_error() == Some(10048)
-            ) => {
+            Err(e)
+                if retries > 0
+                    && (e.kind() == std::io::ErrorKind::AddrInUse
+                        || e.raw_os_error() == Some(10048)) =>
+            {
                 retries -= 1;
                 let _ = event_tx.try_send(BackendEvent::Log(
                     LogSource::Tenuki,
@@ -895,7 +915,11 @@ pub async fn run_translation_server(
             Err(e) => {
                 let _ = startup_tx.send(Err(format!(
                     "Failed to bind translation server: {}:{} (試行{}/{}回後): {}",
-                    host, port, max_retries - retries, max_retries, e
+                    host,
+                    port,
+                    max_retries - retries,
+                    max_retries,
+                    e
                 )));
                 return;
             }
@@ -904,7 +928,10 @@ pub async fn run_translation_server(
 
     let _ = event_tx.try_send(BackendEvent::Log(
         LogSource::Tenuki,
-        format!("TENUKI translation server listening on http://127.0.0.1:{}", port),
+        format!(
+            "TENUKI translation server listening on http://127.0.0.1:{}",
+            port
+        ),
         LogLevel::Info,
         crate::messages::current_timestamp(),
     ));
@@ -930,8 +957,8 @@ pub async fn run_translation_server(
 mod tests {
     use super::{
         build_list_request_record, build_list_response_record, build_observation_record,
-        build_translate_request_record, build_translate_response_record,
-        contains_observed_markup, extract_translate_post_text, ListRequest,
+        build_translate_request_record, build_translate_response_record, contains_observed_markup,
+        extract_translate_post_text, ListRequest,
     };
     use crate::backend::analysis::find_unescaped_assignment_separator;
 
@@ -967,7 +994,10 @@ mod tests {
         let text = r#"[世界6.12.24]传闻八卦门北方袭击了丐帮<color\=#2779FA>凶邪</color>晏弃特，血战一场最终得胜而归。=[他人6.12.24]broken target"#;
         let index = find_unescaped_assignment_separator(text).unwrap();
 
-        assert_eq!(&text[..index], r#"[世界6.12.24]传闻八卦门北方袭击了丐帮<color\=#2779FA>凶邪</color>晏弃特，血战一场最终得胜而归。"#);
+        assert_eq!(
+            &text[..index],
+            r#"[世界6.12.24]传闻八卦门北方袭击了丐帮<color\=#2779FA>凶邪</color>晏弃特，血战一场最终得胜而归。"#
+        );
         assert_eq!(&text[index + 1..], "[他人6.12.24]broken target");
     }
 

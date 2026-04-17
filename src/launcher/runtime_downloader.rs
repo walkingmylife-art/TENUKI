@@ -1,7 +1,7 @@
 //! src/launcher/runtime_downloader.rs
 //!
 //! 再開容易性と完走性を最適化したダウンローダ。
-//! - 固定チャンク (4MB) を安全再開境界として使用する。
+//! - 固定チャンク (16MB) を安全再開境界として使用する。
 //! - .part ファイルは決して削除せず、常に confirmed_bytes まで truncate してから追記する。
 //! - 再開状態は sidecar (.sidecar.json) に永続化する。
 //! - 区間失敗回数 (chunk_fail_count) が上限に達した場合のみ fallback URL へ切り替える。
@@ -21,7 +21,7 @@ use std::time::Duration;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_CHUNK_FAILS: u32 = 3;
 const RETRY_WAIT_SECS: u64 = 2;
 
@@ -57,8 +57,7 @@ fn load_sidecar(path: &Path) -> Option<DownloadSidecar> {
 }
 
 fn save_sidecar(path: &Path, sidecar: &DownloadSidecar) -> Result<()> {
-    let content = serde_json::to_string_pretty(sidecar)
-        .context("Failed to serialize sidecar")?;
+    let content = serde_json::to_string_pretty(sidecar).context("Failed to serialize sidecar")?;
     fs::write(path, content)?;
     Ok(())
 }
@@ -86,7 +85,10 @@ impl RuntimeDownloader {
             .user_agent("TENUKI-Launcher/1.0")
             .build()
             .context("Failed to build HTTP client")?;
-        Ok(Self { client, cancel_flag })
+        Ok(Self {
+            client,
+            cancel_flag,
+        })
     }
 
     fn check_cancel(&self) -> Result<()> {
@@ -109,7 +111,11 @@ impl RuntimeDownloader {
         fs::create_dir_all(dest_dir)?;
 
         if runtime_is_complete(dest_dir, backend) {
-            log::info!("Runtime already complete ({}): {}", backend, dest_dir.display());
+            log::info!(
+                "Runtime already complete ({}): {}",
+                backend,
+                dest_dir.display()
+            );
             return Ok(None);
         }
 
@@ -140,27 +146,32 @@ impl RuntimeDownloader {
             // extra_assets は補助 DLL 等であり、独自の fallback は持たない
             let fb = if index == 0 { fallback_url } else { None };
 
-            let current_used = self.download_file(
-                asset_url,
-                fb,
-                &zip_path,
-                None,
-                &|progress, status| {
+            let current_used =
+                self.download_file(asset_url, fb, &zip_path, None, &|progress, status| {
                     let combined = (download_unit + progress.clamp(0.0, 1.0)) / total_units;
                     progress_callback(combined, status);
-                },
-            )?;
+                })?;
 
             if used_url.is_none() {
                 used_url = Some(current_used);
             }
 
-            log::info!("Extracting asset {}/{}: {}", index + 1, asset_urls.len(), zip_name);
+            log::info!(
+                "Extracting asset {}/{}: {}",
+                index + 1,
+                asset_urls.len(),
+                zip_name
+            );
             self.extract_zip(&zip_path, dest_dir, |p, _| {
                 let combined = (extract_unit + p.clamp(0.0, 1.0)) / total_units;
                 progress_callback(
                     combined,
-                    &format!("展開中 {}/{}: {:.1}%", index + 1, asset_urls.len(), p * 100.0),
+                    &format!(
+                        "展開中 {}/{}: {:.1}%",
+                        index + 1,
+                        asset_urls.len(),
+                        p * 100.0
+                    ),
                 );
             })?;
 
@@ -168,7 +179,10 @@ impl RuntimeDownloader {
         }
 
         if find_llama_server_exe(dest_dir).is_none() {
-            anyhow::bail!("llama-server not found after extraction: {}", dest_dir.display());
+            anyhow::bail!(
+                "llama-server not found after extraction: {}",
+                dest_dir.display()
+            );
         }
 
         Ok(used_url)
@@ -213,7 +227,9 @@ impl RuntimeDownloader {
                 // sidecar なし・サイズ不一致 = 壊れたファイル。削除して再取得。
                 log::warn!(
                     "Model size mismatch (got {}, expected {}), re-downloading: {}",
-                    size, expected_size, dest_path.display()
+                    size,
+                    expected_size,
+                    dest_path.display()
                 );
                 fs::remove_file(dest_path)?;
             }
@@ -244,8 +260,10 @@ impl RuntimeDownloader {
         let mut sc = if let Some(existing) = load_sidecar(&sc_path) {
             log::info!(
                 "Resuming from byte {} (chunk start {}) via {} (fails={})",
-                existing.confirmed_bytes, existing.current_chunk_start,
-                existing.current_url, existing.chunk_fail_count
+                existing.confirmed_bytes,
+                existing.current_chunk_start,
+                existing.current_url,
+                existing.chunk_fail_count
             );
             existing
         } else {
@@ -281,7 +299,11 @@ impl RuntimeDownloader {
             sc.current_chunk_start = offset;
             save_sidecar(&sc_path, &sc)?;
 
-            let total_opt = if sc.expected_size > 0 { Some(sc.expected_size) } else { None };
+            let total_opt = if sc.expected_size > 0 {
+                Some(sc.expected_size)
+            } else {
+                None
+            };
 
             match self.fetch_chunk(&sc.current_url, offset, total_opt, &part_path) {
                 Ok(fr) => {
@@ -366,8 +388,11 @@ impl RuntimeDownloader {
                     save_sidecar(&sc_path, &sc)?;
                     log::warn!(
                         "Chunk fail {}/{} at byte {} (chunk start {}): {}",
-                        sc.chunk_fail_count, MAX_CHUNK_FAILS,
-                        offset, sc.current_chunk_start, e
+                        sc.chunk_fail_count,
+                        MAX_CHUNK_FAILS,
+                        offset,
+                        sc.current_chunk_start,
+                        e
                     );
 
                     truncate_part_file(&part_path, sc.confirmed_bytes)?;
@@ -424,7 +449,8 @@ impl RuntimeDownloader {
             None => format!("bytes={}-", offset),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .get(url)
             .header("Range", &range_header)
             .send()
@@ -442,9 +468,7 @@ impl RuntimeDownloader {
             .headers()
             .get("content-range")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                v.rfind('/').and_then(|i| v[i+1..].trim().parse().ok())
-            });
+            .and_then(|v| v.rfind('/').and_then(|i| v[i + 1..].trim().parse().ok()));
 
         truncate_part_file(part_path, offset)?;
 
@@ -472,7 +496,11 @@ impl RuntimeDownloader {
         }
         file.sync_all()?;
         let is_eof = bytes_written < CHUNK_SIZE;
-        Ok(FetchResult { bytes_written, revealed_total, is_eof })
+        Ok(FetchResult {
+            bytes_written,
+            revealed_total,
+            is_eof,
+        })
     }
 
     fn extract_zip(
@@ -527,7 +555,9 @@ fn safe_join(base: &Path, entry_name: &str) -> Result<PathBuf> {
     let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     let parent = out_path.parent().unwrap_or(base);
     let canonical_parent = if parent.exists() {
-        parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
+        parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
     } else {
         let mut existing = parent;
         while !existing.exists() {
@@ -536,7 +566,9 @@ fn safe_join(base: &Path, entry_name: &str) -> Result<PathBuf> {
                 None => break,
             }
         }
-        let ec = existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf());
+        let ec = existing
+            .canonicalize()
+            .unwrap_or_else(|_| existing.to_path_buf());
         let rel = parent.strip_prefix(existing).unwrap_or(Path::new(""));
         ec.join(rel)
     };
@@ -596,4 +628,64 @@ pub fn runtime_is_complete(dir: &Path, backend: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_rt_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tenuki_rt_{}", tag));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const EXE: &str = if cfg!(target_os = "windows") {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+
+    // --- vulkan: exe のみで complete ---
+
+    #[test]
+    fn vulkan_complete_with_exe_only() {
+        let dir = temp_rt_dir("vk_complete");
+        fs::write(dir.join(EXE), b"").unwrap();
+
+        assert!(runtime_is_complete(&dir, "vulkan"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vulkan_incomplete_without_exe() {
+        let dir = temp_rt_dir("vk_no_exe");
+
+        assert!(!runtime_is_complete(&dir, "vulkan"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- cuda: exe だけでは incomplete ---
+
+    #[test]
+    fn cuda_incomplete_exe_only_no_dll() {
+        let dir = temp_rt_dir("cuda_no_dll");
+        fs::write(dir.join(EXE), b"").unwrap();
+
+        assert!(!runtime_is_complete(&dir, "cuda"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- cuda: exe + dll 1個以上で complete ---
+
+    #[test]
+    fn cuda_complete_with_exe_and_dll() {
+        let dir = temp_rt_dir("cuda_with_dll");
+        fs::write(dir.join(EXE), b"").unwrap();
+        fs::write(dir.join("nvcuda.dll"), b"").unwrap();
+
+        assert!(runtime_is_complete(&dir, "cuda"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

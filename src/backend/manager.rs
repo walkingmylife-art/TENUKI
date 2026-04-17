@@ -5,44 +5,45 @@
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
-use tokio::sync::mpsc as tokio_mpsc;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::RwLock;
 
-use crate::config::{Config, StructuralOptions};
-use crate::launcher::app_config::ServerConfig;
 use crate::backend::analysis::{self, SharedInputReplayState};
-use crate::messages::{BackendEvent, LogLevel, LogSource, ProcessType};
 use crate::backend::dictionary::Dictionary;
 use crate::backend::process::LlamaProcess;
-use crate::backend::processor::{
-    ProcessorFactory, TextProcessor, TranslationMode,
-};
-use crate::backend::translator::{LlmClient, HttpLlmClient, TranslationCache, NewEntriesCache};
-use crate::backend::translator::TranslationSettings;
+use crate::backend::processor::{ProcessorFactory, TextProcessor, TranslationMode};
 use crate::backend::server;
+use crate::backend::translator::TranslationSettings;
+use crate::backend::translator::{HttpLlmClient, LlmClient, NewEntriesCache, TranslationCache};
 use crate::backend_info;
+use crate::config::{Config, StructuralOptions};
+use crate::launcher::app_config::ServerConfig;
+use crate::messages::{BackendEvent, LogLevel, LogSource, ProcessType};
 
 // ============================================================
 // スロット管理ユーティリティ
 // ============================================================
 
 fn max_existing_slot_num(text_dir: &Path, lang: &str) -> Option<u32> {
-    std::fs::read_dir(text_dir).ok()?.filter_map(|e| {
-        let e = e.ok()?;
-        if !e.file_type().ok()?.is_dir() {
-            return None;
-        }
+    std::fs::read_dir(text_dir)
+        .ok()?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            if !e.file_type().ok()?.is_dir() {
+                return None;
+            }
 
-        let name = e.file_name().to_string_lossy().into_owned();
-        slot_num_from_name(&name, lang)
-    }).max()
+            let name = e.file_name().to_string_lossy().into_owned();
+            slot_num_from_name(&name, lang)
+        })
+        .max()
 }
 
 fn is_slot_dir_name_for_lang(name: &str, lang: &str) -> bool {
@@ -62,7 +63,9 @@ fn slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
         suffix.parse::<u32>().ok()
     } else if lang.is_empty()
         && !prefix.is_empty()
-        && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         suffix.parse::<u32>().ok()
     } else {
@@ -95,8 +98,12 @@ pub fn is_slot_dir(p: &Path) -> bool {
             .unwrap_or(false)
 }
 
-pub fn find_or_create_slot_under(container: &Path, lang: &str) -> PathBuf {
-    if let Some(existing_slot) = find_slot_ancestor(container, lang) {
+fn find_existing_slot_under(container: &Path, lang: &str) -> Option<PathBuf> {
+    find_slot_ancestor(container, lang)
+}
+
+pub fn provision_slot_under(container: &Path, lang: &str) -> PathBuf {
+    if let Some(existing_slot) = find_existing_slot_under(container, lang) {
         let _ = std::fs::create_dir_all(&existing_slot);
         return existing_slot;
     }
@@ -112,6 +119,10 @@ pub fn find_or_create_slot_under(container: &Path, lang: &str) -> PathBuf {
         let _ = std::fs::create_dir_all(&slot);
         slot
     }
+}
+
+pub fn find_or_create_slot_under(container: &Path, lang: &str) -> PathBuf {
+    provision_slot_under(container, lang)
 }
 
 #[cfg(test)]
@@ -217,7 +228,14 @@ mod tests {
 
         let resolved = resolve_slot_dir(&config, &base_dir);
 
-        assert_eq!(resolved, base_dir.join("dicts").join("ar").join("text").join("ar_001"));
+        assert_eq!(
+            resolved,
+            base_dir
+                .join("dicts")
+                .join("ar")
+                .join("text")
+                .join("ar_001")
+        );
         assert!(resolved.is_dir());
 
         let _ = std::fs::remove_dir_all(&base_dir);
@@ -227,23 +245,41 @@ mod tests {
 pub fn create_new_slot(tgt_lang: &str, base_dir: &PathBuf) -> PathBuf {
     let text_dir = base_dir.join("dicts").join(tgt_lang).join("text");
     let _ = std::fs::create_dir_all(&text_dir);
-    let next_num = max_existing_slot_num(&text_dir, tgt_lang).map(|n| n + 1).unwrap_or(1);
+    let next_num = max_existing_slot_num(&text_dir, tgt_lang)
+        .map(|n| n + 1)
+        .unwrap_or(1);
     let slot = text_dir.join(format!("{}_{:03}", tgt_lang, next_num));
     let _ = std::fs::create_dir_all(&slot);
     slot
 }
 
-pub fn resolve_slot_dir(config: &Config, base_dir: &PathBuf) -> PathBuf {
+fn resolve_explicit_slot_dir(config: &Config) -> Option<PathBuf> {
     if let Some(slot) = &config.dict_slot {
         if !slot.is_empty() {
-            let p = PathBuf::from(slot);
-            let _ = std::fs::create_dir_all(&p);
-            return p;
+            return Some(PathBuf::from(slot));
         }
+    }
+    None
+}
+
+pub fn provision_slot_dir(config: &Config, base_dir: &PathBuf) -> PathBuf {
+    if let Some(p) = resolve_explicit_slot_dir(config) {
+        let _ = std::fs::create_dir_all(&p);
+        return p;
     }
 
     let text_dir = base_dir.join("dicts").join(&config.tgt_lang).join("text");
-    find_or_create_slot_under(&text_dir, &config.tgt_lang)
+    provision_slot_under(&text_dir, &config.tgt_lang)
+}
+
+pub fn resolve_slot_dir(config: &Config, base_dir: &PathBuf) -> PathBuf {
+    if resolve_explicit_slot_dir(config).is_none() {
+        log::error!(
+            "[manager] dict_slot が未確定のまま resolve_slot_dir が呼ばれました。preflight が通っていない可能性があります。tgt_lang={}",
+            config.tgt_lang
+        );
+    }
+    provision_slot_dir(config, base_dir)
 }
 
 pub fn get_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
@@ -345,66 +381,20 @@ pub struct ProcessManager {
 // ヘルパー関数
 // ============================================================
 
-/// base_dir から llama-server 実行ファイルを探す
-///
-/// 優先順:
-///   1. launcher_config.toml の backend 名から runtime/<backend>/ を直接探索
-///   2. runtime/ 配下を max_depth(3) で広く探索
-///   3. base_dir 直下 / llama-server サブフォルダ（旧来フォールバック）
-///
-/// 起動判断の権威は launcher_config.toml。state.json は参照しない。
+/// base_dir から llama-server 実行ファイルを探す。
+/// launcher_config.toml の backend が権威。対応 runtime/<backend>/ のみを探索する。
+/// backend に対応する runtime が存在しない場合は None を返す（起動失敗）。
 fn find_llama_exe(base_dir: &Path) -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    let name = "llama-server.exe";
-    #[cfg(not(target_os = "windows"))]
-    let name = "llama-server";
-
-    // 1. launcher_config.toml の backend から runtime/<backend>/ を直接探索
-    // launcher_config.toml は install_root（権威位置）から読む
     let install_root = crate::launcher::resolve_install_root();
     let launcher_config_path = install_root.join("launcher_config.toml");
-    let backend = std::fs::read_to_string(&launcher_config_path)
-        .ok()
-        .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
-        .and_then(|v| v.get("backend")?.as_str().map(|s| s.to_string()));
+    let config = crate::launcher::app_config::AppConfig::load(&launcher_config_path).ok()?;
+    let backend = config.backend;
 
-    if let Some(backend) = backend {
-        let backend_dir = base_dir.join("runtime").join(&backend);
-        if backend_dir.exists() {
-            let found = walkdir::WalkDir::new(&backend_dir)
-                .max_depth(3)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .find(|e| e.file_name().to_string_lossy() == name)
-                .map(|e| e.path().to_path_buf());
-            if found.is_some() {
-                return found;
-            }
-        }
+    let backend_dir = base_dir.join("runtime").join(&backend);
+    if !crate::launcher::runtime_downloader::runtime_is_complete(&backend_dir, &backend) {
+        return None;
     }
-
-    // 2. runtime/ 配下を広く探索
-    let runtime_dir = base_dir.join("runtime");
-    if runtime_dir.exists() {
-        let found = walkdir::WalkDir::new(&runtime_dir)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy() == name)
-            .map(|e| e.path().to_path_buf());
-        if found.is_some() {
-            return found;
-        }
-    }
-
-    // 3. 旧来フォールバック
-    let candidate = base_dir.join(name);
-    if candidate.exists() { return Some(candidate); }
-
-    let in_subdir = base_dir.join("llama-server").join(name);
-    if in_subdir.exists() { return Some(in_subdir); }
-
-    None
+    crate::launcher::runtime_downloader::find_llama_server_exe(&backend_dir)
 }
 
 /// llama-server の /health エンドポイントが {"status":"ok"} を返すまで待機
@@ -429,7 +419,9 @@ fn wait_for_llama_server(
 
     let mut backoff = Duration::from_millis(500);
     for attempt in 0..60 {
-        if shutdown.load(Ordering::Relaxed) { return false; }
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
         // まず TCP レベルで到達できるか確認（ポートが開いていない段階をスキップ）
         if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
             thread::sleep(backoff);
@@ -441,7 +433,8 @@ fn wait_for_llama_server(
         match agent.get(&health_url).call() {
             Ok(response) if response.status() == 200 => {
                 // body を読んで "ok" を確認（読めなくても 200 なら OK とみなす）
-                let is_ok = response.into_string()
+                let is_ok = response
+                    .into_string()
                     .map(|s| s.contains("\"ok\""))
                     .unwrap_or(true);
                 if is_ok {
@@ -486,32 +479,26 @@ fn wait_for_llama_server(
 }
 
 fn parse_metric_value(body: &str, metric_name: &str) -> Option<f32> {
-    body.lines()
-        .find_map(|line| {
-            if line.starts_with('#') {
-                return None;
-            }
+    body.lines().find_map(|line| {
+        if line.starts_with('#') {
+            return None;
+        }
 
-            let (name, value) = line.split_once(' ')?;
-            if name == metric_name {
-                return value.trim().parse::<f32>().ok();
-            }
+        let (name, value) = line.split_once(' ')?;
+        if name == metric_name {
+            return value.trim().parse::<f32>().ok();
+        }
 
-            None
-        })
+        None
+    })
 }
 
 #[cfg(target_os = "windows")]
 mod pdh_vram {
     use windows::core::PCWSTR;
     use windows::Win32::System::Performance::{
-        PdhAddEnglishCounterW,
-        PdhCloseQuery,
-        PdhCollectQueryData,
-        PdhGetFormattedCounterArrayW,
-        PdhOpenQueryW,
-        PDH_FMT_COUNTERVALUE_ITEM_W,
-        PDH_FMT_LARGE,
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE,
     };
 
     pub struct PdhQuery {
@@ -528,10 +515,12 @@ mod pdh_vram {
                     return None;
                 }
 
-                let dedicated_path: Vec<u16> =
-                    "\\GPU Adapter Memory(*)\\Dedicated Usage\0".encode_utf16().collect();
-                let shared_path: Vec<u16> =
-                    "\\GPU Adapter Memory(*)\\Shared Usage\0".encode_utf16().collect();
+                let dedicated_path: Vec<u16> = "\\GPU Adapter Memory(*)\\Dedicated Usage\0"
+                    .encode_utf16()
+                    .collect();
+                let shared_path: Vec<u16> = "\\GPU Adapter Memory(*)\\Shared Usage\0"
+                    .encode_utf16()
+                    .collect();
 
                 let mut dedicated_counter: isize = 0;
                 if PdhAddEnglishCounterW(
@@ -539,7 +528,8 @@ mod pdh_vram {
                     PCWSTR::from_raw(dedicated_path.as_ptr()),
                     0,
                     &mut dedicated_counter,
-                ) != 0 {
+                ) != 0
+                {
                     PdhCloseQuery(query);
                     return None;
                 }
@@ -550,7 +540,8 @@ mod pdh_vram {
                     PCWSTR::from_raw(shared_path.as_ptr()),
                     0,
                     &mut shared_counter,
-                ) == 0 {
+                ) == 0
+                {
                     Some(shared_counter)
                 } else {
                     None
@@ -594,7 +585,8 @@ mod pdh_vram {
                     &mut buffer_size,
                     &mut item_count,
                     Some(buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W),
-                ) != 0 {
+                ) != 0
+                {
                     return None;
                 }
 
@@ -640,13 +632,17 @@ impl ProcessManager {
             self.current_processor.as_ref(),
             mark_result_stale,
         ) {
-            let _ = self.event_tx.send(BackendEvent::InputAnalysisUpdated(snapshot));
+            let _ = self
+                .event_tx
+                .send(BackendEvent::InputAnalysisUpdated(snapshot));
         }
     }
 
     fn rebuild_processor(&mut self) {
-        self.current_processor =
-            Arc::from(ProcessorFactory::create(self.translation_mode, self.config.structural));
+        self.current_processor = Arc::from(ProcessorFactory::create(
+            self.translation_mode,
+            self.config.structural,
+        ));
         self.emit_rebuilt_input_snapshot(true);
     }
 
@@ -655,17 +651,22 @@ impl ProcessManager {
         let new_dict_path = get_dict_path(&self.config, &self.base_dir);
         let new_bin_path = get_bin_path(&self.config, &self.base_dir);
 
-        self.dictionary = Arc::new(RwLock::new(
-            Dictionary::new(new_slot_dir.clone(), new_dict_path, new_bin_path, self.event_tx.clone())
-        ));
+        self.dictionary = Arc::new(RwLock::new(Dictionary::new(
+            new_slot_dir.clone(),
+            new_dict_path,
+            new_bin_path,
+            self.event_tx.clone(),
+        )));
         // パターン辞書も言語スロットに合わせて再初期化
         self.t_cache = Arc::new(TranslationCache::default());
         self.n_cache = Arc::new(NewEntriesCache::default());
 
-        backend_info!(self.event_tx,
+        backend_info!(
+            self.event_tx,
             "辞書を再読み込みしました (lang={}, slot={})",
             self.config.tgt_lang,
-            self.config.dict_slot.as_deref().unwrap_or("auto"));
+            self.config.dict_slot.as_deref().unwrap_or("auto")
+        );
     }
 
     fn reload_config_internal(&mut self, config_path: &PathBuf, force_dictionary_reload: bool) {
@@ -730,7 +731,8 @@ impl ProcessManager {
             return self.check_remote_llama_endpoint();
         }
 
-        let is_alive = self.llama_process
+        let is_alive = self
+            .llama_process
             .as_mut()
             .map(|proc| proc.is_alive())
             .unwrap_or(false);
@@ -794,10 +796,13 @@ impl ProcessManager {
         let input_replay = Arc::new(std::sync::Mutex::new(analysis::InputReplayState::default()));
         let slot_dir = resolve_slot_dir(&config, &base_dir);
         let dict_path = get_dict_path(&config, &base_dir);
-        let bin_file  = get_bin_path(&config, &base_dir);
-        let dictionary = Arc::new(RwLock::new(
-            Dictionary::new(slot_dir.clone(), dict_path, bin_file, event_tx.clone())
-        ));
+        let bin_file = get_bin_path(&config, &base_dir);
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            slot_dir.clone(),
+            dict_path,
+            bin_file,
+            event_tx.clone(),
+        )));
         let ctx_size = server_cfg.ctx_size;
         let llm_slots = server_cfg.parallel_slots.max(1) as usize;
         let llm_client = Arc::new(HttpLlmClient::new(format!(
@@ -900,7 +905,9 @@ impl ProcessManager {
     }
 
     pub fn set_translation_mode(&mut self, mode: TranslationMode) {
-        if self.translation_mode == mode { return; }
+        if self.translation_mode == mode {
+            return;
+        }
         self.translation_mode = mode;
         self.rebuild_processor();
     }
@@ -916,14 +923,18 @@ impl ProcessManager {
 
     /// ポートを設定する。実際に値が変化した場合のみ true を返す。
     pub fn set_server_port(&mut self, port: u16) -> bool {
-        if self.server_port == port { return false; }
+        if self.server_port == port {
+            return false;
+        }
         self.server_port = port;
         true
     }
 
     /// ホストを設定する。実際に値が変化した場合のみ true を返す。
     pub fn set_server_host(&mut self, host: &str) -> bool {
-        if self.config.server_host == host { return false; }
+        if self.config.server_host == host {
+            return false;
+        }
         self.config.server_host = host.to_string();
         true
     }
@@ -933,7 +944,9 @@ impl ProcessManager {
     }
 
     pub fn start_all(&mut self) {
-        if self.starting { return; }
+        if self.starting {
+            return;
+        }
 
         self.starting = true;
 
@@ -993,13 +1006,19 @@ impl ProcessManager {
             RestartScope::Full => {
                 self.stop_all();
                 self.start_all();
-                (self.is_engine_running(), self.is_translation_server_running())
+                (
+                    self.is_engine_running(),
+                    self.is_translation_server_running(),
+                )
             }
             RestartScope::TranslatorOnly => {
                 if !self.is_engine_running() {
                     // engine 不在 → Full に昇格
                     self.start_all();
-                    return (self.is_engine_running(), self.is_translation_server_running());
+                    return (
+                        self.is_engine_running(),
+                        self.is_translation_server_running(),
+                    );
                 }
                 let translator_success = self.restart_translator();
                 (true, translator_success)
@@ -1028,7 +1047,9 @@ impl ProcessManager {
 
     /// n_cache の全エントリを dict.register して n_cache をクリアする
     fn flush_n_cache_to_dict(&mut self) {
-        if self.n_cache.is_empty() { return; }
+        if self.n_cache.is_empty() {
+            return;
+        }
         let entries = self.n_cache.drain();
         let dict = self.dictionary.clone();
         self.server_runtime.block_on(async {
@@ -1055,10 +1076,9 @@ impl ProcessManager {
                 });
             }
             self.server_shutdown_tx = None;
-            let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-                ProcessType::Tenuki,
-                false,
-            ));
+            let _ = self
+                .event_tx
+                .send(BackendEvent::ProcessStatus(ProcessType::Tenuki, false));
         }
 
         if !engine_alive && self.server_handle.is_some() {
@@ -1069,7 +1089,9 @@ impl ProcessManager {
     // ----------------------------------------------------------
 
     fn start_llama_server(&mut self) -> bool {
-        if self.has_live_llama_process() { return true; }
+        if self.has_live_llama_process() {
+            return true;
+        }
 
         if !is_local_llama_host(&self.server_cfg.host) {
             return self.check_remote_llama_endpoint();
@@ -1084,7 +1106,9 @@ impl ProcessManager {
                     "models/ ディレクトリにモデルファイルが見つかりません".to_string()
                 };
                 let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki, msg, LogLevel::Error,
+                    LogSource::Tenuki,
+                    msg,
+                    LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
                 return false;
@@ -1100,7 +1124,9 @@ impl ProcessManager {
                     "llama-server 実行ファイルが見つかりません".to_string()
                 };
                 let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki, msg, LogLevel::Error,
+                    LogSource::Tenuki,
+                    msg,
+                    LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
                 return false;
@@ -1130,7 +1156,8 @@ impl ProcessManager {
             Ok(proc) => {
                 self.llama_process = Some(proc);
                 let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-                    ProcessType::InferenceEngine, true,
+                    ProcessType::InferenceEngine,
+                    true,
                 ));
                 if wait_for_llama_server(
                     &self.server_cfg.host,
@@ -1151,7 +1178,9 @@ impl ProcessManager {
                     format!("推論エンジンの起動に失敗しました: {e}")
                 };
                 let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki, msg, LogLevel::Error,
+                    LogSource::Tenuki,
+                    msg,
+                    LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
                 return false;
@@ -1179,12 +1208,15 @@ impl ProcessManager {
             let _ = self.wait_for_port_closed(port, Duration::from_secs(5));
         }
         let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-            ProcessType::InferenceEngine, false,
+            ProcessType::InferenceEngine,
+            false,
         ));
     }
 
     fn start_translation_server(&mut self) -> bool {
-        if self.server_handle.is_some() { return true; }
+        if self.server_handle.is_some() {
+            return true;
+        }
 
         let dictionary = self.dictionary.clone();
         let processor = self.current_processor.clone();
@@ -1215,26 +1247,36 @@ impl ProcessManager {
             enable_model_symbol_cleanup,
         };
 
-        let handle = self.server_runtime.spawn(
-            server::run_translation_server(
-                host.clone(), port, dictionary, processor,
-                src_lang, tgt_lang, custom_lang_name,
-                prompt_template,
-                translation_settings,
-                llm_client, server_event_tx, startup_tx, shutdown_rx,
-                t_cache, n_cache, input_replay, llm_slots,
-            )
-        );
+        let handle = self.server_runtime.spawn(server::run_translation_server(
+            host.clone(),
+            port,
+            dictionary,
+            processor,
+            src_lang,
+            tgt_lang,
+            custom_lang_name,
+            prompt_template,
+            translation_settings,
+            llm_client,
+            server_event_tx,
+            startup_tx,
+            shutdown_rx,
+            t_cache,
+            n_cache,
+            input_replay,
+            llm_slots,
+        ));
 
-        match self.server_runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(15), startup_rx).await
-        }) {
+        match self
+            .server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(15), startup_rx).await })
+        {
             Ok(Ok(Ok(()))) => {
                 self.server_shutdown_tx = Some(shutdown_tx);
                 self.server_handle = Some(handle);
-                let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-                    ProcessType::Tenuki, true,
-                ));
+                let _ = self
+                    .event_tx
+                    .send(BackendEvent::ProcessStatus(ProcessType::Tenuki, true));
 
                 let bind_msg = if self.config.ui_lang == "en" {
                     if host == "0.0.0.0" {
@@ -1259,27 +1301,35 @@ impl ProcessManager {
                 true
             }
             Ok(Ok(Err(e))) => {
-                self.server_runtime.block_on(async { let _ = handle.await; });
+                self.server_runtime.block_on(async {
+                    let _ = handle.await;
+                });
                 let msg = if self.config.ui_lang == "en" {
                     format!("Translation server failed to start: {e}")
                 } else {
                     format!("翻訳サーバーの起動に失敗しました: {e}")
                 };
                 let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki, msg, LogLevel::Error,
+                    LogSource::Tenuki,
+                    msg,
+                    LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
                 false
             }
             Ok(Err(_)) => {
-                self.server_runtime.block_on(async { let _ = handle.await; });
+                self.server_runtime.block_on(async {
+                    let _ = handle.await;
+                });
                 let msg = if self.config.ui_lang == "en" {
                     "Translation server startup channel closed unexpectedly".to_string()
                 } else {
                     "翻訳サーバー起動チャンネルが予期せず閉じられました".to_string()
                 };
                 let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki, msg, LogLevel::Error,
+                    LogSource::Tenuki,
+                    msg,
+                    LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
                 false
@@ -1295,7 +1345,9 @@ impl ProcessManager {
                     "翻訳サーバーの起動がタイムアウトしました（15秒）".to_string()
                 };
                 let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki, msg, LogLevel::Error,
+                    LogSource::Tenuki,
+                    msg,
+                    LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
                 false
@@ -1324,10 +1376,10 @@ impl ProcessManager {
         // 3. サーバー停止後に n_cache → dict.buffer へ登録
         //    サーバーが完全停止しているため dict の write lock 競合なし
         self.flush_n_cache_to_dict();
-        let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-            ProcessType::Tenuki, false,
-        ));
-        
+        let _ = self
+            .event_tx
+            .send(BackendEvent::ProcessStatus(ProcessType::Tenuki, false));
+
         // 4. キャッシュをリセット（次回起動に備えて）
         self.t_cache = Arc::new(TranslationCache::default());
         self.n_cache = Arc::new(NewEntriesCache::default());
@@ -1339,7 +1391,10 @@ impl ProcessManager {
             if !closed {
                 let _ = self.event_tx.send(BackendEvent::Log(
                     LogSource::Tenuki,
-                    format!("警告: 翻訳サーバー停止後もポート {} が解放されていません", port),
+                    format!(
+                        "警告: 翻訳サーバー停止後もポート {} が解放されていません",
+                        port
+                    ),
                     LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));
@@ -1353,7 +1408,11 @@ impl ProcessManager {
     /// 存在しない場合は None。他の .gguf への fallback は行わない。
     fn resolve_model(&self) -> Option<PathBuf> {
         let m = self.selected_model.as_ref()?;
-        if m.exists() { Some(m.clone()) } else { None }
+        if m.exists() {
+            Some(m.clone())
+        } else {
+            None
+        }
     }
 }
 

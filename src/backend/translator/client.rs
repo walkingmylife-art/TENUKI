@@ -1,8 +1,8 @@
 //! LLMクライアント（HTTP専用）
 
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use serde_json::json;
 
 /// LLMクライアントトレイト
 pub trait LlmClient: Send + Sync {

@@ -103,7 +103,11 @@ fn draw_dictionary_history(ui: &mut egui::Ui, data: &UiDisplayData, empty: &str)
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.label(egui::RichText::new(timestamp).monospace().size(12.0));
-                    ui.label(egui::RichText::new(original).size(13.0).color(egui::Color32::from_rgb(220, 220, 215)));
+                    ui.label(
+                        egui::RichText::new(original)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(220, 220, 215)),
+                    );
                     ui.label(
                         egui::RichText::new(translated)
                             .size(13.0)
@@ -199,7 +203,7 @@ pub fn show_normal_ui(
                 if let Some(rx) = &state.dict_slot_rx {
                     if let Ok(result) = rx.try_recv() {
                         if let Some(path) = result {
-                            commands.set_dict_slot = Some(Some(path.to_string_lossy().to_string()));
+                            commands.set_dict_slot = Some(path.to_string_lossy().to_string());
                         }
                         state.dict_slot_rx = None;
                     }
@@ -211,14 +215,24 @@ pub fn show_normal_ui(
                         .unwrap_or_else(|| "Dict".into()),
                     None => t(L, "Dict[none]", "辞書[なし]", "词典[无]").to_string(),
                 };
-                if ui.button(egui::RichText::new(btn_text).size(14.0)).clicked()
+                if ui
+                    .button(egui::RichText::new(btn_text).size(14.0))
+                    .clicked()
                     && state.dict_slot_rx.is_none()
                 {
                     let (tx, rx) = std::sync::mpsc::channel();
                     state.dict_slot_rx = Some(rx);
-                    let default_dir = data.base_dir.join("dicts").join(&data.tgt_lang).join("text");
+                    let default_dir = data
+                        .base_dir
+                        .join("dicts")
+                        .join(&data.tgt_lang)
+                        .join("text");
                     std::thread::spawn(move || {
-                        let _ = tx.send(rfd::FileDialog::new().set_directory(&default_dir).pick_folder());
+                        let _ = tx.send(
+                            rfd::FileDialog::new()
+                                .set_directory(&default_dir)
+                                .pick_folder(),
+                        );
                     });
                 }
             });
@@ -238,8 +252,12 @@ pub fn show_normal_ui(
                     .size(14.0),
             );
             ui.label(
-                egui::RichText::new(format!("{}: {}", t(L, "Dict", "辞書", "词典"), data.dictionary_loaded + data.dictionary_new))
-                    .size(13.0),
+                egui::RichText::new(format!(
+                    "{}: {}",
+                    t(L, "Dict", "辞書", "词典"),
+                    data.dictionary_loaded + data.dictionary_new
+                ))
+                .size(13.0),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let model_names: Vec<String> = data
@@ -286,13 +304,31 @@ pub fn show_normal_ui(
             .fixed_pos(state.lang_panel_anchor)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(state.lang_panel_tab == LangPanelTab::Tgt, t(L, "Target", "翻訳先", "翻译目标")).clicked() {
+                    if ui
+                        .selectable_label(
+                            state.lang_panel_tab == LangPanelTab::Tgt,
+                            t(L, "Target", "翻訳先", "翻译目标"),
+                        )
+                        .clicked()
+                    {
                         state.lang_panel_tab = LangPanelTab::Tgt;
                     }
-                    if ui.selectable_label(state.lang_panel_tab == LangPanelTab::Ui, t(L, "Display", "表示", "显示")).clicked() {
+                    if ui
+                        .selectable_label(
+                            state.lang_panel_tab == LangPanelTab::Ui,
+                            t(L, "Display", "表示", "显示"),
+                        )
+                        .clicked()
+                    {
                         state.lang_panel_tab = LangPanelTab::Ui;
                     }
-                    if ui.selectable_label(state.lang_panel_tab == LangPanelTab::Network, t(L, "Network", "ネットワーク", "网络")).clicked() {
+                    if ui
+                        .selectable_label(
+                            state.lang_panel_tab == LangPanelTab::Network,
+                            t(L, "Network", "ネットワーク", "网络"),
+                        )
+                        .clicked()
+                    {
                         state.lang_panel_tab = LangPanelTab::Network;
                     }
                     ui.add_space(8.0);
@@ -303,12 +339,11 @@ pub fn show_normal_ui(
                 ui.separator();
                 ui.set_min_width(220.0);
 
-                let is_custom =
-                    state.lang_panel_tab == LangPanelTab::Tgt
-                        && state
-                            .pending_tgt_lang
-                            .as_deref()
-                            .is_some_and(|lang| !LANGS.contains(&lang));
+                let is_custom = state.lang_panel_tab == LangPanelTab::Tgt
+                    && state
+                        .pending_tgt_lang
+                        .as_deref()
+                        .is_some_and(|lang| !LANGS.contains(&lang));
                 if state.lang_panel_tab != LangPanelTab::Network {
                     let list = match state.lang_panel_tab {
                         LangPanelTab::Ui => UI_LANGS,
@@ -376,7 +411,18 @@ pub fn show_normal_ui(
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(egui::RichText::new(t(L, "Reset to local", "ローカルへ戻す", "重置为本地")).size(12.0)).clicked() {
+                            if ui
+                                .button(
+                                    egui::RichText::new(t(
+                                        L,
+                                        "Reset to local",
+                                        "ローカルへ戻す",
+                                        "重置为本地",
+                                    ))
+                                    .size(12.0),
+                                )
+                                .clicked()
+                            {
                                 state.network_host_buf = "127.0.0.1".to_string();
                                 commands.set_server_host = Some("127.0.0.1".to_string());
                                 commands.restart_backend = true;
@@ -385,9 +431,19 @@ pub fn show_normal_ui(
                     });
                     ui.separator();
                     let note = if data.server_host == "0.0.0.0" {
-                        t(L, "Network accessible (0.0.0.0)", "ネットワーク公開 (0.0.0.0)", "网络可访问 (0.0.0.0)")
+                        t(
+                            L,
+                            "Network accessible (0.0.0.0)",
+                            "ネットワーク公開 (0.0.0.0)",
+                            "网络可访问 (0.0.0.0)",
+                        )
                     } else {
-                        t(L, "Local only (127.0.0.1)", "ローカルのみ (127.0.0.1)", "仅本地 (127.0.0.1)")
+                        t(
+                            L,
+                            "Local only (127.0.0.1)",
+                            "ローカルのみ (127.0.0.1)",
+                            "仅本地 (127.0.0.1)",
+                        )
                     };
                     ui.label(
                         egui::RichText::new(note)
@@ -397,8 +453,9 @@ pub fn show_normal_ui(
                 }
 
                 if state.lang_panel_tab == LangPanelTab::Tgt {
-                    let mut custom_btn = egui::Button::new(t(L, "Custom language", "カスタム言語", "自定义语言"))
-                        .min_size(egui::vec2(ui.available_width(), 0.0));
+                    let mut custom_btn =
+                        egui::Button::new(t(L, "Custom language", "カスタム言語", "自定义语言"))
+                            .min_size(egui::vec2(ui.available_width(), 0.0));
                     if is_custom {
                         custom_btn = custom_btn.fill(egui::Color32::from_rgb(70, 90, 120));
                     }
@@ -426,9 +483,13 @@ pub fn show_normal_ui(
                         if enter {
                             let tgt = state.custom_tgt_val_buf.trim().to_string();
                             if tgt.is_empty() {
-                                code_resp.ctx.memory_mut(|m| m.request_focus(egui::Id::new("custom_lang_val_edit")));
+                                code_resp.ctx.memory_mut(|m| {
+                                    m.request_focus(egui::Id::new("custom_lang_val_edit"))
+                                });
                             } else if state.custom_tgt_name_buf.trim().is_empty() {
-                                code_resp.ctx.memory_mut(|m| m.request_focus(egui::Id::new("custom_lang_name_edit")));
+                                code_resp.ctx.memory_mut(|m| {
+                                    m.request_focus(egui::Id::new("custom_lang_name_edit"))
+                                });
                             } else {
                                 ok_clicked = true;
                             }
@@ -449,9 +510,13 @@ pub fn show_normal_ui(
                             let tgt = state.custom_tgt_val_buf.trim().to_string();
                             let name = state.custom_tgt_name_buf.trim().to_string();
                             if tgt.is_empty() {
-                                name_resp.ctx.memory_mut(|m| m.request_focus(egui::Id::new("custom_lang_val_edit")));
+                                name_resp.ctx.memory_mut(|m| {
+                                    m.request_focus(egui::Id::new("custom_lang_val_edit"))
+                                });
                             } else if name.is_empty() {
-                                name_resp.ctx.memory_mut(|m| m.request_focus(egui::Id::new("custom_lang_name_edit")));
+                                name_resp.ctx.memory_mut(|m| {
+                                    m.request_focus(egui::Id::new("custom_lang_name_edit"))
+                                });
                             } else {
                                 ok_clicked = true;
                             }
@@ -468,11 +533,19 @@ pub fn show_normal_ui(
                 None
             } else {
                 let n = state.custom_tgt_name_buf.trim().to_string();
-                if n.is_empty() { None } else { Some(n) }
+                if n.is_empty() {
+                    None
+                } else {
+                    Some(n)
+                }
             };
             let current_slot = data.dict_slot.clone().filter(|s| !s.is_empty());
             if current_slot.is_some() {
-                state.dict_confirm = Some(DictConfirmPending { tgt, tgt_name, current_slot });
+                state.dict_confirm = Some(DictConfirmPending {
+                    tgt,
+                    tgt_name,
+                    current_slot,
+                });
             } else {
                 commands.set_lang_pair = Some((data.src_lang.clone(), tgt, tgt_name, None));
             }
@@ -499,15 +572,35 @@ pub fn show_normal_ui(
                         .and_then(|s| std::path::Path::new(s).file_name())
                         .and_then(|n| n.to_str())
                         .unwrap_or("?");
-                    ui.label(format!("{}: {}", t(L, "Current", "現在", "当前"), slot_name));
-                    ui.label(t(L, "Keep current dictionary?", "現在の辞書をそのまま使いますか？", "保留当前词典？"));
+                    ui.label(format!(
+                        "{}: {}",
+                        t(L, "Current", "現在", "当前"),
+                        slot_name
+                    ));
+                    ui.label(t(
+                        L,
+                        "Keep current dictionary?",
+                        "現在の辞書をそのまま使いますか？",
+                        "保留当前词典？",
+                    ));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new(t(L, "Keep", "そのまま使う", "保留")).size(13.0)).clicked() {
+                    if ui
+                        .button(
+                            egui::RichText::new(t(L, "Keep", "そのまま使う", "保留")).size(13.0),
+                        )
+                        .clicked()
+                    {
                         action = Some(true);
                     }
-                    if ui.button(egui::RichText::new(t(L, "Create New", "新しく作る", "新建")).size(13.0)).clicked() {
+                    if ui
+                        .button(
+                            egui::RichText::new(t(L, "Create New", "新しく作る", "新建"))
+                                .size(13.0),
+                        )
+                        .clicked()
+                    {
                         action = Some(false);
                     }
                 });
@@ -515,7 +608,8 @@ pub fn show_normal_ui(
         if let Some(keep) = action {
             if let Some(p) = state.dict_confirm.take() {
                 let dict_slot = if keep { p.current_slot } else { None };
-                commands.set_lang_pair = Some((data.src_lang.clone(), p.tgt, p.tgt_name, dict_slot));
+                commands.set_lang_pair =
+                    Some((data.src_lang.clone(), p.tgt, p.tgt_name, dict_slot));
             }
         }
     }
@@ -524,15 +618,21 @@ pub fn show_normal_ui(
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("VRAM: {:.0}MB", data.vram_mb)).size(12.0));
             ui.label(egui::RichText::new(format!("Shared: {:.0}MB", data.shared_mb)).size(12.0));
-            ui.label(egui::RichText::new(format!("Tokens: {:.1} t/s", data.tokens_per_second)).size(12.0));
+            ui.label(
+                egui::RichText::new(format!("Tokens: {:.1} t/s", data.tokens_per_second))
+                    .size(12.0),
+            );
             ui.label(egui::RichText::new(format!("Dict hits: {}", data.dict_hits)).size(12.0));
         });
         ui.horizontal(|ui| {
             if data.server_host == "0.0.0.0" && !data.local_ip.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("URL: http://{}:{}", data.local_ip, data.server_port))
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(100, 200, 100)),
+                    egui::RichText::new(format!(
+                        "URL: http://{}:{}",
+                        data.local_ip, data.server_port
+                    ))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(100, 200, 100)),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

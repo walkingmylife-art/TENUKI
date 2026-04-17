@@ -1,4 +1,1 @@
-pub use crate::config::{
-    ProfileStructuralOptions as StructuralOptions,
-    TranslationProfile,
-};
+pub use crate::config::{ProfileStructuralOptions as StructuralOptions, TranslationProfile};

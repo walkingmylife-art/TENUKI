@@ -1,11 +1,11 @@
 //! ログ出力モジュール
 
+use once_cell::sync::Lazy;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use once_cell::sync::Lazy;
 
 #[derive(Debug, Clone)]
 pub struct LogEvent {
@@ -56,20 +56,16 @@ fn ensure_utf8_bom(path: &Path) {
 pub static LOG_TX: Lazy<mpsc::SyncSender<LogEvent>> = Lazy::new(|| {
     let (tx, rx) = mpsc::sync_channel::<LogEvent>(1000);
     let log_path = runtime_dir().join("tenuki.log");
-    
+
     thread::spawn(move || {
         ensure_utf8_bom(&log_path);
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             for event in rx {
                 let _ = writeln!(file, "[{}] {} {}", event.timestamp, event.level, event.msg);
             }
         }
     });
-    
+
     tx
 });
 
@@ -81,11 +77,7 @@ pub static OBSERVE_TX: Lazy<mpsc::SyncSender<LogEvent>> = Lazy::new(|| {
 
     thread::spawn(move || {
         ensure_utf8_bom(&log_path);
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             for event in rx {
                 let _ = writeln!(file, "[{}] {} {}", event.timestamp, event.level, event.msg);
             }
@@ -103,11 +95,7 @@ pub static REQUEST_TX: Lazy<mpsc::SyncSender<LogEvent>> = Lazy::new(|| {
 
     thread::spawn(move || {
         ensure_utf8_bom(&log_path);
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             for event in rx {
                 let _ = writeln!(file, "[{}] {} {}", event.timestamp, event.level, event.msg);
             }

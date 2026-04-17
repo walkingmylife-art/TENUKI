@@ -2,15 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use walkdir::WalkDir;
-
-fn llama_server_binary_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "llama-server.exe"
-    } else {
-        "llama-server"
-    }
-}
 
 pub fn check_models(base_dir: &Path, cache: &mut Option<(bool, Instant)>) -> bool {
     let now = Instant::now();
@@ -37,29 +28,21 @@ pub fn check_llama_server(base_dir: &Path) -> bool {
 }
 
 pub fn find_llama_server_exe(base_dir: &Path) -> Option<PathBuf> {
-    let name = llama_server_binary_name();
-
-    let runtime_dir = base_dir.join("runtime");
-    if runtime_dir.exists() {
-        let found = WalkDir::new(&runtime_dir)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy() == name)
-            .map(|e| e.path().to_path_buf());
-        if found.is_some() {
-            return found;
-        }
+    let backend = authority_backend()?;
+    let runtime_dir = base_dir.join("runtime").join(&backend);
+    if !crate::launcher::runtime_downloader::runtime_is_complete(&runtime_dir, &backend) {
+        return None;
     }
+    crate::launcher::runtime_downloader::find_llama_server_exe(&runtime_dir)
+}
 
-    let fallback_paths = [
-        base_dir.join(name),
-        base_dir.join("llama-server").join(name),
-    ];
-    for p in fallback_paths {
-        if p.is_file() {
-            return Some(p);
-        }
+fn authority_backend() -> Option<String> {
+    let install_root = crate::launcher::resolve_install_root();
+    let config_path = install_root.join("launcher_config.toml");
+    let config = crate::launcher::app_config::AppConfig::load(&config_path).ok()?;
+    if config.backend.trim().is_empty() {
+        None
+    } else {
+        Some(config.backend)
     }
-    None
 }

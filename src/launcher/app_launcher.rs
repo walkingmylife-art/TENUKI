@@ -1,8 +1,8 @@
 // src/launcher/app_launcher.rs
 //
-// 役割：権威設定（AppConfig）に基づきモデルとバックエンドを準備し、
-//       実際に使用した URL や実行ファイルのパスをキャッシュ（LauncherState）に保存する。
-// - LauncherState はあくまでキャッシュであり、権威設定を上書きしない。
+// 役割：権威設定（AppConfig）に基づきモデルとバックエンドを準備する。
+// - setup で通った backend を launcher_config.toml の backend フィールドに反映して保存。
+// - 通常起動の判定（check_ready）は launcher_config.toml の backend のみ参照。
 // - 検証（test_backend_exe）は必ず 127.0.0.1 + 動的ポートを使用する。
 // - 起動引数の組み立ては build_server_command() に一元化し、本番起動とテスト起動で完全に一致させる。
 // - LaunchProgress::Progress は「現在のフェーズ（モデルDL/ランタイムDL）単体の進捗（0.0～1.0）」であり、
@@ -10,21 +10,27 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// 診断メッセージを SubStatus で流し、launcher_debug.log にも追記する。
 fn diag(progress_tx: &Sender<LaunchProgress>, base_dir: &Path, msg: &str) {
-    progress_tx.send(LaunchProgress::SubStatus(msg.to_string())).ok();
+    progress_tx
+        .send(LaunchProgress::SubStatus(msg.to_string()))
+        .ok();
     let log_path = base_dir.join("launcher_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -35,7 +41,6 @@ fn diag(progress_tx: &Sender<LaunchProgress>, base_dir: &Path, msg: &str) {
 
 use super::app_config::AppConfig;
 use super::backend_detector::BackendDetector;
-use super::launcher_state::LauncherState;
 use super::progress::LaunchProgress;
 use super::runtime_downloader::{find_llama_server_exe, RuntimeDownloader};
 use crate::backend::process::build_llama_command;
@@ -74,6 +79,12 @@ fn cleanup_model_resume_artifacts(model_path: &Path) {
     }
 }
 
+fn push_unique_candidate(out: &mut Vec<BackendCandidate>, candidate: BackendCandidate) {
+    if out.iter().all(|existing| existing.name != candidate.name) {
+        out.push(candidate);
+    }
+}
+
 /// runtime とモデルが揃っているか確認する。
 /// main.rs でモードを決定するために使用される。
 /// - launcher_config.toml は install_root から読む（権威位置）
@@ -92,22 +103,17 @@ pub fn check_ready(base_dir: &std::path::Path) -> bool {
         }
     };
 
-    // runtime 確認: launcher_state のキャッシュを使って backend dir を特定
-    let state_path = base_dir.join("launcher_state.json");
-    let state = super::launcher_state::LauncherState::load(&state_path).unwrap_or_default();
-    let backend = match &state.backend {
-        Some(b) => b.clone(),
-        None => {
-            diag_file(base_dir, "[check_ready] no backend in state → false");
-            return false;
-        }
-    };
-    let runtime_dir = base_dir.join("runtime").join(&backend);
-    let rt_ok = runtime_is_complete(&runtime_dir, &backend);
-    diag_file(base_dir, &format!(
-        "[check_ready] runtime_is_complete backend={} rt_ok={}",
-        backend, rt_ok
-    ));
+    // runtime 確認: authority (launcher_config.toml) の backend から runtime ディレクトリを特定
+    let backend = &config.backend;
+    let runtime_dir = base_dir.join("runtime").join(backend);
+    let rt_ok = runtime_is_complete(&runtime_dir, backend);
+    diag_file(
+        base_dir,
+        &format!(
+            "[check_ready] runtime_is_complete backend={} rt_ok={}",
+            backend, rt_ok
+        ),
+    );
     if !rt_ok {
         return false;
     }
@@ -115,10 +121,13 @@ pub fn check_ready(base_dir: &std::path::Path) -> bool {
     let model_path = base_dir.join("models").join(&config.model.filename);
     let expected_size = config.model.expected_size;
     let ok = model_is_complete(&model_path, expected_size);
-    diag_file(base_dir, &format!(
-        "[check_ready] model_is_complete={} filename={} expected_size={}",
-        ok, config.model.filename, expected_size
-    ));
+    diag_file(
+        base_dir,
+        &format!(
+            "[check_ready] model_is_complete={} filename={} expected_size={}",
+            ok, config.model.filename, expected_size
+        ),
+    );
     if !ok {
         return false;
     }
@@ -126,10 +135,60 @@ pub fn check_ready(base_dir: &std::path::Path) -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendCandidateReason {
+    AuthorityConfig,
+    GpuDetection,
+    InstalledRuntime,
+}
+
+impl BackendCandidateReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorityConfig => "authority_config",
+            Self::GpuDetection => "gpu_detection",
+            Self::InstalledRuntime => "installed_runtime",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackendCandidate {
+    name: String,
+    reason: BackendCandidateReason,
+}
+
+impl BackendCandidate {
+    fn new(name: String, reason: BackendCandidateReason) -> Self {
+        Self { name, reason }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackendPlan {
+    gpu_detected: Vec<BackendCandidate>,
+    installed: Vec<BackendCandidate>,
+    authority_download: Option<BackendCandidate>,
+    skipped_authority_download: Option<BackendCandidate>,
+    fallback_downloads: Vec<BackendCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedBackendCandidate {
+    candidate: BackendCandidate,
+    exe_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedModelRescue {
+    None,
+    Unique(PathBuf),
+    Ambiguous(Vec<PathBuf>),
+}
+
 pub struct AppLauncher {
     base_dir: PathBuf,
     config: AppConfig,
-    state: LauncherState,
     http_client: Client,
     ui_lang: String,
 }
@@ -139,29 +198,33 @@ impl AppLauncher {
         // launcher_config.toml は install_root（権威位置）から読む
         let install_root = super::resolve_install_root();
         let config_path = install_root.join("launcher_config.toml");
-        let config = AppConfig::load(&config_path)?;
-
-        let state_path = base_dir.join("launcher_state.json");
-        let mut state = LauncherState::load(&state_path).unwrap_or_default();
-
-        let old_state_path = base_dir.join("state.json");
-        if old_state_path.exists() && !state_path.exists() {
-            if let Ok(old_state) = LauncherState::load(&old_state_path) {
-                state = old_state;
-                state.save(&state_path)?;
-            }
-        }
+        // missing = setup 前の未生成。default をメモリ上の出発点にするだけで保存しない。
+        // 保存は run() の Save 段階でのみ行う。
+        let config = if config_path.exists() {
+            AppConfig::load(&config_path)?
+        } else {
+            AppConfig::default()
+        };
 
         let http_client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .context("Failed to build HTTP client")?;
 
-        Ok(Self { base_dir, config, state, http_client, ui_lang })
+        Ok(Self {
+            base_dir,
+            config,
+            http_client,
+            ui_lang,
+        })
     }
 
     fn t(&self, en: &str, ja: &str) -> String {
-        if self.ui_lang == "en" { en.to_string() } else { ja.to_string() }
+        if self.ui_lang == "en" {
+            en.to_string()
+        } else {
+            ja.to_string()
+        }
     }
 
     pub fn run(
@@ -181,66 +244,211 @@ impl AppLauncher {
         }
 
         // Stage: Directories
-        progress_tx.send(LaunchProgress::Stage(LauncherStage::Directories)).ok();
-        progress_tx.send(LaunchProgress::Status(self.t("Preparing directories...", "ディレクトリを確認中..."))).ok();
+        progress_tx
+            .send(LaunchProgress::Stage(LauncherStage::Directories))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::Status(
+                self.t("Preparing directories...", "ディレクトリを確認中..."),
+            ))
+            .ok();
         self.create_directories()?;
         check_cancel!();
 
         // Stage: Gpu
-        progress_tx.send(LaunchProgress::Stage(LauncherStage::Gpu)).ok();
-        progress_tx.send(LaunchProgress::Status(self.t("Detecting GPU...", "GPUを検出中..."))).ok();
-        let candidates = self.build_backend_candidates();
+        progress_tx
+            .send(LaunchProgress::Stage(LauncherStage::Gpu))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::Status(
+                self.t("Detecting GPU...", "GPUを検出中..."),
+            ))
+            .ok();
+        let backend_plan = self.build_backend_plan();
+        diag(
+            &progress_tx,
+            &self.base_dir,
+            &format!(
+                "[run] backend plan gpu_detected={:?} installed={:?} authority_download={:?} skipped_authority_download={:?} fallback_downloads={:?}",
+                backend_plan.gpu_detected,
+                backend_plan.installed,
+                backend_plan.authority_download,
+                backend_plan.skipped_authority_download,
+                backend_plan.fallback_downloads
+            ),
+        );
+        if let Some(candidate) = backend_plan.skipped_authority_download.as_ref() {
+            diag(
+                &progress_tx,
+                &self.base_dir,
+                &format!(
+                    "[run] skip authority download backend={} reason=authority_backend_not_in_current_gpu_evidence gpu_detected={:?}",
+                    candidate.name,
+                    backend_plan
+                        .gpu_detected
+                        .iter()
+                        .map(|gpu| gpu.name.as_str())
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
         check_cancel!();
 
         // Stage: Model
-        progress_tx.send(LaunchProgress::Stage(LauncherStage::Model)).ok();
-        progress_tx.send(LaunchProgress::Status(self.t("Checking model...", "モデルを確認中..."))).ok();
-        let (model_path, model_url) = self.ensure_model(&progress_tx, &cancel_flag)?;
+        progress_tx
+            .send(LaunchProgress::Stage(LauncherStage::Model))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::Status(
+                self.t("Checking model...", "モデルを確認中..."),
+            ))
+            .ok();
+        let model_path = self.ensure_model(&progress_tx, &cancel_flag)?;
         check_cancel!();
 
         // Stage: Runtime
-        progress_tx.send(LaunchProgress::Stage(LauncherStage::Runtime)).ok();
-        progress_tx.send(LaunchProgress::Status(self.t("Selecting backend...", "バックエンドを選定中..."))).ok();
-        let mut working_backend = None;
-        for name in candidates.iter() {
+        // Pass 1: 既インストール runtime を順に試す（ダウンロードなし）
+        // Pass 2: 既存で動くものがなければ config.backend のみダウンロード
+        progress_tx
+            .send(LaunchProgress::Stage(LauncherStage::Runtime))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::Status(
+                self.t("Selecting backend...", "バックエンドを選定中..."),
+            ))
+            .ok();
+
+        let mut working_backend: Option<VerifiedBackendCandidate> = None;
+        for candidate in backend_plan.installed.iter() {
             check_cancel!();
-            progress_tx.send(LaunchProgress::SubStatus(
-                self.t(&format!("Trying {}...", name), &format!("{} を試行中...", name))
-            )).ok();
-            if let Ok((exe_path, backend_url)) = self.try_backend(name, &model_path, &progress_tx, &cancel_flag) {
-                working_backend = Some((name.clone(), exe_path, backend_url));
-                break;
+            let name = &candidate.name;
+            progress_tx
+                .send(LaunchProgress::SubStatus(self.t(
+                    &format!("Trying {}...", candidate.name),
+                    &format!("{} を試行中...", name),
+                )))
+                .ok();
+            match self.try_existing_backend(candidate, &model_path, &progress_tx) {
+                Ok(verified) => {
+                    working_backend = Some(verified);
+                    break;
+                }
+                Err(e) => {
+                    diag(
+                        &progress_tx,
+                        &self.base_dir,
+                        &format!(
+                            "[run] existing runtime rejected backend={} reason={} error={}",
+                            name,
+                            candidate.reason.as_str(),
+                            e
+                        ),
+                    );
+                }
             }
         }
 
-        let (backend_name, exe_path, backend_url) =
+        if working_backend.is_none() {
+            if let Some(candidate) = backend_plan.authority_download.as_ref() {
+                let name = &candidate.name;
+                check_cancel!();
+                progress_tx
+                    .send(LaunchProgress::SubStatus(self.t(
+                        &format!("Downloading {} runtime...", name),
+                        &format!("{} ランタイムをダウンロード中...", name),
+                    )))
+                    .ok();
+                match self.try_backend(candidate, &model_path, &progress_tx, &cancel_flag) {
+                    Ok(verified) => {
+                        working_backend = Some(verified);
+                    }
+                    Err(e) => {
+                        diag(
+                            &progress_tx,
+                            &self.base_dir,
+                            &format!(
+                                "[run] authority download rejected backend={} reason={} error={}",
+                                name,
+                                candidate.reason.as_str(),
+                                e
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        if working_backend.is_none() {
+            for candidate in backend_plan.fallback_downloads.iter() {
+                let name = &candidate.name;
+                check_cancel!();
+                progress_tx
+                    .send(LaunchProgress::SubStatus(self.t(
+                        &format!("Downloading {} runtime...", name),
+                        &format!("{} 繝ｩ繝ｳ繧ｿ繧､繝繧偵ム繧ｦ繝ｳ繝ｭ繝ｼ繝我ｸｭ...", name),
+                    )))
+                    .ok();
+                match self.try_backend(candidate, &model_path, &progress_tx, &cancel_flag) {
+                    Ok(verified) => {
+                        working_backend = Some(verified);
+                        break;
+                    }
+                    Err(e) => {
+                        diag(
+                            &progress_tx,
+                            &self.base_dir,
+                            &format!(
+                                "[run] fallback download rejected backend={} reason={} error={}",
+                                name,
+                                candidate.reason.as_str(),
+                                e
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        let verified_backend =
             working_backend.ok_or_else(|| anyhow!("No working backend found"))?;
+        let backend_name = verified_backend.candidate.name.clone();
+        let exe_path = verified_backend.exe_path;
         check_cancel!();
 
         // Stage: Verify (test_backend_exe already ran inside try_backend)
-        progress_tx.send(LaunchProgress::Stage(LauncherStage::Verify)).ok();
-        progress_tx.send(LaunchProgress::Status(self.t("Verified.", "検証完了."))).ok();
+        progress_tx
+            .send(LaunchProgress::Stage(LauncherStage::Verify))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::Status(self.t("Verified.", "検証完了.")))
+            .ok();
         check_cancel!();
 
-        // Stage: Save
-        progress_tx.send(LaunchProgress::Stage(LauncherStage::Save)).ok();
-        progress_tx.send(LaunchProgress::Status(self.t("Saving state...", "状態を保存中..."))).ok();
-        // キャッシュ更新：今回実際に採用した URL を保存する（権威設定ではない）
-        self.state.backend = Some(backend_name.clone());
-        self.state.model_filename = Some(self.config.model.filename.clone());
-        self.state.runtime_exe_path = Some(exe_path);
-        self.state.model_url = Some(model_url);
-        self.state.backend_url = Some(backend_url);
-        self.state.save(&self.base_dir.join("launcher_state.json"))?;
+        // Stage: Save — setup で通った backend を authority (launcher_config.toml) に反映
+        progress_tx
+            .send(LaunchProgress::Stage(LauncherStage::Save))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::Status(
+                self.t("Saving config...", "設定を保存中..."),
+            ))
+            .ok();
+        self.config.backend = backend_name.clone();
+        let install_root = super::resolve_install_root();
+        let config_path = install_root.join("launcher_config.toml");
+        self.config.save(&config_path)?;
         self.seed_profiles()?;
 
-        diag(&progress_tx, &self.base_dir, &format!(
-            "[run] COMPLETE backend={} model={} exe={} url={}",
-            self.state.backend.as_deref().unwrap_or("?"),
-            self.state.model_filename.as_deref().unwrap_or("?"),
-            self.state.runtime_exe_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "?".into()),
-            self.state.backend_url.as_deref().unwrap_or("?"),
-        ));
+        diag(
+            &progress_tx,
+            &self.base_dir,
+            &format!(
+                "[run] COMPLETE backend={} model={} exe={}",
+                backend_name,
+                self.config.model.filename,
+                exe_path.display(),
+            ),
+        );
         progress_tx.send(LaunchProgress::Complete).ok();
         Ok(())
     }
@@ -258,11 +466,14 @@ impl AppLauncher {
         &self,
         progress_tx: &Sender<LaunchProgress>,
         cancel_flag: &Arc<AtomicBool>,
-    ) -> Result<(PathBuf, String)> {
+    ) -> Result<PathBuf> {
         let expected = self.config.model.expected_size;
         if expected == 0 {
-            diag(progress_tx, &self.base_dir,
-                "[ensure_model] ERROR: expected_size == 0 in launcher_config.toml");
+            diag(
+                progress_tx,
+                &self.base_dir,
+                "[ensure_model] ERROR: expected_size == 0 in launcher_config.toml",
+            );
             anyhow::bail!(
                 "model.expected_size is 0 in launcher_config.toml. \
                  Set it to the correct file size in bytes."
@@ -273,28 +484,69 @@ impl AppLauncher {
         let model_path = model_dir.join(&self.config.model.filename);
 
         let complete = model_is_complete(&model_path, expected);
-        diag(progress_tx, &self.base_dir, &format!(
-            "[ensure_model] filename={} exists={} expected_size={} complete={}",
-            self.config.model.filename, model_path.exists(), expected, complete
-        ));
+        diag(
+            progress_tx,
+            &self.base_dir,
+            &format!(
+                "[ensure_model] filename={} exists={} expected_size={} complete={}",
+                self.config.model.filename,
+                model_path.exists(),
+                expected,
+                complete
+            ),
+        );
         if complete {
-            let url = self.state.model_url.clone()
-                .unwrap_or_else(|| self.config.model.urls.primary.clone());
-            diag(progress_tx, &self.base_dir, "[ensure_model] → reuse existing model");
-            return Ok((model_path, url));
+            diag(
+                progress_tx,
+                &self.base_dir,
+                "[ensure_model] → reuse existing model",
+            );
+            return Ok(model_path);
+        }
+
+        match self.observe_alternative_models(&model_dir, expected) {
+            ObservedModelRescue::Unique(found) => {
+                diag(
+                    progress_tx,
+                    &self.base_dir,
+                    &format!(
+                        "[ensure_model] rescue commit reason=single_same_size_candidate authority_filename_missing observed={} committed={}",
+                        found.display(),
+                        model_path.display()
+                    ),
+                );
+                cleanup_model_resume_artifacts(&found);
+                std::fs::rename(&found, &model_path)?;
+                return Ok(model_path);
+            }
+            ObservedModelRescue::Ambiguous(candidates) => {
+                diag(
+                    progress_tx,
+                    &self.base_dir,
+                    &format!(
+                        "[ensure_model] rescue refused reason=ambiguous_same_size_candidates count={} candidates={:?}",
+                        candidates.len(),
+                        candidates
+                    ),
+                );
+            }
+            ObservedModelRescue::None => {}
         }
 
         // authority filename がまだない／不完全だが、models/ に同サイズの別名ggufがあれば再利用する。
         // sidecar なし・サイズ完全一致・拡張子 .gguf の先頭ヒットを採用。
         if let Some(found) = self.find_alternative_model(&model_dir, expected) {
-            diag(progress_tx, &self.base_dir, &format!(
-                "[ensure_model] found alternative model by size: {} → rename to {}",
-                found.display(), model_path.display()
-            ));
+            diag(
+                progress_tx,
+                &self.base_dir,
+                &format!(
+                    "[ensure_model] found alternative model by size: {} → rename to {}",
+                    found.display(),
+                    model_path.display()
+                ),
+            );
             std::fs::rename(&found, &model_path)?;
-            let url = self.state.model_url.clone()
-                .unwrap_or_else(|| self.config.model.urls.primary.clone());
-            return Ok((model_path, url));
+            return Ok(model_path);
         }
 
         // 不完全なファイルが残っている場合は削除して再取得
@@ -302,20 +554,30 @@ impl AppLauncher {
         if model_path.exists() {
             let sidecar = PathBuf::from(format!("{}.sidecar.json", model_path.display()));
             if !sidecar.exists() {
-                diag(progress_tx, &self.base_dir, "[ensure_model] incomplete (no sidecar, bad size) → remove and re-download");
+                diag(
+                    progress_tx,
+                    &self.base_dir,
+                    "[ensure_model] incomplete (no sidecar, bad size) → remove and re-download",
+                );
                 std::fs::remove_file(&model_path)?;
             }
         }
 
-        progress_tx.send(LaunchProgress::Status(self.t("Downloading model...", "モデルをダウンロード中..."))).ok();
-        progress_tx.send(LaunchProgress::SubStatus(
-            self.t(&format!("Fetching: {}", self.config.model.filename),
-                   &format!("取得中: {}", self.config.model.filename)),
-        )).ok();
+        progress_tx
+            .send(LaunchProgress::Status(
+                self.t("Downloading model...", "モデルをダウンロード中..."),
+            ))
+            .ok();
+        progress_tx
+            .send(LaunchProgress::SubStatus(self.t(
+                &format!("Fetching: {}", self.config.model.filename),
+                &format!("取得中: {}", self.config.model.filename),
+            )))
+            .ok();
 
         let urls = &self.config.model.urls;
         let downloader = RuntimeDownloader::with_cancel_flag(cancel_flag.clone())?;
-        let used_url_opt = downloader.download_model(
+        let _used_url_opt = downloader.download_model(
             &urls.primary,
             urls.fallback.as_deref(),
             &model_path,
@@ -326,20 +588,12 @@ impl AppLauncher {
             },
         )?;
 
-        let used_url = used_url_opt.unwrap_or_else(|| {
-            self.state.model_url.clone()
-                .unwrap_or_else(|| self.config.model.urls.primary.clone())
-        });
-        Ok((model_path, used_url))
+        Ok(model_path)
     }
 
     /// models/ ディレクトリ内から authority filename 以外の .gguf を探し、
     /// sidecar なし・expected_size 一致のものを収集する。
-    ///
-    /// 採用ルール（優先順）:
-    ///   1. state.model_filename と一致する候補が唯一 → それを採用
-    ///   2. 候補が唯一 → 採用
-    ///   3. 候補が複数 → 採用不能（ambiguous）→ None
+    /// 候補が唯一のときのみ採用。複数は ambiguous → None（再DL）。
     fn find_alternative_model(&self, model_dir: &Path, expected_size: u64) -> Option<PathBuf> {
         let authority_name = &self.config.model.filename;
         let entries = std::fs::read_dir(model_dir).ok()?;
@@ -354,7 +608,10 @@ impl AppLauncher {
                 if path.file_name().and_then(|n| n.to_str()) == Some(authority_name.as_str()) {
                     return None;
                 }
-                if std::fs::metadata(&path).map(|m| m.len() == expected_size).unwrap_or(false) {
+                if std::fs::metadata(&path)
+                    .map(|m| m.len() == expected_size)
+                    .unwrap_or(false)
+                {
                     cleanup_model_resume_artifacts(&path);
                     Some(path)
                 } else {
@@ -363,22 +620,6 @@ impl AppLauncher {
             })
             .collect();
 
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // state.model_filename と一致する候補を優先
-        if let Some(state_name) = &self.state.model_filename {
-            let preferred: Vec<&PathBuf> = candidates
-                .iter()
-                .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(state_name.as_str()))
-                .collect();
-            if preferred.len() == 1 {
-                return Some(preferred[0].clone());
-            }
-        }
-
-        // 候補が一意なら採用。複数は選択根拠なし → None（再DL）。
         if candidates.len() == 1 {
             candidates.into_iter().next()
         } else {
@@ -386,120 +627,190 @@ impl AppLauncher {
         }
     }
 
-    fn build_backend_candidates(&self) -> Vec<String> {
-        let mut candidates = Vec::new();
-        if let Some(backend) = &self.state.backend {
-            candidates.push(backend.clone());
-        }
-        let gpus = BackendDetector::enumerate_gpus().unwrap_or_default();
-        for name in BackendDetector::build_backend_candidate_names(&gpus) {
-            if !candidates.contains(&name) {
-                candidates.push(name);
-            }
-        }
-        for name in ["cuda", "rocm", "vulkan"] {
-            if !candidates.iter().any(|c| c == name) {
-                if self.base_dir.join("runtime").join(name).exists() {
-                    candidates.push(name.to_string());
+    fn observe_alternative_models(
+        &self,
+        model_dir: &Path,
+        expected_size: u64,
+    ) -> ObservedModelRescue {
+        let authority_name = &self.config.model.filename;
+        let entries = match std::fs::read_dir(model_dir) {
+            Ok(entries) => entries,
+            Err(_) => return ObservedModelRescue::None,
+        };
+
+        let candidates: Vec<PathBuf> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("gguf") {
+                    return None;
                 }
+                if path.file_name().and_then(|n| n.to_str()) == Some(authority_name.as_str()) {
+                    return None;
+                }
+                if std::fs::metadata(&path)
+                    .map(|m| m.len() == expected_size)
+                    .unwrap_or(false)
+                {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        match candidates.len() {
+            0 => ObservedModelRescue::None,
+            1 => ObservedModelRescue::Unique(candidates.into_iter().next().unwrap()),
+            _ => ObservedModelRescue::Ambiguous(candidates),
+        }
+    }
+
+    fn build_backend_plan(&self) -> BackendPlan {
+        let gpu_candidates = self.gpu_backend_candidates();
+        let installed_runtime_candidates = self.installed_runtime_candidates();
+        self.build_backend_plan_from_observations(gpu_candidates, installed_runtime_candidates)
+    }
+
+    fn build_backend_plan_from_observations(
+        &self,
+        gpu_candidates: Vec<BackendCandidate>,
+        installed_runtime_candidates: Vec<BackendCandidate>,
+    ) -> BackendPlan {
+        let authority_download = BackendCandidate::new(
+            self.config.backend.clone(),
+            BackendCandidateReason::AuthorityConfig,
+        );
+
+        let mut installed = Vec::new();
+        if self.has_complete_runtime(&authority_download.name) {
+            push_unique_candidate(&mut installed, authority_download.clone());
+        }
+        for candidate in gpu_candidates.iter().cloned() {
+            if self.has_complete_runtime(&candidate.name) {
+                push_unique_candidate(&mut installed, candidate);
             }
         }
-        candidates
+        for candidate in installed_runtime_candidates {
+            push_unique_candidate(&mut installed, candidate);
+        }
+
+        let authority_matches_current_gpu = gpu_candidates
+            .iter()
+            .any(|candidate| candidate.name == authority_download.name);
+
+        let mut fallback_downloads = Vec::new();
+        for candidate in gpu_candidates.iter().cloned() {
+            if candidate.name != authority_download.name {
+                push_unique_candidate(&mut fallback_downloads, candidate);
+            }
+        }
+
+        BackendPlan {
+            gpu_detected: gpu_candidates,
+            installed,
+            authority_download: authority_matches_current_gpu.then_some(authority_download.clone()),
+            skipped_authority_download: (!authority_matches_current_gpu)
+                .then_some(authority_download),
+            fallback_downloads,
+        }
+    }
+
+    fn gpu_backend_candidates(&self) -> Vec<BackendCandidate> {
+        let gpus = BackendDetector::enumerate_gpus().unwrap_or_default();
+        BackendDetector::build_backend_candidate_names(&gpus)
+            .into_iter()
+            .map(|name| BackendCandidate::new(name, BackendCandidateReason::GpuDetection))
+            .collect()
+    }
+
+    fn installed_runtime_candidates(&self) -> Vec<BackendCandidate> {
+        ["cuda", "rocm", "vulkan"]
+            .into_iter()
+            .filter(|name| self.has_complete_runtime(name))
+            .map(|name| {
+                BackendCandidate::new(name.to_string(), BackendCandidateReason::InstalledRuntime)
+            })
+            .collect()
+    }
+
+    fn has_complete_runtime(&self, name: &str) -> bool {
+        let runtime_dir = self.base_dir.join("runtime").join(name);
+        crate::launcher::runtime_downloader::runtime_is_complete(&runtime_dir, name)
+    }
+
+    /// 既インストール runtime を検証して (exe, url) を返す。ダウンロードしない。
+    fn try_existing_backend(
+        &self,
+        candidate: &BackendCandidate,
+        model_path: &Path,
+        progress_tx: &Sender<LaunchProgress>,
+    ) -> Result<VerifiedBackendCandidate> {
+        let name = &candidate.name;
+        let runtime_dir = self.base_dir.join("runtime").join(name);
+        if !self.has_complete_runtime(name) {
+            anyhow::bail!("runtime/{} not installed", name);
+        }
+        let exe_path = find_llama_server_exe(&runtime_dir)
+            .ok_or_else(|| anyhow!("llama-server not found in {}", runtime_dir.display()))?;
+        progress_tx
+            .send(LaunchProgress::SubStatus(
+                self.t("Verifying runtime...", "ランタイム検証中..."),
+            ))
+            .ok();
+        self.test_backend_exe(&exe_path, model_path)?;
+        diag(
+            progress_tx,
+            &self.base_dir,
+            &format!(
+                "[try_existing_backend] using {} → {}",
+                name,
+                exe_path.display()
+            ),
+        );
+        Ok(VerifiedBackendCandidate {
+            candidate: candidate.clone(),
+            exe_path,
+        })
     }
 
     /// バックエンドを試行し、(実行ファイルパス, 採用する URL) を返す。
     fn try_backend(
         &self,
-        name: &str,
+        candidate: &BackendCandidate,
         model_path: &Path,
         progress_tx: &Sender<LaunchProgress>,
         cancel_flag: &Arc<AtomicBool>,
-    ) -> Result<(PathBuf, String)> {
+    ) -> Result<VerifiedBackendCandidate> {
+        let name = &candidate.name;
         let runtime_dir = self.base_dir.join("runtime").join(name);
 
-        // キャッシュ済み exe を優先試行する。
-        // backend 名一致は不要 — exe が runtime/<name>/ 配下にあれば十分。
-        // backend 名が違っても同一 artifact が別ディレクトリにある場合をカバーする。
-        if let (Some(cached_path), Some(cached_url)) = (
-            self.state.runtime_exe_path.as_ref(),
-            self.state.backend_url.as_ref(),
-        ) {
-            let in_target_dir = cached_path
-                .ancestors()
-                .any(|a| a == runtime_dir.as_path());
-            if cached_path.exists() && in_target_dir
-                && self.test_backend_exe(cached_path, model_path).is_ok()
-            {
-                diag(progress_tx, &self.base_dir, &format!(
-                    "[try_backend] reuse cached exe: {}", cached_path.display()
-                ));
-                return Ok((cached_path.clone(), cached_url.clone()));
-            }
-        }
-
-        // orphan 救済: runtime/<other>/ にある完成済み artifact を runtime/<name>/ に移設する。
-        if let Some(orphan_url) = self.rescue_orphan_runtime(name, &runtime_dir, progress_tx) {
-            if let Some(exe_path) = find_llama_server_exe(&runtime_dir) {
-                if self.test_backend_exe(&exe_path, model_path).is_ok() {
-                    diag(progress_tx, &self.base_dir, &format!(
-                        "[try_backend] rescued orphan runtime → {}", exe_path.display()
-                    ));
-                    return Ok((exe_path, orphan_url));
-                }
-            }
-        }
-
-        let used_url_opt = self.ensure_runtime(name, &runtime_dir, progress_tx, cancel_flag)?;
+        self.ensure_runtime(name, &runtime_dir, progress_tx, cancel_flag)?;
         let exe_path = find_llama_server_exe(&runtime_dir)
             .ok_or_else(|| anyhow!("llama-server not found in {}", runtime_dir.display()))?;
 
+        progress_tx
+            .send(LaunchProgress::SubStatus(
+                self.t("Verifying runtime...", "ランタイム検証中..."),
+            ))
+            .ok();
         self.test_backend_exe(&exe_path, model_path)?;
 
-        let used_url = used_url_opt.unwrap_or_else(|| {
-            self.state.backend_url.clone()
-                .unwrap_or_else(|| self.config.runtime_urls.for_backend(name).unwrap().primary.clone())
-        });
-        Ok((exe_path, used_url))
-    }
+        diag(
+            progress_tx,
+            &self.base_dir,
+            &format!(
+                "[try_backend] verified backend={} reason={} exe={}",
+                name,
+                candidate.reason.as_str(),
+                exe_path.display()
+            ),
+        );
 
-    /// runtime/<other>/ に `name` と同一 backend の完成済み artifact があれば
-    /// runtime/<name>/ に移設（rename）して、採用した URL を返す。
-    ///
-    /// 移設条件:
-    ///   - `runtime/<other>/` が `runtime_is_complete(other)` を満たす
-    ///   - `state.backend_url` が `name` 用の authority URL（プライマリ / ベース一致）と一致
-    ///   - `other != name`
-    fn rescue_orphan_runtime(&self, name: &str, dest_dir: &Path, progress_tx: &Sender<LaunchProgress>) -> Option<String> {
-        use crate::launcher::runtime_downloader::runtime_is_complete;
-
-        let runtime_root = self.base_dir.join("runtime");
-        let authority_url = self.config.runtime_urls.for_backend(name)
-            .map(|a| url_base(&a.primary))?;
-
-        let cached_url = self.state.backend_url.as_deref()?;
-        if url_base(cached_url) != authority_url {
-            return None;
-        }
-
-        let entries = std::fs::read_dir(&runtime_root).ok()?;
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            let other = dir.file_name()?.to_str()?;
-            if other == name || !dir.is_dir() {
-                continue;
-            }
-            if !runtime_is_complete(&dir, other) {
-                continue;
-            }
-            // 同一 URL 由来なら移設する
-            diag(progress_tx, &self.base_dir, &format!(
-                "[rescue_orphan_runtime] moving runtime/{} → runtime/{}", other, name
-            ));
-            if std::fs::rename(&dir, dest_dir).is_ok() {
-                return Some(cached_url.to_string());
-            }
-        }
-        None
+        Ok(VerifiedBackendCandidate {
+            candidate: candidate.clone(),
+            exe_path,
+        })
     }
 
     fn ensure_runtime(
@@ -508,26 +819,32 @@ impl AppLauncher {
         dest_dir: &Path,
         progress_tx: &Sender<LaunchProgress>,
         cancel_flag: &Arc<AtomicBool>,
-    ) -> Result<Option<String>> {
-        let rt_ok = crate::launcher::runtime_downloader::runtime_is_complete(dest_dir, name);
-        diag(progress_tx, &self.base_dir, &format!(
-            "[ensure_runtime] backend={} rt_ok={}",
-            name, rt_ok
-        ));
+    ) -> Result<()> {
+        let rt_ok = self.has_complete_runtime(name);
+        diag(
+            progress_tx,
+            &self.base_dir,
+            &format!("[ensure_runtime] backend={} rt_ok={}", name, rt_ok),
+        );
         if rt_ok {
-            return Ok(None);
+            return Ok(());
         }
 
-        progress_tx.send(LaunchProgress::Status(
-            self.t(&format!("Downloading {} runtime...", name),
-                   &format!("{} ランタイムをダウンロード中...", name))
-        )).ok();
+        progress_tx
+            .send(LaunchProgress::Status(self.t(
+                &format!("Downloading {} runtime...", name),
+                &format!("{} ランタイムをダウンロード中...", name),
+            )))
+            .ok();
 
-        let assets = self.config.runtime_urls.for_backend(name)
+        let assets = self
+            .config
+            .runtime_urls
+            .for_backend(name)
             .ok_or_else(|| anyhow!("Unsupported backend: {}", name))?;
 
         let downloader = RuntimeDownloader::with_cancel_flag(cancel_flag.clone())?;
-        downloader.download_backend(
+        let _used_url = downloader.download_backend(
             name,
             &assets.primary,
             &assets.extra_assets,
@@ -537,7 +854,8 @@ impl AppLauncher {
                 // ランタイムダウンロード単体の進捗（0.0～1.0）
                 progress_tx.send(LaunchProgress::Progress(progress)).ok();
             },
-        )
+        )?;
+        Ok(())
     }
 
     /// バックエンド実行ファイルの検証。
@@ -570,6 +888,12 @@ impl AppLauncher {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn test backend: {}", exe_path.display()))?;
+
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                for _ in BufReader::new(stderr).lines() {}
+            });
+        }
 
         let result = self.wait_for_healthy_process(&mut child, test_port, Duration::from_secs(120));
         let _ = child.kill();
@@ -635,7 +959,11 @@ impl AppLauncher {
 /// check_ready 用：progress_tx なしでファイルだけに書く。
 fn diag_file(base_dir: &Path, msg: &str) {
     let log_path = base_dir.join("launcher_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -650,7 +978,201 @@ fn find_free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// URL の ?query 部分を除いたベース文字列を返す。
-fn url_base(url: &str) -> &str {
-    url.split('?').next().unwrap_or(url)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launcher::app_config::AppConfig;
+    use crate::launcher::runtime_downloader::runtime_is_complete;
+    use std::fs;
+    use std::time::Duration;
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tenuki_launcher_{}", tag));
+        fs::create_dir_all(dir.join("models")).unwrap();
+        dir
+    }
+
+    fn make_launcher(base_dir: PathBuf, filename: &str, expected_size: u64) -> AppLauncher {
+        let mut config = AppConfig::default();
+        config.model.filename = filename.to_string();
+        config.model.expected_size = expected_size;
+        AppLauncher {
+            base_dir,
+            config,
+            http_client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            ui_lang: "ja".to_string(),
+        }
+    }
+
+    // --- model rescue: find_alternative_model ---
+
+    #[test]
+    fn rescue_single_alternative_model_by_size() {
+        let base = temp_base("rescue_single");
+        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
+
+        let alt = base.join("models").join("other.gguf");
+        fs::write(&alt, vec![0u8; 1000]).unwrap();
+
+        let result = launcher.find_alternative_model(&base.join("models"), 1000);
+        assert_eq!(result, Some(alt));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescue_multiple_candidates_returns_none() {
+        let base = temp_base("rescue_multi");
+        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
+
+        fs::write(base.join("models").join("a.gguf"), vec![0u8; 1000]).unwrap();
+        fs::write(base.join("models").join("b.gguf"), vec![0u8; 1000]).unwrap();
+
+        let result = launcher.find_alternative_model(&base.join("models"), 1000);
+        assert_eq!(
+            result, None,
+            "ambiguous: multiple same-size candidates must not be rescued"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescue_authority_filename_excluded_from_search() {
+        let base = temp_base("rescue_auth_skip");
+        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
+
+        // only the authority file exists — it must be excluded from the rescue search
+        fs::write(base.join("models").join("authority.gguf"), vec![0u8; 1000]).unwrap();
+
+        let result = launcher.find_alternative_model(&base.join("models"), 1000);
+        assert_eq!(
+            result, None,
+            "authority filename must not be returned as alternative"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescue_ignores_size_mismatch() {
+        let base = temp_base("rescue_size_mismatch");
+        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
+
+        fs::write(base.join("models").join("wrong_size.gguf"), vec![0u8; 500]).unwrap();
+
+        let result = launcher.find_alternative_model(&base.join("models"), 1000);
+        assert_eq!(result, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // --- check_ready: authority backend のみ参照する ---
+
+    /// check_ready はランタイムを authority backend (launcher_config.toml) で絞る。
+    /// TODO: check_ready が resolve_install_root() に依存しているため、
+    /// config injection seam を追加後に統合テストとして実装する。
+    /// 現状は has_complete_runtime / runtime_is_complete の直呼びで代替する。
+
+    #[test]
+    fn check_ready_authority_backend_only_runtime_check() {
+        // authority=cuda, runtime/vulkan=complete, runtime/cuda=incomplete → false
+        let base = temp_base("cr_authority");
+        let vk_dir = base.join("runtime").join("vulkan");
+        fs::create_dir_all(&vk_dir).unwrap();
+        let exe = if cfg!(target_os = "windows") {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        fs::write(vk_dir.join(exe), b"").unwrap();
+
+        let cuda_dir = base.join("runtime").join("cuda");
+        fs::create_dir_all(&cuda_dir).unwrap();
+        // cuda incomplete (no exe)
+
+        let vulkan_ok = runtime_is_complete(&vk_dir, "vulkan");
+        let cuda_ok = runtime_is_complete(&cuda_dir, "cuda");
+
+        assert!(vulkan_ok, "vulkan runtime should be complete");
+        assert!(!cuda_ok, "cuda runtime without exe should be incomplete");
+
+        // Verify: authority cuda + vulkan complete → check_ready would return false
+        // (model also required, but runtime gate fails first)
+        // Full check_ready integration requires seam injection — see TODO above.
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn backend_plan_skips_authority_download_when_gpu_evidence_disagrees() {
+        let base = temp_base("plan_skip_authority_download");
+        let mut launcher = make_launcher(base.clone(), "authority.gguf", 1000);
+        launcher.config.backend = "cuda".to_string();
+
+        let plan = launcher.build_backend_plan_from_observations(
+            vec![BackendCandidate::new(
+                "vulkan".to_string(),
+                BackendCandidateReason::GpuDetection,
+            )],
+            Vec::new(),
+        );
+
+        assert!(plan.authority_download.is_none());
+        assert_eq!(
+            plan.skipped_authority_download
+                .as_ref()
+                .map(|candidate| candidate.name.as_str()),
+            Some("cuda")
+        );
+        assert_eq!(
+            plan.fallback_downloads
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vulkan"]
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn backend_plan_keeps_complete_authority_runtime_in_installed_pass() {
+        let base = temp_base("plan_installed_authority");
+        let mut launcher = make_launcher(base.clone(), "authority.gguf", 1000);
+        launcher.config.backend = "cuda".to_string();
+
+        let runtime_dir = base.join("runtime").join("cuda");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let exe = if cfg!(target_os = "windows") {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        fs::write(runtime_dir.join(exe), b"").unwrap();
+        fs::write(runtime_dir.join("nvcuda.dll"), b"").unwrap();
+
+        let plan = launcher.build_backend_plan_from_observations(
+            vec![BackendCandidate::new(
+                "vulkan".to_string(),
+                BackendCandidateReason::GpuDetection,
+            )],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            plan.installed
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cuda"]
+        );
+        assert!(plan.authority_download.is_none());
+        assert!(plan.skipped_authority_download.is_some());
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }
