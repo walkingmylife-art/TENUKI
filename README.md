@@ -21,6 +21,7 @@ TENUKI is a XUnity Auto Translator tool built in Rust and powered by a local LLM
 
 ## XUnity Auto Translator
 
+```ini
 [Service]
 Endpoint=CustomTranslate
 FallbackEndpoint=
