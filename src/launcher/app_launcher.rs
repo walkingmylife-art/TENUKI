@@ -92,10 +92,23 @@ pub enum CheckReadyReason {
     RuntimeIncomplete {
         backend: String,
     },
+    /// Known model が missing → launcher で download 可。
     ModelMissing {
         filename: String,
     },
+    /// Known model のサイズ不一致（ダウンロード不完全など）。
     ModelSizeMismatch {
+        filename: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// Local model が missing → download 不可。ユーザーに再配置/再選択を促す。
+    LocalModelMissing {
+        filename: String,
+    },
+    /// Local model のサイズが authority と一致しない。
+    /// ファイル自体は存在するが中身が差し替わっている可能性がある。
+    LocalModelChanged {
         filename: String,
         expected: u64,
         actual: u64,
@@ -118,6 +131,21 @@ impl std::fmt::Display for CheckReadyReason {
                 write!(
                     f,
                     "model '{}' size mismatch: expected {} got {}",
+                    filename, expected, actual
+                )
+            }
+            Self::LocalModelMissing { filename } => {
+                write!(f, "local model '{}' not found (download not available)", filename)
+            }
+            Self::LocalModelChanged {
+                filename,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "local model '{}' changed on disk: committed size {} but found {}. \
+                     Re-select to update authority.",
                     filename, expected, actual
                 )
             }
@@ -158,29 +186,44 @@ pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyRe
         });
     }
 
-    let model_path = base_dir.join("models").join(&config.model.filename);
-    let expected_size = config.model.expected_size;
+    let filename = config.model.filename().to_string();
+    let expected_size = config.model.expected_size();
+    let is_known = config.model.is_known();
+    let model_path = base_dir.join("models").join(&filename);
 
     let actual_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
     diag_file(
         base_dir,
         &format!(
-            "[check_ready] model filename={} expected={} actual={}",
-            config.model.filename, expected_size, actual_size
+            "[check_ready] model filename={} kind={} expected={} actual={}",
+            filename,
+            if is_known { "Known" } else { "Local" },
+            expected_size,
+            actual_size
         ),
     );
 
     if actual_size == 0 {
-        return Err(CheckReadyReason::ModelMissing {
-            filename: config.model.filename.clone(),
-        });
+        return if is_known {
+            Err(CheckReadyReason::ModelMissing { filename })
+        } else {
+            Err(CheckReadyReason::LocalModelMissing { filename })
+        };
     }
     if actual_size != expected_size || expected_size == 0 {
-        return Err(CheckReadyReason::ModelSizeMismatch {
-            filename: config.model.filename.clone(),
-            expected: expected_size,
-            actual: actual_size,
-        });
+        return if is_known {
+            Err(CheckReadyReason::ModelSizeMismatch {
+                filename,
+                expected: expected_size,
+                actual: actual_size,
+            })
+        } else {
+            Err(CheckReadyReason::LocalModelChanged {
+                filename,
+                expected: expected_size,
+                actual: actual_size,
+            })
+        };
     }
 
     // サイズ一致 = 完成。stale sidecar / .part は掃除する。
@@ -188,6 +231,9 @@ pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyRe
     diag_file(base_dir, "[check_ready] → true");
     Ok(())
 }
+
+// re-export ModelConfig for use in app_launcher
+use super::app_config::ModelConfig;
 
 /// runtime とモデルが揃っているか確認する（bool 版）。
 /// main.rs でモードを決定するために使用される。
@@ -237,13 +283,6 @@ struct BackendPlan {
 struct VerifiedBackendCandidate {
     candidate: BackendCandidate,
     exe_path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ObservedModelRescue {
-    None,
-    Unique(PathBuf),
-    Ambiguous(Vec<PathBuf>),
 }
 
 pub struct AppLauncher {
@@ -509,7 +548,7 @@ impl AppLauncher {
                 "[run] post-save self_check={} backend={} model={} exe={}",
                 self_check,
                 backend_name,
-                self.config.model.filename,
+                self.config.model.filename(),
                 exe_path.display(),
             ),
         );
@@ -519,7 +558,7 @@ impl AppLauncher {
                  (backend={} model={}). \
                  Runtime or model did not satisfy authority exact check after save.",
                 backend_name,
-                self.config.model.filename
+                self.config.model.filename()
             );
         }
 
@@ -535,13 +574,15 @@ impl AppLauncher {
         Ok(())
     }
 
-    /// モデルを準備し、(ファイルパス, 今回採用する URL) を返す。
+    /// Known model: complete なら返す、incomplete なら download。
+    /// Local model: complete なら返す、missing/incomplete なら bail。
     fn ensure_model(
         &self,
         progress_tx: &Sender<LaunchProgress>,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<PathBuf> {
-        let expected = self.config.model.expected_size;
+        let expected = self.config.model.expected_size();
+        let filename = self.config.model.filename().to_string();
         if expected == 0 {
             diag(
                 progress_tx,
@@ -555,76 +596,47 @@ impl AppLauncher {
         }
 
         let model_dir = self.base_dir.join("models");
-        let model_path = model_dir.join(&self.config.model.filename);
+        let model_path = model_dir.join(&filename);
 
         let complete = model_is_complete(&model_path, expected);
         diag(
             progress_tx,
             &self.base_dir,
             &format!(
-                "[ensure_model] filename={} exists={} expected_size={} complete={}",
-                self.config.model.filename,
+                "[ensure_model] filename={} kind={} exists={} expected_size={} complete={}",
+                filename,
+                if self.config.model.is_known() { "Known" } else { "Local" },
                 model_path.exists(),
                 expected,
                 complete
             ),
         );
         if complete {
-            diag(
-                progress_tx,
-                &self.base_dir,
-                "[ensure_model] → reuse existing model",
-            );
+            diag(progress_tx, &self.base_dir, "[ensure_model] → reuse existing model");
             return Ok(model_path);
         }
 
-        match self.observe_alternative_models(&model_dir, expected) {
-            ObservedModelRescue::Unique(found) => {
-                diag(
-                    progress_tx,
-                    &self.base_dir,
-                    &format!(
-                        "[ensure_model] rescue commit reason=single_same_size_candidate authority_filename_missing observed={} committed={}",
-                        found.display(),
-                        model_path.display()
-                    ),
-                );
-                cleanup_model_resume_artifacts(&found);
-                std::fs::rename(&found, &model_path)?;
-                return Ok(model_path);
-            }
-            ObservedModelRescue::Ambiguous(candidates) => {
-                diag(
-                    progress_tx,
-                    &self.base_dir,
-                    &format!(
-                        "[ensure_model] rescue refused reason=ambiguous_same_size_candidates count={} candidates={:?}",
-                        candidates.len(),
-                        candidates
-                    ),
-                );
-            }
-            ObservedModelRescue::None => {}
-        }
-
-        // authority filename がまだない／不完全だが、models/ に同サイズの別名ggufがあれば再利用する。
-        // sidecar なし・サイズ完全一致・拡張子 .gguf の先頭ヒットを採用。
-        if let Some(found) = self.find_alternative_model(&model_dir, expected) {
+        // Local model: download 不可。ユーザーに再配置/再選択を促す。
+        if let ModelConfig::Local { .. } = &self.config.model {
             diag(
                 progress_tx,
                 &self.base_dir,
-                &format!(
-                    "[ensure_model] found alternative model by size: {} → rename to {}",
-                    found.display(),
-                    model_path.display()
-                ),
+                &format!("[ensure_model] Local model missing, cannot download: {}", filename),
             );
-            std::fs::rename(&found, &model_path)?;
-            return Ok(model_path);
+            anyhow::bail!(
+                "Local model '{}' not found in models/. \
+                 Restore the file or select another model.",
+                filename
+            );
         }
+
+        // Known model: download パス
+        let ModelConfig::Known { urls, .. } = &self.config.model else {
+            unreachable!()
+        };
 
         // 不完全なファイルが残っている場合は削除して再取得
-        // (sidecarありの場合はdownload_model側が再開する)
+        // (sidecar ありの場合は download_model 側が再開する)
         if model_path.exists() {
             let sidecar = PathBuf::from(format!("{}.sidecar.json", model_path.display()));
             if !sidecar.exists() {
@@ -644,18 +656,17 @@ impl AppLauncher {
             .ok();
         progress_tx
             .send(LaunchProgress::SubStatus(self.t(
-                &format!("Fetching: {}", self.config.model.filename),
-                &format!("取得中: {}", self.config.model.filename),
+                &format!("Fetching: {}", filename),
+                &format!("取得中: {}", filename),
             )))
             .ok();
 
-        let urls = &self.config.model.urls;
         let downloader = RuntimeDownloader::with_cancel_flag(cancel_flag.clone())?;
         let _used_url_opt = downloader.download_model(
             &urls.primary,
             urls.fallback.as_deref(),
             &model_path,
-            self.config.model.expected_size,
+            expected,
             |progress, _| {
                 // この progress はモデルダウンロード単体の進捗（0.0～1.0）
                 progress_tx.send(LaunchProgress::Progress(progress)).ok();
@@ -663,81 +674,6 @@ impl AppLauncher {
         )?;
 
         Ok(model_path)
-    }
-
-    /// models/ ディレクトリ内から authority filename 以外の .gguf を探し、
-    /// sidecar なし・expected_size 一致のものを収集する。
-    /// 候補が唯一のときのみ採用。複数は ambiguous → None（再DL）。
-    fn find_alternative_model(&self, model_dir: &Path, expected_size: u64) -> Option<PathBuf> {
-        let authority_name = &self.config.model.filename;
-        let entries = std::fs::read_dir(model_dir).ok()?;
-
-        let candidates: Vec<PathBuf> = entries
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("gguf") {
-                    return None;
-                }
-                if path.file_name().and_then(|n| n.to_str()) == Some(authority_name.as_str()) {
-                    return None;
-                }
-                if std::fs::metadata(&path)
-                    .map(|m| m.len() == expected_size)
-                    .unwrap_or(false)
-                {
-                    cleanup_model_resume_artifacts(&path);
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if candidates.len() == 1 {
-            candidates.into_iter().next()
-        } else {
-            None
-        }
-    }
-
-    fn observe_alternative_models(
-        &self,
-        model_dir: &Path,
-        expected_size: u64,
-    ) -> ObservedModelRescue {
-        let authority_name = &self.config.model.filename;
-        let entries = match std::fs::read_dir(model_dir) {
-            Ok(entries) => entries,
-            Err(_) => return ObservedModelRescue::None,
-        };
-
-        let candidates: Vec<PathBuf> = entries
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("gguf") {
-                    return None;
-                }
-                if path.file_name().and_then(|n| n.to_str()) == Some(authority_name.as_str()) {
-                    return None;
-                }
-                if std::fs::metadata(&path)
-                    .map(|m| m.len() == expected_size)
-                    .unwrap_or(false)
-                {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        match candidates.len() {
-            0 => ObservedModelRescue::None,
-            1 => ObservedModelRescue::Unique(candidates.into_iter().next().unwrap()),
-            _ => ObservedModelRescue::Ambiguous(candidates),
-        }
     }
 
     fn build_backend_plan(&self) -> BackendPlan {
@@ -1074,9 +1010,21 @@ mod tests {
     }
 
     fn make_launcher(base_dir: PathBuf, filename: &str, expected_size: u64) -> AppLauncher {
+        use crate::launcher::app_config::{known_model_tuple, ModelConfig, UrlPair};
+        let model = if let Some(known) = known_model_tuple(filename) {
+            ModelConfig::Known {
+                filename: known.filename.to_string(),
+                expected_size: known.expected_size,
+                urls: UrlPair::single(known.url),
+            }
+        } else {
+            ModelConfig::Local {
+                filename: filename.to_string(),
+                expected_size,
+            }
+        };
         let mut config = AppConfig::default();
-        config.model.filename = filename.to_string();
-        config.model.expected_size = expected_size;
+        config.model = model;
         AppLauncher {
             base_dir,
             config,
@@ -1086,69 +1034,6 @@ mod tests {
                 .unwrap(),
             ui_lang: "ja".to_string(),
         }
-    }
-
-    // --- model rescue: find_alternative_model ---
-
-    #[test]
-    fn rescue_single_alternative_model_by_size() {
-        let base = temp_base("rescue_single");
-        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
-
-        let alt = base.join("models").join("other.gguf");
-        fs::write(&alt, vec![0u8; 1000]).unwrap();
-
-        let result = launcher.find_alternative_model(&base.join("models"), 1000);
-        assert_eq!(result, Some(alt));
-
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn rescue_multiple_candidates_returns_none() {
-        let base = temp_base("rescue_multi");
-        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
-
-        fs::write(base.join("models").join("a.gguf"), vec![0u8; 1000]).unwrap();
-        fs::write(base.join("models").join("b.gguf"), vec![0u8; 1000]).unwrap();
-
-        let result = launcher.find_alternative_model(&base.join("models"), 1000);
-        assert_eq!(
-            result, None,
-            "ambiguous: multiple same-size candidates must not be rescued"
-        );
-
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn rescue_authority_filename_excluded_from_search() {
-        let base = temp_base("rescue_auth_skip");
-        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
-
-        // only the authority file exists — it must be excluded from the rescue search
-        fs::write(base.join("models").join("authority.gguf"), vec![0u8; 1000]).unwrap();
-
-        let result = launcher.find_alternative_model(&base.join("models"), 1000);
-        assert_eq!(
-            result, None,
-            "authority filename must not be returned as alternative"
-        );
-
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn rescue_ignores_size_mismatch() {
-        let base = temp_base("rescue_size_mismatch");
-        let launcher = make_launcher(base.clone(), "authority.gguf", 1000);
-
-        fs::write(base.join("models").join("wrong_size.gguf"), vec![0u8; 500]).unwrap();
-
-        let result = launcher.find_alternative_model(&base.join("models"), 1000);
-        assert_eq!(result, None);
-
-        let _ = fs::remove_dir_all(&base);
     }
 
     // --- check_ready: authority backend のみ参照する ---

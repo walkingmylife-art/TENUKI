@@ -1,7 +1,8 @@
 // src/ui/container.rs
 
 use crate::config::StructuralOptions;
-use crate::messages::{InputAnalysisSnapshot, LogLevel};
+use crate::launcher::app_config::ModelConfig;
+use crate::messages::{InputAnalysisSnapshot, LogLevel, ModelCandidate};
 use anyhow::Result;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -79,7 +80,7 @@ pub struct UiDisplayData {
     pub model_calls: usize,
     pub llama_running: bool,
     pub tenuki_running: bool,
-    pub available_models: Vec<PathBuf>,
+    pub available_models: Vec<ModelCandidate>,
     pub selected_model: Option<PathBuf>,
     pub status_key: StatusKey,
     pub status_icon: StatusIcon,
@@ -211,7 +212,7 @@ pub struct UiCommands {
     pub exit_app: bool,
     pub set_structural_options: Option<StructuralOptions>,
     pub set_profile: Option<String>,
-    pub select_model: Option<String>,
+    pub select_model: Option<ModelConfig>,
     pub set_input_pickup: Option<(u64, bool)>,
     pub set_input_pickup_note: Option<(u64, String)>,
     pub set_work_folder: Option<PathBuf>,
@@ -355,12 +356,12 @@ impl UiContainer {
         }
     }
 
-    pub fn update_available_models(&mut self, models: Vec<PathBuf>) {
+    pub fn update_available_models(&mut self, models: Vec<ModelCandidate>) {
         let selected_still_valid = self
             .display
             .selected_model
             .as_ref()
-            .is_some_and(|selected| models.iter().any(|m| m == selected));
+            .is_some_and(|selected| models.iter().any(|c| &c.path == selected));
         if !selected_still_valid {
             self.display.selected_model = None;
         }

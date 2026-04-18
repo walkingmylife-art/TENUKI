@@ -87,6 +87,22 @@ fn build_initial_launcher_state(
             | launcher::CheckReadyReason::ModelMissing { .. }
             | launcher::CheckReadyReason::ModelSizeMismatch { .. },
         ) => LauncherUiState::initial_setup(),
+        Err(launcher::CheckReadyReason::LocalModelMissing { filename }) => {
+            LauncherUiState::with_startup_reason(format!(
+                "Local model '{}' not found.\n\
+                 Restore it to the models/ folder or select another model.",
+                filename
+            ))
+        }
+        Err(launcher::CheckReadyReason::LocalModelChanged {
+            filename,
+            expected,
+            actual,
+        }) => LauncherUiState::with_startup_reason(format!(
+            "Local model '{}' changed on disk (committed: {} bytes, found: {} bytes).\n\
+             Re-select the model to update the authority, or restore the original file.",
+            filename, expected, actual
+        )),
     }
 }
 
@@ -888,9 +904,9 @@ impl eframe::App for TenukiApp {
                         .ok();
                 }
 
-                if let Some(filename) = commands.select_model.take() {
+                if let Some(model_config) = commands.select_model.take() {
                     self.command_tx
-                        .send(FrontendCommand::SetModel(filename))
+                        .send(FrontendCommand::CommitModelSelection(model_config))
                         .ok();
                 }
 

@@ -1,4 +1,5 @@
-use crate::messages::LogLevel;
+use crate::launcher::app_config::{known_model_tuple, ModelConfig, UrlPair};
+use crate::messages::{LogLevel, ModelCandidateKind};
 use crate::ui::container::{
     DictConfirmPending, LangPanelTab, LeftPanelTab, LogEntry, UiCommands, UiDisplayData, UiState,
 };
@@ -260,18 +261,13 @@ pub fn show_normal_ui(
                 .size(13.0),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let model_names: Vec<String> = data
-                    .available_models
-                    .iter()
-                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                    .collect();
                 let selected_name = data
                     .selected_model
                     .as_ref()
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| {
-                        if model_names.is_empty() {
+                        if data.available_models.is_empty() {
                             t(L, "No model", "モデルがありません", "无模型").to_string()
                         } else {
                             t(L, "Select model", "モデルを選択", "选择模型").to_string()
@@ -281,12 +277,35 @@ pub fn show_normal_ui(
                     .width(220.0)
                     .selected_text(&selected_name)
                     .show_ui(ui, |ui| {
-                        if model_names.is_empty() {
+                        if data.available_models.is_empty() {
                             ui.label(t(L, "No models", "モデルがありません", "无模型"));
                         } else {
-                            for name in &model_names {
-                                if ui.selectable_label(*name == selected_name, name).clicked() {
-                                    commands.select_model = Some(name.clone());
+                            for candidate in &data.available_models {
+                                let tag = match candidate.kind {
+                                    ModelCandidateKind::Known => "[known]",
+                                    ModelCandidateKind::Local => "[local]",
+                                };
+                                let label = format!("{} {}", tag, candidate.filename);
+                                let is_selected = candidate.filename == selected_name;
+                                if ui.selectable_label(is_selected, &label).clicked() {
+                                    let model_config = match candidate.kind {
+                                        ModelCandidateKind::Known => {
+                                            known_model_tuple(&candidate.filename).map(|t| {
+                                                ModelConfig::Known {
+                                                    filename: t.filename.to_string(),
+                                                    expected_size: t.expected_size,
+                                                    urls: UrlPair::single(t.url),
+                                                }
+                                            })
+                                        }
+                                        ModelCandidateKind::Local => Some(ModelConfig::Local {
+                                            filename: candidate.filename.clone(),
+                                            expected_size: candidate.size,
+                                        }),
+                                    };
+                                    if let Some(mc) = model_config {
+                                        commands.select_model = Some(mc);
+                                    }
                                 }
                             }
                         }

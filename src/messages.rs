@@ -3,6 +3,7 @@
 //! GUI ↔ バックエンド 間の通信で使用するコマンドとイベントを定義する。
 
 use crate::config::StructuralOptions;
+use crate::launcher::app_config::ModelConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +19,24 @@ pub struct InputAnalysisSnapshot {
     pub result_stale: bool,
     pub dict_hits: usize,
     pub model_calls: usize,
+}
+
+// ============================================================
+// モデル候補（UI 表示 + commit 生成に使う metadata 付きリスト項目）
+// ============================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelCandidateKind {
+    Known,
+    Local,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelCandidate {
+    pub filename: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub kind: ModelCandidateKind,
 }
 
 // ============================================================
@@ -38,7 +57,9 @@ pub enum FrontendCommand {
     },
     SetDictSlot(String),
     SetProfile(String),
-    SetModel(String),
+    /// UI で確定した完全な ModelConfig authority object を backend へ渡す。
+    /// backend は adopt して save するだけ。filename 単独渡し禁止。
+    CommitModelSelection(ModelConfig),
     UpdateSettings {
         structural: Option<StructuralOptions>,
         server_port: Option<u16>,
@@ -81,7 +102,8 @@ pub enum BackendEvent {
         engine_success: bool,
         translator_success: bool,
     },
-    AvailableModels(Vec<PathBuf>),
+    /// models/ の .gguf 一覧。Known/Local 種別と metadata 付き。
+    AvailableModels(Vec<ModelCandidate>),
     /// authority resolved model を UI に通知する。AvailableModels とは分離して送信する。
     SelectedModelResolved(Option<PathBuf>),
     LanguageChanged(String),

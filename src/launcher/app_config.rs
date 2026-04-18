@@ -113,11 +113,41 @@ pub struct ServerConfig {
     pub extra_args: Vec<String>,
 }
 
+/// Model authority object. Exactly one of two kinds:
+/// - `Known`: TENUKI-managed model with download URLs; filename must be in KNOWN_MODELS.
+/// - `Local`: user-placed model; no URLs, missing = wait/re-select.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub urls: UrlPair,
-    pub filename: String,
-    pub expected_size: u64,
+#[serde(tag = "kind")]
+pub enum ModelConfig {
+    Known {
+        filename: String,
+        expected_size: u64,
+        urls: UrlPair,
+    },
+    Local {
+        filename: String,
+        expected_size: u64,
+    },
+}
+
+impl ModelConfig {
+    pub fn filename(&self) -> &str {
+        match self {
+            Self::Known { filename, .. } | Self::Local { filename, .. } => filename,
+        }
+    }
+
+    pub fn expected_size(&self) -> u64 {
+        match self {
+            Self::Known { expected_size, .. } | Self::Local { expected_size, .. } => {
+                *expected_size
+            }
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        matches!(self, Self::Known { .. })
+    }
 }
 
 impl Default for AppConfig {
@@ -149,17 +179,36 @@ impl Default for ServerConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self {
+        Self::Known {
+            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
+            expected_size: 1_474_785_216,
             urls: UrlPair::single(
                 "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true",
             ),
-            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
-            expected_size: 1_474_785_216,
         }
     }
 }
 
-// 旧形式マイグレーション用（model.url のみ）
+// --- Migration structs (old formats without `kind` tag) ---
+
+/// Old struct-based ModelConfig (had `urls: UrlPair` — no `kind` field).
+#[derive(Debug, Deserialize)]
+struct LegacyModelConfigV2 {
+    urls: UrlPair,
+    filename: String,
+    expected_size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyAppConfigV2 {
+    backend: String,
+    server: ServerConfig,
+    model: LegacyModelConfigV2,
+    #[serde(default)]
+    runtime_urls: RuntimeUrls,
+}
+
+/// Oldest single-url format.
 #[derive(Debug, Deserialize)]
 struct LegacyModelConfig {
     url: String,
@@ -174,6 +223,48 @@ struct LegacyAppConfig {
     model: LegacyModelConfig,
 }
 
+fn migrate_legacy_model(
+    filename: String,
+    url: String,
+    expected_size: u64,
+    path: &Path,
+) -> Result<ModelConfig> {
+    if let Some(known) = known_model_tuple(&filename) {
+        return Ok(ModelConfig::Known {
+            filename: known.filename.to_string(),
+            expected_size: known.expected_size,
+            urls: UrlPair::single(known.url),
+        });
+    }
+    if known_model_tuple_by_url(&url).is_some() {
+        // URL は known だが filename が不明 → Known にも Local にも解釈できない混成状態。
+        // filename を書き換えることは authority 破壊なので fail fast。
+        anyhow::bail!(
+            "Config in {} cannot be interpreted as either Known or Local: \
+             filename='{}' is not in the known table, but url matches a known model. \
+             To fix: either use the correct known filename, or change the url to a \
+             non-known URL and set a valid expected_size (Local model).",
+            path.display(),
+            filename
+        );
+    }
+    if expected_size == 0 {
+        // size がないと Local としても authority を確定できない。
+        anyhow::bail!(
+            "Config in {} cannot be interpreted as either Known or Local: \
+             filename='{}' is not in the known table and expected_size=0. \
+             Set expected_size to the correct file size in bytes to treat this as a Local model.",
+            path.display(),
+            filename
+        );
+    }
+    // Unknown filename, unknown url, size > 0 → Local (discard url)
+    Ok(ModelConfig::Local {
+        filename,
+        expected_size,
+    })
+}
+
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -186,6 +277,7 @@ impl AppConfig {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
 
+        // Step 1: current format (ModelConfig enum with `kind` tag)
         if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
             config.normalize();
             config.repair_and_save(path)?;
@@ -193,18 +285,33 @@ impl AppConfig {
             return Ok(config);
         }
 
-        if let Ok(legacy) = toml::from_str::<LegacyAppConfig>(&content) {
-            log::info!("Migrating config from legacy single-URL format (model only)");
+        // Step 2: old struct format (urls: UrlPair, no `kind` field)
+        if let Ok(legacy) = toml::from_str::<LegacyAppConfigV2>(&content) {
+            log::info!("Migrating config from legacy struct format (no kind field)");
+            let model =
+                migrate_legacy_model(legacy.model.filename, legacy.model.urls.primary, legacy.model.expected_size, path)?;
             let mut config = AppConfig {
                 backend: legacy.backend,
                 server: legacy.server,
-                model: ModelConfig {
-                    urls: UrlPair::single(legacy.model.url),
-                    filename: legacy.model.filename,
-                    // expected_size は旧形式に存在しないため 0。repair_and_save で補完を試みる。
-                    expected_size: legacy.model.expected_size,
-                },
-                // runtime 側は旧形式に URL 情報が存在しないため、デフォルト値を使用する（互換性は取らない）
+                model,
+                runtime_urls: legacy.runtime_urls,
+            };
+            config.normalize();
+            config.repair_and_save(path)?;
+            config.validate(path)?;
+            config.save(path)?;
+            return Ok(config);
+        }
+
+        // Step 3: oldest single-url format
+        if let Ok(legacy) = toml::from_str::<LegacyAppConfig>(&content) {
+            log::info!("Migrating config from legacy single-URL format");
+            let model =
+                migrate_legacy_model(legacy.model.filename, legacy.model.url, legacy.model.expected_size, path)?;
+            let mut config = AppConfig {
+                backend: legacy.backend,
+                server: legacy.server,
+                model,
                 runtime_urls: RuntimeUrls::default(),
             };
             config.normalize();
@@ -242,64 +349,74 @@ impl AppConfig {
         }
     }
 
-    /// authority tuple (filename / urls.primary / expected_size) の整合を検査し、
-    /// known official tuple で修復できる場合は原子的に上書き保存する。
-    /// 修復不能な divergence は hard-fail する。
+    /// Known: filename を known table で検証し、diverged tuple を修復保存する。
+    /// Local: expected_size > 0 を確認するだけ。URL repair はしない。
     fn repair_and_save(&mut self, path: &Path) -> Result<()> {
-        // まず filename で known tuple を引く
-        if let Some(known) = known_model_tuple(&self.model.filename) {
-            let url_matches = self.model.urls.primary == known.url;
-            let size_matches = self.model.expected_size == known.expected_size;
-            if !url_matches || !size_matches {
-                log::warn!(
-                    "Authority tuple diverged for filename '{}': url_ok={} size_ok={} — repairing from known table",
-                    self.model.filename, url_matches, size_matches
-                );
-                self.model.urls.primary = known.url.to_string();
-                self.model.expected_size = known.expected_size;
-                self.save(path)?;
+        match &self.model {
+            ModelConfig::Known { filename, .. } => {
+                let filename = filename.clone();
+                let known = known_model_tuple(&filename).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Config in {} has kind=Known but filename '{}' is not in the known \
+                         table. Cannot be interpreted as Known. \
+                         Change kind to Local (and remove urls) or use a recognized filename.",
+                        path.display(),
+                        filename
+                    )
+                })?;
+                let needs_repair = match &self.model {
+                    ModelConfig::Known { urls, expected_size, .. } => {
+                        urls.primary != known.url || *expected_size != known.expected_size
+                    }
+                    _ => unreachable!(),
+                };
+                if needs_repair {
+                    log::warn!(
+                        "Authority tuple diverged for '{}': repairing from known table",
+                        filename
+                    );
+                    self.model = ModelConfig::Known {
+                        filename: known.filename.to_string(),
+                        expected_size: known.expected_size,
+                        urls: UrlPair {
+                            primary: known.url.to_string(),
+                            fallback: None,
+                        },
+                    };
+                    self.save(path)?;
+                }
             }
-            return Ok(());
+            ModelConfig::Local { filename, expected_size } => {
+                let (filename, expected_size) = (filename.clone(), *expected_size);
+                if filename.is_empty() {
+                    anyhow::bail!("model.filename is empty (Local) in {}", path.display());
+                }
+                if expected_size == 0 {
+                    anyhow::bail!(
+                        "model.expected_size is 0 (Local) in {}. \
+                         Set it to the correct file size in bytes.",
+                        path.display()
+                    );
+                }
+            }
         }
-
-        // filename が unknown の場合、URL 逆引きで filename を書き換えることは禁止。
-        // url だけが known でも filename の変更は authority 破壊になるため fail fast。
-        if known_model_tuple_by_url(&self.model.urls.primary).is_some() {
-            anyhow::bail!(
-                "Authority tuple unresolvable in {}: filename='{}' is unknown but url matches a known model. \
-                 Set a consistent (filename, url, expected_size) tuple in launcher_config.toml.",
-                path.display(),
-                self.model.filename
-            );
-        }
-
-        // filename も URL も unknown — tuple内部の整合だけ確認する
-        // expected_size == 0 は実質的に divergence と同等なので hard-fail
-        if self.model.expected_size == 0 {
-            anyhow::bail!(
-                "Authority tuple is unresolvable in {}: \
-                 filename='{}' is not a known model and expected_size=0. \
-                 Set a coherent (filename, url, expected_size) tuple in launcher_config.toml.",
-                path.display(),
-                self.model.filename
-            );
-        }
-
         Ok(())
     }
 
     fn validate(&self, path: &Path) -> Result<()> {
-        if self.model.expected_size == 0 {
+        if self.model.filename().is_empty() {
+            anyhow::bail!("model.filename is empty in {}", path.display());
+        }
+        if self.model.expected_size() == 0 {
             anyhow::bail!(
                 "model.expected_size is 0 in {}. Set it to the correct file size in bytes.",
                 path.display()
             );
         }
-        if self.model.filename.is_empty() {
-            anyhow::bail!("model.filename is empty in {}", path.display());
-        }
-        if self.model.urls.primary.is_empty() {
-            anyhow::bail!("model.urls.primary is empty in {}", path.display());
+        if let ModelConfig::Known { urls, .. } = &self.model {
+            if urls.primary.is_empty() {
+                anyhow::bail!("model.urls.primary is empty in {}", path.display());
+            }
         }
         Ok(())
     }
@@ -314,8 +431,9 @@ impl AppConfig {
     }
 
     fn normalize(&mut self) {
-        // 空文字列・空白文字列はすべて None に正規化する
-        self.model.urls.fallback = normalize_fallback(self.model.urls.fallback.take());
+        if let ModelConfig::Known { urls, .. } = &mut self.model {
+            urls.fallback = normalize_fallback(urls.fallback.take());
+        }
         self.runtime_urls.cuda.fallback =
             normalize_fallback(self.runtime_urls.cuda.fallback.take());
         self.runtime_urls.vulkan.fallback =
@@ -378,23 +496,25 @@ mod tests {
         dir.join("launcher_config.toml")
     }
 
-    // --- authority tuple 修復 ---
+    // --- Known: authority tuple 修復 ---
 
     #[test]
     fn repair_known_filename_fixes_diverged_url_and_size() {
         let path = temp_config_path("repair_known");
         let mut cfg = AppConfig::default();
-        cfg.model.filename = "HY-MT1.5-1.8B-Q6_K.gguf".to_string();
-        cfg.model.urls.primary = "https://wrong.example.com/bad.gguf".to_string();
-        cfg.model.expected_size = 1;
+        cfg.model = ModelConfig::Known {
+            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
+            expected_size: 1,
+            urls: UrlPair::single("https://wrong.example.com/bad.gguf"),
+        };
         cfg.save(&path).unwrap();
 
         let loaded = AppConfig::load(&path).unwrap();
         let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
 
-        assert_eq!(loaded.model.filename, "HY-MT1.5-1.8B-Q6_K.gguf");
-        assert_eq!(loaded.model.urls.primary, known.url);
-        assert_eq!(loaded.model.expected_size, known.expected_size);
+        assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
+        assert!(matches!(&loaded.model, ModelConfig::Known { urls, expected_size, .. }
+            if urls.primary == known.url && *expected_size == known.expected_size));
 
         let _ = fs::remove_file(&path);
     }
@@ -403,79 +523,171 @@ mod tests {
     fn repair_preserves_filename_when_only_url_diverges() {
         let path = temp_config_path("repair_url_only");
         let mut cfg = AppConfig::default();
-        cfg.model.filename = "HY-MT1.5-1.8B-Q6_K.gguf".to_string();
-        cfg.model.urls.primary = "https://wrong.example.com/bad.gguf".to_string();
-        // size already correct
-        cfg.model.expected_size = 1_474_785_216;
+        cfg.model = ModelConfig::Known {
+            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
+            expected_size: 1_474_785_216,
+            urls: UrlPair::single("https://wrong.example.com/bad.gguf"),
+        };
         cfg.save(&path).unwrap();
 
         let loaded = AppConfig::load(&path).unwrap();
-        assert_eq!(loaded.model.filename, "HY-MT1.5-1.8B-Q6_K.gguf");
+        assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
         let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
-        assert_eq!(loaded.model.urls.primary, known.url);
+        assert!(matches!(&loaded.model, ModelConfig::Known { urls, .. } if urls.primary == known.url));
 
         let _ = fs::remove_file(&path);
     }
 
-    // --- authority tuple fail fast ---
+    // --- Known: unknown filename は fail fast ---
 
     #[test]
-    fn unknown_filename_with_known_url_fails() {
-        let path = temp_config_path("unknown_fn_known_url");
+    fn known_kind_with_unknown_filename_fails() {
+        let path = temp_config_path("known_unknown_fn");
         let mut cfg = AppConfig::default();
-        cfg.model.filename = "not-a-known-model.gguf".to_string();
-        // use the real known URL
-        cfg.model.urls.primary =
-            "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true"
-                .to_string();
-        cfg.model.expected_size = 1_474_785_216;
+        cfg.model = ModelConfig::Known {
+            filename: "not-a-known-model.gguf".to_string(),
+            expected_size: 1_474_785_216,
+            urls: UrlPair::single("https://example.com/custom.gguf"),
+        };
         cfg.save(&path).unwrap();
 
         let result = AppConfig::load(&path);
-        assert!(
-            result.is_err(),
-            "expected Err: unknown filename + known URL is forbidden"
-        );
+        assert!(result.is_err(), "kind=Known with unknown filename must fail");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // --- Local: valid size is accepted ---
+
+    #[test]
+    fn local_model_with_nonzero_size_ok() {
+        let path = temp_config_path("local_ok");
+        let mut cfg = AppConfig::default();
+        cfg.model = ModelConfig::Local {
+            filename: "my-custom-model.gguf".to_string(),
+            expected_size: 9_000_000,
+        };
+        cfg.save(&path).unwrap();
+
+        let result = AppConfig::load(&path);
+        assert!(result.is_ok(), "Local model with valid size should load: {:?}", result);
+        let loaded = result.unwrap();
+        assert!(matches!(&loaded.model, ModelConfig::Local { filename, .. } if filename == "my-custom-model.gguf"));
+        assert!(!loaded.model.is_known());
 
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn unknown_filename_with_zero_size_fails() {
-        let path = temp_config_path("unknown_fn_zero_size");
+    fn local_model_with_zero_size_fails() {
+        let path = temp_config_path("local_zero_size");
         let mut cfg = AppConfig::default();
-        cfg.model.filename = "not-a-known-model.gguf".to_string();
-        cfg.model.urls.primary = "https://example.com/custom.gguf".to_string();
-        cfg.model.expected_size = 0;
+        cfg.model = ModelConfig::Local {
+            filename: "my-custom-model.gguf".to_string(),
+            expected_size: 0,
+        };
         cfg.save(&path).unwrap();
 
         let result = AppConfig::load(&path);
-        assert!(
-            result.is_err(),
-            "expected Err: unknown filename + expected_size=0"
-        );
+        assert!(result.is_err(), "Local model with expected_size=0 must fail");
 
         let _ = fs::remove_file(&path);
     }
 
-    // --- custom unknown model with valid size is accepted ---
+    // --- migration: old struct format (no `kind` field) ---
 
     #[test]
-    fn unknown_filename_with_nonzero_size_and_unknown_url_ok() {
-        let path = temp_config_path("unknown_fn_ok");
-        let mut cfg = AppConfig::default();
-        cfg.model.filename = "my-custom-model.gguf".to_string();
-        cfg.model.urls.primary = "https://example.com/custom.gguf".to_string();
-        cfg.model.expected_size = 9_000_000;
-        cfg.save(&path).unwrap();
+    fn migration_v2_known_filename_produces_known() {
+        let path = temp_config_path("mig_v2_known");
+        // write legacy struct format (no `kind` field)
+        let toml = r#"
+backend = "cuda"
 
+[server]
+host = "127.0.0.1"
+port = 8080
+ctx_size = 1024
+ngl = 999
+batch_size = 128
+ubatch_size = 64
+parallel_slots = 2
+cont_batching = true
+extra_args = []
+
+[model]
+filename = "HY-MT1.5-1.8B-Q6_K.gguf"
+expected_size = 1474785216
+
+[model.urls]
+primary = "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true"
+"#;
+        fs::write(&path, toml).unwrap();
+        let loaded = AppConfig::load(&path).unwrap();
+        assert!(loaded.model.is_known());
+        assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_v2_unknown_filename_known_url_fails() {
+        let path = temp_config_path("mig_v2_unknown_known_url");
+        let toml = r#"
+backend = "cuda"
+
+[server]
+host = "127.0.0.1"
+port = 8080
+ctx_size = 1024
+ngl = 999
+batch_size = 128
+ubatch_size = 64
+parallel_slots = 2
+cont_batching = true
+extra_args = []
+
+[model]
+filename = "not-a-known-model.gguf"
+expected_size = 1474785216
+
+[model.urls]
+primary = "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true"
+"#;
+        fs::write(&path, toml).unwrap();
         let result = AppConfig::load(&path);
-        assert!(
-            result.is_ok(),
-            "custom tuple with valid size should load: {:?}",
-            result
-        );
+        assert!(result.is_err(), "unknown filename + known URL must fail during migration");
+        let _ = fs::remove_file(&path);
+    }
 
+    #[test]
+    fn migration_v2_unknown_filename_unknown_url_ok_produces_local() {
+        let path = temp_config_path("mig_v2_local");
+        let toml = r#"
+backend = "cuda"
+
+[server]
+host = "127.0.0.1"
+port = 8080
+ctx_size = 1024
+ngl = 999
+batch_size = 128
+ubatch_size = 64
+parallel_slots = 2
+cont_batching = true
+extra_args = []
+
+[model]
+filename = "my-custom-model.gguf"
+expected_size = 9000000
+
+[model.urls]
+primary = "https://example.com/custom.gguf"
+"#;
+        fs::write(&path, toml).unwrap();
+        let result = AppConfig::load(&path);
+        assert!(result.is_ok(), "unknown filename + unknown url + size>0 should migrate to Local: {:?}", result);
+        let loaded = result.unwrap();
+        assert!(!loaded.model.is_known(), "migrated model must be Local");
+        assert_eq!(loaded.model.filename(), "my-custom-model.gguf");
         let _ = fs::remove_file(&path);
     }
 }

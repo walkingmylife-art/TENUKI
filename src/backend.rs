@@ -17,38 +17,51 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::launcher::app_config::AppConfig;
-use crate::messages::{BackendEvent, FrontendCommand, ProcessType};
+use crate::launcher::app_config::{known_model_tuple, AppConfig};
+use crate::messages::{BackendEvent, FrontendCommand, ModelCandidate, ModelCandidateKind, ProcessType};
 use manager::{ProcessManager, RestartScope};
 
 /// launcher_config.toml の model.filename が権威。
-/// models/ に一致するファイルがあれば返す。なければ None（launcher が DL する）。
-/// basename スキャンによる別ファイルへの fallback は行わない。
-fn resolve_selected_model(filename: &str, models: &[PathBuf]) -> Option<PathBuf> {
+/// candidates の中に一致するファイルがあれば PathBuf を返す。なければ None。
+fn resolve_selected_model(filename: &str, candidates: &[ModelCandidate]) -> Option<PathBuf> {
     if filename.trim().is_empty() {
         return None;
     }
-    let authority_name = PathBuf::from(filename);
-    let authority_name = authority_name.file_name()?;
-    models
+    candidates
         .iter()
-        .find(|m| m.file_name() == Some(authority_name))
-        .cloned()
+        .find(|c| c.filename == filename)
+        .map(|c| c.path.clone())
 }
 
-pub fn find_available_models(base_dir: &PathBuf) -> Vec<PathBuf> {
+pub fn find_available_models(base_dir: &PathBuf) -> Vec<ModelCandidate> {
     let models_dir = base_dir.join("models");
-    let mut models = Vec::new();
+    let mut candidates = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&models_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "gguf").unwrap_or(false) {
-                models.push(path);
+            if !path.extension().map(|e| e == "gguf").unwrap_or(false) {
+                continue;
             }
+            let filename = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let kind = if known_model_tuple(&filename).is_some() {
+                ModelCandidateKind::Known
+            } else {
+                ModelCandidateKind::Local
+            };
+            candidates.push(ModelCandidate {
+                filename,
+                path,
+                size,
+                kind,
+            });
         }
     }
-    models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    models
+    candidates.sort_by(|a, b| a.filename.cmp(&b.filename));
+    candidates
 }
 
 pub fn start_backend(
@@ -62,7 +75,7 @@ pub fn start_backend(
     std::thread::spawn(move || {
         let models = find_available_models(&base_dir);
         let _ = event_tx.send(BackendEvent::AvailableModels(models.clone()));
-        let selected_model = resolve_selected_model(&app_config.model.filename, &models);
+        let selected_model = resolve_selected_model(app_config.model.filename(), &models);
         let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected_model.clone()));
 
         // dict_slot は preflight で commit 済みの authority。backend は読むだけ。
@@ -157,23 +170,18 @@ pub fn start_backend(
                         });
                         let _ = event_tx.send(BackendEvent::LanguageChanged(tgt));
                     }
-                    FrontendCommand::SetModel(filename) => {
+                    FrontendCommand::CommitModelSelection(model_config) => {
                         let install_root = crate::launcher::resolve_install_root();
                         let launcher_config_path = install_root.join("launcher_config.toml");
-                        match crate::launcher::app_config::AppConfig::load(&launcher_config_path) {
+                        let filename = model_config.filename().to_string();
+                        match AppConfig::load(&launcher_config_path) {
                             Ok(mut app_cfg) => {
-                                app_cfg.model.filename = filename.clone();
-                                // known tuple で url / expected_size を原子的に整合
-                                if let Some(known) =
-                                    crate::launcher::app_config::known_model_tuple(&filename)
-                                {
-                                    app_cfg.model.urls.primary = known.url.to_string();
-                                    app_cfg.model.expected_size = known.expected_size;
-                                }
+                                // backend は adopt して save するだけ。URL/size の再推測禁止。
+                                app_cfg.model = model_config;
                                 if let Err(e) = app_cfg.save(&launcher_config_path) {
                                     let _ = event_tx.send(BackendEvent::Log(
                                         crate::messages::LogSource::Tenuki,
-                                        format!("SetModel: save failed: {}", e),
+                                        format!("CommitModelSelection: save failed: {}", e),
                                         crate::messages::LogLevel::Error,
                                         crate::messages::current_timestamp(),
                                     ));
@@ -196,7 +204,7 @@ pub fn start_backend(
                             Err(e) => {
                                 let _ = event_tx.send(BackendEvent::Log(
                                     crate::messages::LogSource::Tenuki,
-                                    format!("SetModel: load launcher_config failed: {}", e),
+                                    format!("CommitModelSelection: load launcher_config failed: {}", e),
                                     crate::messages::LogLevel::Error,
                                     crate::messages::current_timestamp(),
                                 ));
