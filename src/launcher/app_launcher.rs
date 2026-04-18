@@ -85,25 +85,63 @@ fn push_unique_candidate(out: &mut Vec<BackendCandidate>, candidate: BackendCand
     }
 }
 
-/// runtime とモデルが揃っているか確認する。
-/// main.rs でモードを決定するために使用される。
+/// `check_ready` が false を返す理由の構造化表現。
+#[derive(Debug, Clone)]
+pub enum CheckReadyReason {
+    ConfigLoadFail(String),
+    RuntimeIncomplete {
+        backend: String,
+    },
+    ModelMissing {
+        filename: String,
+    },
+    ModelSizeMismatch {
+        filename: String,
+        expected: u64,
+        actual: u64,
+    },
+}
+
+impl std::fmt::Display for CheckReadyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConfigLoadFail(e) => write!(f, "launcher_config.toml load failed: {}", e),
+            Self::RuntimeIncomplete { backend } => {
+                write!(f, "runtime/{} is incomplete", backend)
+            }
+            Self::ModelMissing { filename } => write!(f, "model '{}' not found", filename),
+            Self::ModelSizeMismatch {
+                filename,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "model '{}' size mismatch: expected {} got {}",
+                    filename, expected, actual
+                )
+            }
+        }
+    }
+}
+
+/// runtime とモデルが揃っているか確認し、不足の場合は理由を返す。
 /// - launcher_config.toml は install_root から読む（権威位置）
-/// - models/, runtime/, state は base_dir から読む
-pub fn check_ready(base_dir: &std::path::Path) -> bool {
+/// - models/, runtime/ は base_dir から読む
+pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyReason> {
     use crate::launcher::runtime_downloader::runtime_is_complete;
 
-    // launcher_config.toml は install_root（権威位置）から読む
     let install_root = super::resolve_install_root();
     let config_path = install_root.join("launcher_config.toml");
     let config = match super::app_config::AppConfig::load(&config_path) {
         Ok(c) => c,
-        Err(_) => {
-            diag_file(base_dir, "[check_ready] config load failed → false");
-            return false;
+        Err(e) => {
+            let reason = CheckReadyReason::ConfigLoadFail(e.to_string());
+            diag_file(base_dir, &format!("[check_ready] {}", reason));
+            return Err(reason);
         }
     };
 
-    // runtime 確認: authority (launcher_config.toml) の backend から runtime ディレクトリを特定
     let backend = &config.backend;
     let runtime_dir = base_dir.join("runtime").join(backend);
     let rt_ok = runtime_is_complete(&runtime_dir, backend);
@@ -115,24 +153,46 @@ pub fn check_ready(base_dir: &std::path::Path) -> bool {
         ),
     );
     if !rt_ok {
-        return false;
+        return Err(CheckReadyReason::RuntimeIncomplete {
+            backend: backend.clone(),
+        });
     }
 
     let model_path = base_dir.join("models").join(&config.model.filename);
     let expected_size = config.model.expected_size;
-    let ok = model_is_complete(&model_path, expected_size);
+
+    let actual_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
     diag_file(
         base_dir,
         &format!(
-            "[check_ready] model_is_complete={} filename={} expected_size={}",
-            ok, config.model.filename, expected_size
+            "[check_ready] model filename={} expected={} actual={}",
+            config.model.filename, expected_size, actual_size
         ),
     );
-    if !ok {
-        return false;
+
+    if actual_size == 0 {
+        return Err(CheckReadyReason::ModelMissing {
+            filename: config.model.filename.clone(),
+        });
     }
+    if actual_size != expected_size || expected_size == 0 {
+        return Err(CheckReadyReason::ModelSizeMismatch {
+            filename: config.model.filename.clone(),
+            expected: expected_size,
+            actual: actual_size,
+        });
+    }
+
+    // サイズ一致 = 完成。stale sidecar / .part は掃除する。
+    cleanup_model_resume_artifacts(&model_path);
     diag_file(base_dir, "[check_ready] → true");
-    true
+    Ok(())
+}
+
+/// runtime とモデルが揃っているか確認する（bool 版）。
+/// main.rs でモードを決定するために使用される。
+pub fn check_ready(base_dir: &std::path::Path) -> bool {
+    check_ready_detail(base_dir).is_ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +445,7 @@ impl AppLauncher {
                 progress_tx
                     .send(LaunchProgress::SubStatus(self.t(
                         &format!("Downloading {} runtime...", name),
-                        &format!("{} 繝ｩ繝ｳ繧ｿ繧､繝繧偵ム繧ｦ繝ｳ繝ｭ繝ｼ繝我ｸｭ...", name),
+                        &format!("{} ランタイムをダウンロード中...", name),
                     )))
                     .ok();
                 match self.try_backend(candidate, &model_path, &progress_tx, &cancel_flag) {
@@ -439,16 +499,30 @@ impl AppLauncher {
         self.config.save(&config_path)?;
         self.seed_profiles()?;
 
+        // Post-save self-check: 保存した authority で startup 条件が満たされているか検証する。
+        // これが false なら、次回起動で check_ready() が落ちる前にここで失敗させる。
+        let self_check = check_ready(&self.base_dir);
         diag(
             &progress_tx,
             &self.base_dir,
             &format!(
-                "[run] COMPLETE backend={} model={} exe={}",
+                "[run] post-save self_check={} backend={} model={} exe={}",
+                self_check,
                 backend_name,
                 self.config.model.filename,
                 exe_path.display(),
             ),
         );
+        if !self_check {
+            anyhow::bail!(
+                "Setup completed but startup readiness check failed \
+                 (backend={} model={}). \
+                 Runtime or model did not satisfy authority exact check after save.",
+                backend_name,
+                self.config.model.filename
+            );
+        }
+
         progress_tx.send(LaunchProgress::Complete).ok();
         Ok(())
     }
@@ -890,9 +964,7 @@ impl AppLauncher {
             .with_context(|| format!("Failed to spawn test backend: {}", exe_path.display()))?;
 
         if let Some(stderr) = child.stderr.take() {
-            thread::spawn(move || {
-                for _ in BufReader::new(stderr).lines() {}
-            });
+            thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
         }
 
         let result = self.wait_for_healthy_process(&mut child, test_port, Duration::from_secs(120));
@@ -936,7 +1008,7 @@ impl AppLauncher {
     }
 
     /// profiles/default.toml と profiles/game.toml を shipped default で生成する。
-    /// 既存ファイルは上書きしない。
+    /// game.toml が旧 shipped bad prompt のままの場合は公式文面に修復する。
     fn seed_profiles(&self) -> Result<()> {
         use super::translation_profile::TranslationProfile;
         let profiles_dir = self.base_dir.join("profiles");
@@ -947,9 +1019,18 @@ impl AppLauncher {
             TranslationProfile::default().save(&default_path)?;
         }
 
+        const GAME_BAD_PROMPT: &str =
+            "Translate the following segment into {target}, preserving all special symbols and tags exactly as they appear. Do not add any explanations.";
+
         let game_path = profiles_dir.join("game.toml");
         if !game_path.exists() {
             TranslationProfile::game_default().save(&game_path)?;
+        } else if let Ok(content) = std::fs::read_to_string(&game_path) {
+            if let Ok(existing) = toml::from_str::<TranslationProfile>(&content) {
+                if existing.prompt_template == GAME_BAD_PROMPT {
+                    TranslationProfile::game_default().save(&game_path)?;
+                }
+            }
         }
 
         Ok(())

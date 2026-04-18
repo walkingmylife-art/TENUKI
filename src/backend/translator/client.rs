@@ -47,9 +47,9 @@ impl HttpLlmClient {
                 { "role": "user", "content": prompt }
             ],
             "max_tokens": 512,
-            "temperature": 0.7,
-            "top_k": 20,
-            "top_p": 0.6,
+            "temperature": 0.4,
+            "top_k": 30,
+            "top_p": 0.8,
             "repetition_penalty": 1.05,
             "cache_prompt": false
         });

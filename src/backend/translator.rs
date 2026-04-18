@@ -893,7 +893,7 @@ mod tests {
     fn test_settings() -> TranslationSettings {
         TranslationSettings {
             enable_model_wrap: true,
-            model_wrap_min_chars: 30,
+            model_wrap_min_chars: 60,
             model_wrap_min_tail_chars: 10,
             enable_model_symbol_cleanup: true,
         }

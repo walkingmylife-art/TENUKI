@@ -517,10 +517,8 @@ mod tests {
         // build_app_config は backend を raw から取る。
         // raw に backend がなければ AppConfig::default().backend を保持。
         // その後 migrate_config_if_needed の 83-88 行でさらに上書きされる経路が存在する。
-        let raw_with_vulkan: Value = toml::from_str(
-            "prompt_template = \"x\"\nbackend = \"vulkan\"",
-        )
-        .unwrap();
+        let raw_with_vulkan: Value =
+            toml::from_str("prompt_template = \"x\"\nbackend = \"vulkan\"").unwrap();
         let raw_no_backend: Value = toml::from_str(r#"prompt_template = "x""#).unwrap();
 
         let legacy = minimal_legacy_config();

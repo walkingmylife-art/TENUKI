@@ -1151,6 +1151,7 @@ impl ProcessManager {
             self.server_cfg.cont_batching,
             self.llm_slots.max(1) as u32,
             self.server_cfg.port,
+            &self.server_cfg.extra_args,
             self.event_tx.clone(),
         ) {
             Ok(proc) => {

@@ -66,14 +66,20 @@ pub fn start_backend(
         let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected_model.clone()));
 
         // dict_slot は preflight で commit 済みの authority。backend は読むだけ。
-        match config.dict_slot.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match config
+            .dict_slot
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(slot) => {
                 let _ = std::fs::create_dir_all(slot);
             }
             None => {
                 let _ = event_tx.send(BackendEvent::Log(
                     crate::messages::LogSource::Tenuki,
-                    "dict_slot が未確定です。preflight が通っていない可能性があります。".to_string(),
+                    "dict_slot が未確定です。preflight が通っていない可能性があります。"
+                        .to_string(),
                     crate::messages::LogLevel::Error,
                     crate::messages::current_timestamp(),
                 ));

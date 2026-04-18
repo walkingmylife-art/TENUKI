@@ -21,8 +21,7 @@ use std::time::Instant;
 use anyhow::anyhow;
 use serde::Serialize;
 
-use backend::processor::{ProcessorData, ProcessorFactory, TranslationMode};
-use launcher::{show_launcher_screen, LaunchProgress, LauncherStep, LauncherUiState};
+use launcher::{show_launcher_screen, LaunchProgress, LauncherUiState};
 use messages::{BackendEvent, FrontendCommand, LogLevel};
 use ui::container::{LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
 
@@ -62,6 +61,64 @@ fn sanitize_ui_lang(lang: &str) -> String {
     }
 }
 
+fn build_initial_launcher_state(
+    launcher_config_path: &Path,
+    config_ready_for_normal: bool,
+    readiness: &Result<(), launcher::CheckReadyReason>,
+) -> LauncherUiState {
+    if !config_ready_for_normal {
+        return LauncherUiState::with_startup_reason("config.toml preflight failed".to_string());
+    }
+
+    match readiness {
+        Ok(()) => LauncherUiState::initial_setup(),
+        Err(launcher::CheckReadyReason::ConfigLoadFail(reason)) => {
+            if launcher_config_path.exists() {
+                LauncherUiState::with_startup_reason(format!(
+                    "launcher_config.toml load failed: {}",
+                    reason
+                ))
+            } else {
+                LauncherUiState::initial_setup()
+            }
+        }
+        Err(
+            launcher::CheckReadyReason::RuntimeIncomplete { .. }
+            | launcher::CheckReadyReason::ModelMissing { .. }
+            | launcher::CheckReadyReason::ModelSizeMismatch { .. },
+        ) => LauncherUiState::initial_setup(),
+    }
+}
+
+fn complete_backend_handoff(
+    command_tx: &mpsc::Sender<FrontendCommand>,
+    startup_result: Result<(), String>,
+) -> Result<(), String> {
+    startup_result?;
+    command_tx
+        .send(FrontendCommand::Start)
+        .map_err(|e| format!("Failed to queue backend start command: {}", e))
+}
+
+fn reset_backend_runtime(
+    command_tx: &mut mpsc::Sender<FrontendCommand>,
+    command_rx: &mut Option<mpsc::Receiver<FrontendCommand>>,
+    backend_thread: &mut Option<thread::JoinHandle<()>>,
+    shutdown: &mut Arc<AtomicBool>,
+) {
+    let _ = command_tx.send(FrontendCommand::Stop);
+    shutdown.store(true, Ordering::Relaxed);
+
+    if let Some(handle) = backend_thread.take() {
+        let _ = handle.join();
+    }
+
+    *shutdown = Arc::new(AtomicBool::new(false));
+    let (new_tx, new_rx) = mpsc::channel();
+    *command_tx = new_tx;
+    *command_rx = Some(new_rx);
+}
+
 #[derive(Serialize)]
 struct ListPayload {
     texts: Vec<String>,
@@ -81,6 +138,10 @@ fn wait_for_translation_server(port: u16, client: &reqwest::blocking::Client) ->
 }
 
 fn provision_launcher_config_from_misplaced(misplaced_path: &Path, launcher_config_path: &Path) {
+    if misplaced_path == launcher_config_path {
+        return;
+    }
+
     if !misplaced_path.exists() {
         return;
     }
@@ -132,15 +193,6 @@ fn provision_runtime_config_before_normal(config_path: &Path) -> bool {
     }
 }
 
-fn model_inputs_from_context(ctx: &crate::backend::processor::TranslationContext) -> Vec<String> {
-    match &ctx.processor_data {
-        ProcessorData::Structural { text_tokens, .. } if text_tokens.len() > 1 => {
-            text_tokens.clone()
-        }
-        _ => ctx.parts_to_translate.clone(),
-    }
-}
-
 impl TenukiApp {
     fn load_input_records_or_log(&mut self) {
         if let Err(err) = self.ui.load_input_records() {
@@ -183,24 +235,9 @@ impl TenukiApp {
             return;
         }
 
-        let mode = TranslationMode::from_str(&self.ui.display.translation_mode);
-        let processor = ProcessorFactory::create(mode, self.ui.state.structural_edit);
         let mut sections = Vec::new();
 
         for record in &pickup_records {
-            let mut visible_lines = Vec::new();
-            let mut model_inputs = Vec::new();
-
-            for line in record.snapshot.extracted_text.split('\n') {
-                let ctx = processor.preprocess(line);
-                let visible = match &ctx.processor_data {
-                    ProcessorData::Structural { visible_text, .. } => visible_text.clone(),
-                    ProcessorData::Passthrough => line.to_string(),
-                };
-                visible_lines.push(visible);
-                model_inputs.extend(model_inputs_from_context(&ctx));
-            }
-
             let preview = format!(
                 "[{}] {}\n原文: {}\n抽出: {}\n可視: {}\nモデル入力: {}\nメモ: {}",
                 record.timestamp,
@@ -211,11 +248,15 @@ impl TenukiApp {
                 },
                 record.snapshot.raw_text,
                 record.snapshot.extracted_text,
-                visible_lines.join("\n"),
-                if model_inputs.is_empty() {
+                if record.snapshot.visible_text.is_empty() {
                     "-".to_string()
                 } else {
-                    model_inputs.join(" | ")
+                    record.snapshot.visible_text.clone()
+                },
+                if record.snapshot.model_inputs.is_empty() {
+                    "-".to_string()
+                } else {
+                    record.snapshot.model_inputs.join(" | ")
                 },
                 if record.note.trim().is_empty() {
                     "-".to_string()
@@ -315,11 +356,9 @@ impl TenukiApp {
         let launcher_cancel = Arc::new(AtomicBool::new(false));
         let launcher_thread = None;
 
-        let config_ready_for_normal = if config_path.exists() {
-            provision_runtime_config_before_normal(&config_path)
-        } else {
-            false
-        };
+        // preflight は missing config を provision できるため exists() ガードは不要。
+        // Normal 判定前に必ず通す。
+        let config_ready_for_normal = provision_runtime_config_before_normal(&config_path);
 
         let config_result = if config_ready_for_normal {
             config::load(&config_path)
@@ -327,7 +366,8 @@ impl TenukiApp {
             Err(anyhow!("config.toml is not ready for normal startup"))
         };
 
-        let mode = if config_ready_for_normal && launcher::check_ready(&base_dir) {
+        let readiness = launcher::check_ready_detail(&base_dir);
+        let mode = if config_ready_for_normal && readiness.is_ok() {
             AppMode::Normal
         } else {
             AppMode::Launcher
@@ -369,6 +409,12 @@ impl TenukiApp {
         let backend_thread = None;
         let command_rx_opt = Some(command_rx);
 
+        let initial_launcher_state = build_initial_launcher_state(
+            &launcher_config_path,
+            config_ready_for_normal,
+            &readiness,
+        );
+
         let ui = UiContainer::with_base_dir(base_dir.clone());
         let mut app = Self {
             mode,
@@ -382,7 +428,7 @@ impl TenukiApp {
             command_rx: command_rx_opt,
             backend_thread,
             shutdown,
-            launcher_state: LauncherUiState::default(),
+            launcher_state: initial_launcher_state,
             launcher_rx,
             launcher_tx,
             launcher_thread,
@@ -409,8 +455,11 @@ impl TenukiApp {
             for dir in ["profiles", "logs", "tmp"] {
                 let _ = fs::create_dir_all(app.base_dir.join(dir));
             }
-            app.start_backend_after_setup();
-            let _ = app.command_tx.send(FrontendCommand::Start);
+            let start_result = app.start_backend_after_setup();
+            let handoff = complete_backend_handoff(&app.command_tx, start_result);
+            if let Err(err) = handoff {
+                app.return_to_launcher_with_cleanup(LauncherUiState::error(err));
+            }
         }
 
         app
@@ -420,7 +469,8 @@ impl TenukiApp {
         logic::check_models(&self.base_dir, &mut self.cached_model_check)
     }
 
-    fn start_backend_after_setup(&mut self) {
+    #[allow(dead_code)]
+    fn start_backend_after_setup_legacy(&mut self) {
         if let Some(command_rx) = self.command_rx.take() {
             if !provision_runtime_config_before_normal(&self.config_path) {
                 self.ui.add_log(
@@ -456,9 +506,8 @@ impl TenukiApp {
                     self.ui
                         .set_status(StatusKey::ConfigError, StatusIcon::Warning, true);
                     self.mode = AppMode::Launcher;
-                    self.launcher_state = LauncherUiState::error(format!(
-                        "config.toml 読み込み失敗: {e}"
-                    ));
+                    self.launcher_state =
+                        LauncherUiState::error(format!("config.toml 読み込み失敗: {e}"));
                     self.launcher_cancel
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.launcher_thread = None;
@@ -482,9 +531,8 @@ impl TenukiApp {
                         messages::current_timestamp(),
                     );
                     self.mode = AppMode::Launcher;
-                    self.launcher_state = LauncherUiState::error(format!(
-                        "launcher_config.toml 読み込み失敗: {e}"
-                    ));
+                    self.launcher_state =
+                        LauncherUiState::error(format!("launcher_config.toml 読み込み失敗: {e}"));
                     self.launcher_cancel
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.launcher_thread = None;
@@ -505,6 +553,87 @@ impl TenukiApp {
                 command_rx,
             ));
         }
+    }
+
+    fn start_backend_after_setup(&mut self) -> Result<(), String> {
+        let Some(command_rx) = self.command_rx.take() else {
+            return Err("backend command receiver unavailable".to_string());
+        };
+
+        if !provision_runtime_config_before_normal(&self.config_path) {
+            self.ui.add_log(
+                ui::container::LogSource::Tenuki,
+                "config.toml current shape の再構成に失敗したため launcher へ戻します".to_string(),
+                messages::LogLevel::Error,
+                messages::current_timestamp(),
+            );
+            self.command_rx = Some(command_rx);
+            return Err("config.toml を再構成できませんでした。Retry してください。".to_string());
+        }
+
+        let config = match config::load(&self.config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ui.add_log(
+                    ui::container::LogSource::Tenuki,
+                    format!(
+                        "config.toml の読み込みに失敗したため backend を起動できません: {}",
+                        e
+                    ),
+                    messages::LogLevel::Error,
+                    messages::current_timestamp(),
+                );
+                self.ui
+                    .set_status(StatusKey::ConfigError, StatusIcon::Warning, true);
+                self.command_rx = Some(command_rx);
+                return Err(format!("config.toml 読み込み失敗: {e}"));
+            }
+        };
+
+        let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
+        let app_config = match launcher::app_config::AppConfig::load(&launcher_config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ui.add_log(
+                    ui::container::LogSource::Tenuki,
+                    format!(
+                        "launcher_config.toml の読み込みに失敗したため launcher へ戻ります: {}",
+                        e
+                    ),
+                    messages::LogLevel::Error,
+                    messages::current_timestamp(),
+                );
+                self.command_rx = Some(command_rx);
+                return Err(format!("launcher_config.toml 読み込み失敗: {e}"));
+            }
+        };
+
+        self.shutdown.store(false, Ordering::Relaxed);
+        let shutdown_clone = self.shutdown.clone();
+        let event_tx_clone = self.event_tx.clone();
+        let base_dir_clone = self.base_dir.clone();
+        self.backend_thread = Some(backend::start_backend(
+            config,
+            app_config,
+            base_dir_clone,
+            shutdown_clone,
+            event_tx_clone,
+            command_rx,
+        ));
+        Ok(())
+    }
+
+    fn return_to_launcher_with_cleanup(&mut self, launcher_state: LauncherUiState) {
+        reset_backend_runtime(
+            &mut self.command_tx,
+            &mut self.command_rx,
+            &mut self.backend_thread,
+            &mut self.shutdown,
+        );
+        self.mode = AppMode::Launcher;
+        self.launcher_state = launcher_state;
+        self.launcher_cancel.store(false, Ordering::Relaxed);
+        self.launcher_thread = None;
     }
 }
 
@@ -652,8 +781,11 @@ impl eframe::App for TenukiApp {
                         .refresh_available_profiles(&self.base_dir.join("profiles"));
                     self.ui
                         .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
-                    self.start_backend_after_setup();
-                    let _ = self.command_tx.send(FrontendCommand::Start);
+                    let start_result = self.start_backend_after_setup();
+                    let handoff = complete_backend_handoff(&self.command_tx, start_result);
+                    if let Err(err) = handoff {
+                        self.return_to_launcher_with_cleanup(LauncherUiState::error(err));
+                    }
                 }
             }
 
@@ -663,6 +795,15 @@ impl eframe::App for TenukiApp {
                 if commands.exit_app {
                     ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
                     return;
+                }
+
+                if !has_server && (commands.start_backend || commands.restart_backend) {
+                    self.return_to_launcher_with_cleanup(LauncherUiState::error(
+                        "llama-server が見つかりません。セットアップを再実行してください。"
+                            .to_string(),
+                    ));
+                    commands.start_backend = false;
+                    commands.restart_backend = false;
                 }
 
                 if commands.start_backend {
@@ -850,4 +991,192 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_initial_launcher_state, complete_backend_handoff,
+        provision_launcher_config_from_misplaced, reset_backend_runtime,
+    };
+    use crate::launcher::{CheckReadyReason, LauncherEntryIntent, LauncherStep};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tenuki-main-test-{}-{}",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    #[test]
+    fn provision_launcher_config_from_misplaced_same_path_is_noop() {
+        let test_dir = unique_test_dir();
+        fs::create_dir_all(&test_dir).expect("create test dir");
+
+        let config_path = test_dir.join("launcher_config.toml");
+        fs::write(&config_path, "ui_lang = \"ja\"\n").expect("write launcher config");
+
+        provision_launcher_config_from_misplaced(&config_path, &config_path);
+
+        assert!(
+            config_path.exists(),
+            "canonical config should remain in place"
+        );
+        assert!(
+            !test_dir.join("launcher_config.toml.bak").exists(),
+            "same-path guard must not create a backup"
+        );
+
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn missing_launcher_authority_enters_initial_setup() {
+        let test_dir = unique_test_dir();
+        fs::create_dir_all(&test_dir).expect("create test dir");
+
+        let config_path = test_dir.join("launcher_config.toml");
+        let state = build_initial_launcher_state(
+            &config_path,
+            true,
+            &Err(CheckReadyReason::ConfigLoadFail(
+                "launcher_config.toml not found".to_string(),
+            )),
+        );
+
+        assert!(matches!(
+            state.entry_intent,
+            LauncherEntryIntent::InitialSetup
+        ));
+        assert!(matches!(state.step, LauncherStep::WaitingForStart));
+        assert!(state.startup_reason.is_none());
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn existing_launcher_authority_with_runtime_incomplete_enters_initial_setup() {
+        let test_dir = unique_test_dir();
+        fs::create_dir_all(&test_dir).expect("create test dir");
+
+        let config_path = test_dir.join("launcher_config.toml");
+        fs::write(&config_path, "ui_lang = \"ja\"\n").expect("write launcher config");
+
+        let state = build_initial_launcher_state(
+            &config_path,
+            true,
+            &Err(CheckReadyReason::RuntimeIncomplete {
+                backend: "vulkan".to_string(),
+            }),
+        );
+
+        assert!(matches!(
+            state.entry_intent,
+            LauncherEntryIntent::InitialSetup
+        ));
+        assert!(matches!(state.step, LauncherStep::WaitingForStart));
+        assert!(state.startup_reason.is_none());
+
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn existing_launcher_authority_with_config_load_failure_enters_recovery_wait() {
+        let test_dir = unique_test_dir();
+        fs::create_dir_all(&test_dir).expect("create test dir");
+
+        let config_path = test_dir.join("launcher_config.toml");
+        fs::write(&config_path, "ui_lang = \"ja\"\n").expect("write launcher config");
+
+        let state = build_initial_launcher_state(
+            &config_path,
+            true,
+            &Err(CheckReadyReason::ConfigLoadFail("parse error".to_string())),
+        );
+
+        assert!(matches!(
+            state.entry_intent,
+            LauncherEntryIntent::RecoveryWait
+        ));
+        assert!(matches!(state.step, LauncherStep::WaitingForStart));
+        assert_eq!(
+            state.startup_reason.as_deref(),
+            Some("launcher_config.toml load failed: parse error")
+        );
+
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn complete_backend_handoff_failure_does_not_queue_start() {
+        let (tx, rx) = mpsc::channel();
+
+        let result = complete_backend_handoff(&tx, Err("backend failed".to_string()));
+
+        assert_eq!(result.unwrap_err(), "backend failed");
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn complete_backend_handoff_success_queues_start() {
+        let (tx, rx) = mpsc::channel();
+
+        complete_backend_handoff(&tx, Ok(())).expect("handoff should queue start");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::messages::FrontendCommand::Start)
+        ));
+    }
+
+    #[test]
+    fn reset_backend_runtime_discards_stale_commands_and_resets_shutdown() {
+        let (mut tx, rx) = mpsc::channel();
+        tx.send(crate::messages::FrontendCommand::Start)
+            .expect("queue stale start");
+
+        let mut command_rx = None;
+        let mut shutdown = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let shutdown_clone = shutdown.clone();
+
+        let mut backend_thread = Some(thread::spawn(move || {
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                let _ = rx.recv_timeout(Duration::from_millis(20));
+            }
+            finished_clone.store(true, Ordering::Relaxed);
+        }));
+
+        reset_backend_runtime(&mut tx, &mut command_rx, &mut backend_thread, &mut shutdown);
+
+        assert!(backend_thread.is_none());
+        assert!(finished.load(Ordering::Relaxed));
+        assert!(!shutdown.load(Ordering::Relaxed));
+
+        let new_rx = command_rx.as_ref().expect("new receiver should exist");
+        assert!(matches!(new_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        tx.send(crate::messages::FrontendCommand::Restart)
+            .expect("new channel should accept commands");
+        assert!(matches!(
+            new_rx.try_recv(),
+            Ok(crate::messages::FrontendCommand::Restart)
+        ));
+    }
 }

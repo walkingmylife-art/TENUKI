@@ -112,7 +112,9 @@ profile = "game"
         assert_eq!(outcome.shape, RuntimeConfigProvision::ProvisionedMissing);
 
         let config = crate::config::load(&config_path).unwrap();
-        let slot = config.dict_slot.expect("dict_slot should be committed after provisioning");
+        let slot = config
+            .dict_slot
+            .expect("dict_slot should be committed after provisioning");
         assert!(std::path::Path::new(&slot).exists());
 
         let _ = fs::remove_dir_all(&dir);

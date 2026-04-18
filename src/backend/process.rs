@@ -47,7 +47,8 @@ pub fn build_llama_command(
         })
         .args(["--parallel", &parallel.to_string()])
         .args(["--cache-ram", "0"])
-        .args(["--metrics"]);
+        .args(["--metrics"])
+        .args(["--flash-attn", "auto"]);
     if !extra_args.is_empty() {
         cmd.args(extra_args);
     }
@@ -69,6 +70,7 @@ impl LlamaProcess {
         cont_batching: bool,
         parallel: u32,
         port: u16,
+        extra_args: &[String],
         event_tx: mpsc::Sender<BackendEvent>,
     ) -> Result<Self, String> {
         let mut cmd = build_llama_command(
@@ -81,7 +83,7 @@ impl LlamaProcess {
             ubatch_size,
             cont_batching,
             parallel,
-            &[],
+            extra_args,
         );
 
         // DLL 同梱パスを確実にロードさせるため、exe のあるディレクトリを作業ディレクトリに設定
@@ -160,5 +162,39 @@ impl LlamaProcess {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_llama_command;
+    use std::path::Path;
+
+    #[test]
+    fn build_llama_command_restores_flash_attn_auto() {
+        let cmd = build_llama_command(
+            Path::new("llama-server"),
+            Path::new("model.gguf"),
+            8080,
+            0,
+            4096,
+            512,
+            256,
+            true,
+            2,
+            &["--threads".to_string(), "8".to_string()],
+        );
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--flash-attn", "auto"]),
+            "expected --flash-attn auto in args, got {:?}",
+            args
+        );
     }
 }

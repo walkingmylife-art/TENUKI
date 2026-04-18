@@ -11,7 +11,7 @@ fn default_true() -> bool {
 }
 
 fn default_wrap_min_chars() -> u32 {
-    30
+    60
 }
 
 fn default_wrap_min_tail_chars() -> u32 {
@@ -121,7 +121,7 @@ impl Default for ProfileModelProcessingOptions {
     fn default() -> Self {
         Self {
             enable_model_wrap: false,
-            model_wrap_min_chars: 30,
+            model_wrap_min_chars: 60,
             model_wrap_min_tail_chars: 10,
             enable_model_symbol_cleanup: false,
         }
@@ -155,11 +155,20 @@ impl Default for TranslationProfile {
 }
 
 impl TranslationProfile {
+    fn default_for_name(name: &str) -> Self {
+        match sanitize_profile_name(name).as_str() {
+            "game" => Self::game_default(),
+            _ => Self::default(),
+        }
+    }
+
     pub fn game_default() -> Self {
         Self {
             version: default_profile_version(),
             translation_mode: default_profile_translation_mode(),
-            prompt_template: "Translate the following segment into {target}, preserving all special symbols and tags exactly as they appear. Do not add any explanations.".to_string(),
+            prompt_template:
+                "Translate the following segment into {target}, without additional explanation."
+                    .to_string(),
             structural: ProfileStructuralOptions {
                 protect_tags: true,
                 protect_brackets: true,
@@ -169,7 +178,7 @@ impl TranslationProfile {
             },
             model_processing: ProfileModelProcessingOptions {
                 enable_model_wrap: true,
-                model_wrap_min_chars: 30,
+                model_wrap_min_chars: 60,
                 model_wrap_min_tail_chars: 10,
                 enable_model_symbol_cleanup: true,
             },
@@ -192,7 +201,7 @@ impl TranslationProfile {
             if !default_path.exists() {
                 TranslationProfile::default().save(&default_path)?;
             }
-            fs::copy(&default_path, &path)?;
+            TranslationProfile::default_for_name(&name).save(&path)?;
         }
 
         Ok(())
@@ -523,7 +532,7 @@ tgt_lang = "ja"
 
         assert_eq!(config.structural, StructuralOptions::default());
         assert_eq!(config.enable_model_wrap, true);
-        assert_eq!(config.model_wrap_min_chars, 30);
+        assert_eq!(config.model_wrap_min_chars, 60);
         assert_eq!(config.model_wrap_min_tail_chars, 10);
         assert_eq!(config.enable_model_symbol_cleanup, true);
         assert_eq!(
@@ -671,6 +680,32 @@ enable_model_symbol_cleanup = true
         assert_eq!(profile.translation_mode, "structural");
         assert!(profile.structural.protect_tags);
         assert!(profile.model_processing.enable_model_wrap);
+    }
+
+    #[test]
+    fn missing_game_profile_uses_game_defaults() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_profile_seed_test_{}", unique));
+        let profiles_dir = base_dir.join("profiles");
+
+        let profile = TranslationProfile::load(&profiles_dir, "game").unwrap();
+        let saved = std::fs::read_to_string(profiles_dir.join("game.toml")).unwrap();
+
+        assert!(profiles_dir.join("default.toml").exists());
+        assert!(profile.structural.protect_tags);
+        assert!(profile.structural.protect_brackets);
+        assert!(profile.structural.protect_escaped_sequences);
+        assert!(profile.structural.protect_placeholders);
+        assert!(profile.structural.split_symbolic_segments);
+        assert!(profile.model_processing.enable_model_wrap);
+        assert!(profile.model_processing.enable_model_symbol_cleanup);
+        assert!(saved.contains("enable_model_wrap = true"));
+        assert!(saved.contains("protect_tags = true"));
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]

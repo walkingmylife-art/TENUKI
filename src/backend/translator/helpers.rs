@@ -148,57 +148,97 @@ fn normalize_plus_minus_spacing(text: &str) -> String {
 
 fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
     let ch = chars.get(index).copied()?;
-    let next = chars.get(index + 1).copied()?;
+    let next = chars.get(index + 1).copied();
+
     if ch == '、' {
         return Some(1);
     }
-    if (ch == '.' || ch == ',' || ch == '，' || ch == '。') && next == ' ' {
+    if ch == '。' {
+        return Some(1);
+    }
+    if ch == '，' {
+        return Some(1);
+    }
+    if (ch == '.' || ch == ',') && next == Some(' ') {
         return Some(2);
     }
+
+    // Thai: detect " ใน" and break at the leading space
+    if ch == ' '
+        && chars.get(index + 1) == Some(&'ใ')
+        && chars.get(index + 2) == Some(&'น')
+    {
+        return Some(3);
+    }
+
     None
 }
 
-pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, min_tail_length: usize) -> String {
+fn wrap_candidate_score(chars: &[char], index: usize, candidate_width: usize) -> i32 {
+    match (chars[index], candidate_width) {
+        ('。', 1) => 12,
+        ('、', 1) => 6,
+        ('，', 1) => 6,
+        ('.', 2) => 12,
+        (',', 2) => 6,
+        (' ', 3) => 12,
+        _ => 0,
+    }
+}
+
+pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, _min_tail_length: usize) -> String {
     if !enabled || text.contains('\n') || text.chars().count() < min_length {
         return text.to_string();
     }
 
     let chars: Vec<char> = text.chars().collect();
-    let mut result = String::with_capacity(text.len() + 4);
-    let mut segment_start = 0usize;
+    let len = chars.len();
+    let center = len / 2;
 
-    while chars.len().saturating_sub(segment_start) > min_length {
-        let search_start = segment_start + min_length;
-        let mut break_index = None;
+    let mut best: Option<(i32, usize, usize, usize)> = None;
 
-        for index in search_start..chars.len().saturating_sub(1) {
-            let Some(candidate_width) = is_wrap_candidate(&chars, index) else {
-                continue;
-            };
-            let tail_len = chars.len().saturating_sub(index + candidate_width);
-            if tail_len >= min_tail_length {
-                break_index = Some(index);
-                break;
-            }
+    for index in 0..len {
+        let Some(candidate_width) = is_wrap_candidate(&chars, index) else {
+            continue;
+        };
+
+        let base = wrap_candidate_score(&chars, index, candidate_width);
+        if base == 0 {
+            continue;
         }
 
-        let Some(index) = break_index else {
-            break;
-        };
+        let distance = center.abs_diff(index);
+        let score = base - distance as i32;
 
-        let candidate_width = is_wrap_candidate(&chars, index).unwrap_or(1);
-        let emit_end = if candidate_width == 2 {
-            index + 1
-        } else {
-            index + candidate_width
-        };
-        result.extend(chars[segment_start..emit_end].iter());
-        result.push('\n');
-        segment_start = index + candidate_width;
+        match best {
+            None => best = Some((score, distance, index, candidate_width)),
+            Some((best_score, best_distance, best_index, _)) => {
+                if score > best_score
+                    || (score == best_score && distance < best_distance)
+                    || (score == best_score && distance == best_distance && index > best_index)
+                {
+                    best = Some((score, distance, index, candidate_width));
+                }
+            }
+        }
     }
 
-    result.extend(chars[segment_start..].iter());
-    result.replace(" ใน", "\nใน")
+    let Some((_, _, index, candidate_width)) = best else {
+        return text.to_string();
+    };
+
+    let (emit_end, next_start) = match candidate_width {
+        1 => (index + 1, index + 1),
+        2 => (index + 1, index + 2),
+        3 => (index, index + 1),
+        _ => return text.to_string(),
+    };
+
+    let mut result = String::with_capacity(text.len() + 1);
+    result.extend(chars[..emit_end].iter());
+    result.push('\n');
+    result.extend(chars[next_start..].iter());
+    result
 }
 
 pub fn clean_model_output(
@@ -260,29 +300,35 @@ mod tests {
     fn wrap_splits_long_english_at_dot_space() {
         let text = "The hero defeated the ancient dragon in battle. The kingdom was saved.";
         assert_eq!(
-            apply_wrap(text, true, 30, 10),
+            apply_wrap(text, true, 60, 10),
             "The hero defeated the ancient dragon in battle.\nThe kingdom was saved."
         );
     }
 
     #[test]
     fn wrap_does_not_split_short_text() {
-        assert_eq!(apply_wrap("Hello. World.", true, 30, 10), "Hello. World.");
+        assert_eq!(apply_wrap("Hello. World.", true, 60, 10), "Hello. World.");
     }
 
     #[test]
-    fn wrap_can_repeat_after_each_threshold_window() {
+    fn wrap_picks_one_best_candidate() {
         let text = "Alpha beta gamma delta epsilon zeta eta, Theta iota kappa lambda mu nu xi omicron. Pi rho sigma tau upsilon phi chi psi omega, Final section stays.";
         assert_eq!(
-            apply_wrap(text, true, 30, 10),
-            "Alpha beta gamma delta epsilon zeta eta,\nTheta iota kappa lambda mu nu xi omicron.\nPi rho sigma tau upsilon phi chi psi omega,\nFinal section stays."
+            apply_wrap(text, true, 60, 10),
+            "Alpha beta gamma delta epsilon zeta eta, Theta iota kappa lambda mu nu xi omicron.\nPi rho sigma tau upsilon phi chi psi omega, Final section stays."
         );
     }
 
     #[test]
-    fn wrap_requires_ten_chars_after_dot_space() {
+    fn wrap_ignores_min_tail_length() {
         let text = "123456789012345678901234567890. short";
-        assert_eq!(apply_wrap(text, true, 30, 10), text);
+        assert_eq!(apply_wrap(text, true, 31, 10), "123456789012345678901234567890.\nshort");
+    }
+
+    #[test]
+    fn wrap_splits_thai_at_leading_space_before_nai() {
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ใน bbb";
+        assert_eq!(apply_wrap(text, true, 60, 10), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nใน bbb");
     }
 
     #[test]
