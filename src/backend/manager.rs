@@ -1101,7 +1101,7 @@ impl ProcessManager {
             Some(m) => m,
             None => {
                 let msg = if self.config.ui_lang == "en" {
-                    "No model file found in models/ directory".to_string()
+                    "No startup model could be resolved. Select a model from the list.".to_string()
                 } else {
                     "models/ ディレクトリにモデルファイルが見つかりません".to_string()
                 };

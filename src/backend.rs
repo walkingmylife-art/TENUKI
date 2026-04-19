@@ -25,14 +25,23 @@ use manager::{ProcessManager, RestartScope};
 
 /// launcher_config.toml の model.filename が権威。
 /// candidates の中に一致するファイルがあれば PathBuf を返す。なければ None。
-fn resolve_selected_model(filename: &str, candidates: &[ModelCandidate]) -> Option<PathBuf> {
-    if filename.trim().is_empty() {
-        return None;
+fn resolve_startup_model(app_config: &AppConfig, candidates: &[ModelCandidate]) -> Option<PathBuf> {
+    let expected_size = app_config.model.expected_size();
+    if let Some(candidate) = candidates.iter().find(|candidate| {
+        candidate.filename == app_config.model.filename() && candidate.size == expected_size
+    }) {
+        return Some(candidate.path.clone());
     }
-    candidates
+
+    let usable = candidates
         .iter()
-        .find(|c| c.filename == filename)
-        .map(|c| c.path.clone())
+        .filter(|candidate| candidate.size > 0)
+        .collect::<Vec<_>>();
+    if usable.len() == 1 {
+        return Some(usable[0].path.clone());
+    }
+
+    None
 }
 
 pub fn find_available_models(base_dir: &PathBuf) -> Vec<ModelCandidate> {
@@ -77,7 +86,7 @@ pub fn start_backend(
     std::thread::spawn(move || {
         let models = find_available_models(&base_dir);
         let _ = event_tx.send(BackendEvent::AvailableModels(models.clone()));
-        let selected_model = resolve_selected_model(app_config.model.filename(), &models);
+        let selected_model = resolve_startup_model(&app_config, &models);
         let _ = event_tx.send(BackendEvent::SelectedModelResolved(selected_model.clone()));
 
         // dict_slot は preflight で commit 済みの authority。backend は読むだけ。
@@ -175,7 +184,6 @@ pub fn start_backend(
                     FrontendCommand::CommitModelSelection(model_config) => {
                         let install_root = crate::launcher::resolve_install_root();
                         let launcher_config_path = install_root.join("launcher_config.toml");
-                        let filename = model_config.filename().to_string();
                         match AppConfig::load(&launcher_config_path) {
                             Ok(mut app_cfg) => {
                                 // backend は adopt して save するだけ。URL/size の再推測禁止。
@@ -189,7 +197,7 @@ pub fn start_backend(
                                     ));
                                 } else {
                                     let models = find_available_models(&base_dir);
-                                    let selected = resolve_selected_model(&filename, &models);
+                                    let selected = resolve_startup_model(&app_cfg, &models);
                                     let _ = event_tx.send(BackendEvent::AvailableModels(models));
                                     let _ = event_tx.send(BackendEvent::SelectedModelResolved(
                                         selected.clone(),
@@ -317,4 +325,82 @@ pub fn start_backend(
             crate::messages::current_timestamp(),
         ));
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_startup_model, ModelCandidate, ModelCandidateKind};
+    use crate::launcher::app_config::{ModelConfig, UrlPair};
+    use std::path::PathBuf;
+
+    fn known_config(filename: &str, expected_size: u64) -> crate::launcher::app_config::AppConfig {
+        let mut cfg = crate::launcher::app_config::AppConfig::default();
+        cfg.model = ModelConfig::Known {
+            filename: filename.to_string(),
+            expected_size,
+            urls: UrlPair::single("https://example.com/model.gguf"),
+        };
+        cfg
+    }
+
+    #[test]
+    fn startup_model_uses_authority_when_exact_match_exists() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![
+            ModelCandidate {
+                filename: "authority.gguf".to_string(),
+                path: PathBuf::from("models/authority.gguf"),
+                size: 100,
+                kind: ModelCandidateKind::Local,
+            },
+            ModelCandidate {
+                filename: "other.gguf".to_string(),
+                path: PathBuf::from("models/other.gguf"),
+                size: 200,
+                kind: ModelCandidateKind::Local,
+            },
+        ];
+
+        assert_eq!(
+            resolve_startup_model(&cfg, &candidates),
+            Some(PathBuf::from("models/authority.gguf"))
+        );
+    }
+
+    #[test]
+    fn startup_model_falls_back_to_single_usable_model() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![ModelCandidate {
+            filename: "local-7b.gguf".to_string(),
+            path: PathBuf::from("models/local-7b.gguf"),
+            size: 777,
+            kind: ModelCandidateKind::Local,
+        }];
+
+        assert_eq!(
+            resolve_startup_model(&cfg, &candidates),
+            Some(PathBuf::from("models/local-7b.gguf"))
+        );
+    }
+
+    #[test]
+    fn startup_model_stays_unresolved_when_multiple_alternatives_exist() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![
+            ModelCandidate {
+                filename: "local-a.gguf".to_string(),
+                path: PathBuf::from("models/local-a.gguf"),
+                size: 777,
+                kind: ModelCandidateKind::Local,
+            },
+            ModelCandidate {
+                filename: "local-b.gguf".to_string(),
+                path: PathBuf::from("models/local-b.gguf"),
+                size: 888,
+                kind: ModelCandidateKind::Local,
+            },
+        ];
+
+        assert_eq!(resolve_startup_model(&cfg, &candidates), None);
+    }
 }

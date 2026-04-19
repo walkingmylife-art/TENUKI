@@ -84,6 +84,7 @@ fn build_initial_launcher_state(
         }
         Err(
             launcher::CheckReadyReason::RuntimeIncomplete { .. }
+            | launcher::CheckReadyReason::NoModelsAvailable
             | launcher::CheckReadyReason::ModelMissing { .. }
             | launcher::CheckReadyReason::ModelSizeMismatch { .. },
         ) => LauncherUiState::initial_setup(),
@@ -1097,6 +1098,31 @@ mod tests {
             &Err(CheckReadyReason::RuntimeIncomplete {
                 backend: "vulkan".to_string(),
             }),
+        );
+
+        assert!(matches!(
+            state.entry_intent,
+            LauncherEntryIntent::InitialSetup
+        ));
+        assert!(matches!(state.step, LauncherStep::WaitingForStart));
+        assert!(state.startup_reason.is_none());
+
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn no_models_available_enters_initial_setup() {
+        let test_dir = unique_test_dir();
+        fs::create_dir_all(&test_dir).expect("create test dir");
+
+        let config_path = test_dir.join("launcher_config.toml");
+        fs::write(&config_path, "ui_lang = \"ja\"\n").expect("write launcher config");
+
+        let state = build_initial_launcher_state(
+            &config_path,
+            true,
+            &Err(CheckReadyReason::NoModelsAvailable),
         );
 
         assert!(matches!(

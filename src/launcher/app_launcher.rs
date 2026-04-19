@@ -92,6 +92,7 @@ pub enum CheckReadyReason {
     RuntimeIncomplete {
         backend: String,
     },
+    NoModelsAvailable,
     /// Known model が missing → launcher で download 可。
     ModelMissing {
         filename: String,
@@ -122,6 +123,7 @@ impl std::fmt::Display for CheckReadyReason {
             Self::RuntimeIncomplete { backend } => {
                 write!(f, "runtime/{} is incomplete", backend)
             }
+            Self::NoModelsAvailable => write!(f, "no usable model files found"),
             Self::ModelMissing { filename } => write!(f, "model '{}' not found", filename),
             Self::ModelSizeMismatch {
                 filename,
@@ -190,6 +192,14 @@ pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyRe
         });
     }
 
+    let available_models = crate::backend::find_available_models(&base_dir.to_path_buf())
+        .into_iter()
+        .filter(|candidate| candidate.size > 0)
+        .collect::<Vec<_>>();
+    if available_models.is_empty() {
+        return Err(CheckReadyReason::NoModelsAvailable);
+    }
+
     let filename = config.model.filename().to_string();
     let expected_size = config.model.expected_size();
     let is_known = config.model.is_known();
@@ -206,6 +216,26 @@ pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyRe
             actual_size
         ),
     );
+
+    if actual_size == expected_size && expected_size > 0 {
+        cleanup_model_resume_artifacts(&model_path);
+        diag_file(base_dir, "[check_ready] true (authority model matched)");
+        return Ok(());
+    }
+
+    let has_alternative_model = available_models
+        .iter()
+        .any(|candidate| candidate.filename != filename);
+    if has_alternative_model {
+        diag_file(
+            base_dir,
+            &format!(
+                "[check_ready] authority model unavailable, but {} alternative model(s) exist",
+                available_models.len()
+            ),
+        );
+        return Ok(());
+    }
 
     if actual_size == 0 {
         return if is_known {
