@@ -1,11 +1,5 @@
 use crate::backend::normalize::normalize_display;
 
-fn normalize_observed_model_quirks(text: &str) -> String {
-    text.replace('\u{2019}', "'")
-        .replace("\u{7ab6}\u{51b1}", "'s")
-        .replace("\u{7ab6}\u{ff66}", "...")
-}
-
 fn target_compacts_internal_spaces(tgt_lang: &str) -> bool {
     matches!(tgt_lang, "ja" | "zh" | "zh-CN" | "zh-Hant" | "zh-TW")
 }
@@ -121,20 +115,44 @@ fn fix_extra_spaces(
     )
 }
 
+fn is_zm_marker_start(chars: &[char], start: usize) -> bool {
+    if chars.get(start) != Some(&'Z') {
+        return false;
+    }
+
+    let mut probe = start + 1;
+    while probe < chars.len() && chars[probe].is_ascii_uppercase() && chars[probe] != 'Z' {
+        probe += 1;
+    }
+
+    probe > start + 1 && chars.get(probe) == Some(&'Z')
+}
+
 fn normalize_plus_minus_spacing(text: &str) -> String {
-    let normalized = text.replace('\u{FF0B}', "+").replace('\u{FF0D}', "-");
-    let chars: Vec<char> = normalized.chars().collect();
-    let mut result = String::with_capacity(normalized.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
     let mut index = 0usize;
 
     while index < chars.len() {
         let ch = chars[index];
+        let normalized_sign = match ch {
+            '+' | '\u{FF0B}' => Some('+'),
+            '-' | '\u{FF0D}' => Some('-'),
+            _ => None,
+        };
 
-        if ch == ' ' {
-            let prev = result.chars().next_back();
-            let next = chars.get(index + 1).copied();
-            if matches!(prev, Some('+') | Some('-')) || matches!(next, Some('+') | Some('-')) {
-                index += 1;
+        if let Some(sign) = normalized_sign {
+            let mut probe = index + 1;
+            let mut saw_space = false;
+
+            while probe < chars.len() && chars[probe] == ' ' {
+                saw_space = true;
+                probe += 1;
+            }
+
+            if saw_space && is_zm_marker_start(&chars, probe) {
+                result.push(sign);
+                index = probe;
                 continue;
             }
         }
@@ -164,10 +182,7 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
     }
 
     // Thai: detect " ใน" and break at the leading space
-    if ch == ' '
-        && chars.get(index + 1) == Some(&'ใ')
-        && chars.get(index + 2) == Some(&'น')
-    {
+    if ch == ' ' && chars.get(index + 1) == Some(&'ใ') && chars.get(index + 2) == Some(&'น') {
         return Some(3);
     }
 
@@ -249,7 +264,6 @@ pub fn clean_model_output(
 ) -> String {
     let src = src.trim();
     let mut result = normalize_display(translated);
-    result = normalize_observed_model_quirks(&result);
     result = fix_extra_spaces(src, &result, !target_compacts_internal_spaces(tgt_lang));
     if enable_symbol_cleanup {
         result = normalize_plus_minus_spacing(&result);
@@ -322,52 +336,49 @@ mod tests {
     #[test]
     fn wrap_ignores_min_tail_length() {
         let text = "123456789012345678901234567890. short";
-        assert_eq!(apply_wrap(text, true, 31, 10), "123456789012345678901234567890.\nshort");
+        assert_eq!(
+            apply_wrap(text, true, 31, 10),
+            "123456789012345678901234567890.\nshort"
+        );
     }
 
     #[test]
     fn wrap_splits_thai_at_leading_space_before_nai() {
         let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ใน bbb";
-        assert_eq!(apply_wrap(text, true, 60, 10), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nใน bbb");
+        assert_eq!(
+            apply_wrap(text, true, 60, 10),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nใน bbb"
+        );
     }
 
     #[test]
     fn clean_model_output_normalizes_fullwidth_plus_minus_spacing() {
         assert_eq!(
-            clean_model_output("HP+ATK", "HP ＋ ATK", "en", true),
-            "HP+ATK"
+            clean_model_output("bonus", "\u{FF0B} ZAZ", "en", true),
+            "+ZAZ"
         );
         assert_eq!(
-            clean_model_output("HP-ATK", "HP － ATK", "en", true),
-            "HP-ATK"
+            clean_model_output("bonus", "\u{FF0D} ZAZ", "en", true),
+            "-ZAZ"
         );
     }
 
     #[test]
     fn clean_model_output_can_skip_symbol_cleanup() {
         assert_eq!(
-            clean_model_output("HP+ATK", "HP ＋ ATK", "en", false),
-            "HP + ATK"
+            clean_model_output("bonus", "\u{FF0B} ZAZ", "en", false),
+            "+ ZAZ"
         );
     }
 
     #[test]
-    fn clean_model_output_normalizes_observed_smart_quote() {
+    fn clean_model_output_leaves_regular_plus_minus_spacing_unchanged() {
+        assert_eq!(clean_model_output("+ 10", "+ 10", "en", true), "+ 10");
         assert_eq!(
-            clean_model_output("Others", "Others\u{2019}", "en", true),
-            "Others'"
+            clean_model_output("HP + 10", "HP + 10", "en", true),
+            "HP + 10"
         );
-    }
-
-    #[test]
-    fn clean_model_output_normalizes_observed_mojibake_sequences() {
-        assert_eq!(
-            clean_model_output("today battle", "today\u{7ab6}\u{51b1} battle", "en", true),
-            "today's battle"
-        );
-        assert_eq!(
-            clean_model_output("wait", "wait\u{7ab6}\u{ff66}", "en", true),
-            "wait..."
-        );
+        assert_eq!(clean_model_output("A - B", "A - B", "en", true), "A - B");
+        assert_eq!(clean_model_output("- foo", "- foo", "en", true), "- foo");
     }
 }

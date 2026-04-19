@@ -135,7 +135,11 @@ impl std::fmt::Display for CheckReadyReason {
                 )
             }
             Self::LocalModelMissing { filename } => {
-                write!(f, "local model '{}' not found (download not available)", filename)
+                write!(
+                    f,
+                    "local model '{}' not found (download not available)",
+                    filename
+                )
             }
             Self::LocalModelChanged {
                 filename,
@@ -605,14 +609,22 @@ impl AppLauncher {
             &format!(
                 "[ensure_model] filename={} kind={} exists={} expected_size={} complete={}",
                 filename,
-                if self.config.model.is_known() { "Known" } else { "Local" },
+                if self.config.model.is_known() {
+                    "Known"
+                } else {
+                    "Local"
+                },
                 model_path.exists(),
                 expected,
                 complete
             ),
         );
         if complete {
-            diag(progress_tx, &self.base_dir, "[ensure_model] → reuse existing model");
+            diag(
+                progress_tx,
+                &self.base_dir,
+                "[ensure_model] → reuse existing model",
+            );
             return Ok(model_path);
         }
 
@@ -621,7 +633,10 @@ impl AppLauncher {
             diag(
                 progress_tx,
                 &self.base_dir,
-                &format!("[ensure_model] Local model missing, cannot download: {}", filename),
+                &format!(
+                    "[ensure_model] Local model missing, cannot download: {}",
+                    filename
+                ),
             );
             anyhow::bail!(
                 "Local model '{}' not found in models/. \

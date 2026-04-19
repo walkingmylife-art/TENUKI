@@ -139,9 +139,7 @@ impl ModelConfig {
 
     pub fn expected_size(&self) -> u64 {
         match self {
-            Self::Known { expected_size, .. } | Self::Local { expected_size, .. } => {
-                *expected_size
-            }
+            Self::Known { expected_size, .. } | Self::Local { expected_size, .. } => *expected_size,
         }
     }
 
@@ -288,8 +286,12 @@ impl AppConfig {
         // Step 2: old struct format (urls: UrlPair, no `kind` field)
         if let Ok(legacy) = toml::from_str::<LegacyAppConfigV2>(&content) {
             log::info!("Migrating config from legacy struct format (no kind field)");
-            let model =
-                migrate_legacy_model(legacy.model.filename, legacy.model.urls.primary, legacy.model.expected_size, path)?;
+            let model = migrate_legacy_model(
+                legacy.model.filename,
+                legacy.model.urls.primary,
+                legacy.model.expected_size,
+                path,
+            )?;
             let mut config = AppConfig {
                 backend: legacy.backend,
                 server: legacy.server,
@@ -306,8 +308,12 @@ impl AppConfig {
         // Step 3: oldest single-url format
         if let Ok(legacy) = toml::from_str::<LegacyAppConfig>(&content) {
             log::info!("Migrating config from legacy single-URL format");
-            let model =
-                migrate_legacy_model(legacy.model.filename, legacy.model.url, legacy.model.expected_size, path)?;
+            let model = migrate_legacy_model(
+                legacy.model.filename,
+                legacy.model.url,
+                legacy.model.expected_size,
+                path,
+            )?;
             let mut config = AppConfig {
                 backend: legacy.backend,
                 server: legacy.server,
@@ -365,9 +371,11 @@ impl AppConfig {
                     )
                 })?;
                 let needs_repair = match &self.model {
-                    ModelConfig::Known { urls, expected_size, .. } => {
-                        urls.primary != known.url || *expected_size != known.expected_size
-                    }
+                    ModelConfig::Known {
+                        urls,
+                        expected_size,
+                        ..
+                    } => urls.primary != known.url || *expected_size != known.expected_size,
                     _ => unreachable!(),
                 };
                 if needs_repair {
@@ -386,7 +394,10 @@ impl AppConfig {
                     self.save(path)?;
                 }
             }
-            ModelConfig::Local { filename, expected_size } => {
+            ModelConfig::Local {
+                filename,
+                expected_size,
+            } => {
                 let (filename, expected_size) = (filename.clone(), *expected_size);
                 if filename.is_empty() {
                     anyhow::bail!("model.filename is empty (Local) in {}", path.display());
@@ -513,8 +524,10 @@ mod tests {
         let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
 
         assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
-        assert!(matches!(&loaded.model, ModelConfig::Known { urls, expected_size, .. }
-            if urls.primary == known.url && *expected_size == known.expected_size));
+        assert!(
+            matches!(&loaded.model, ModelConfig::Known { urls, expected_size, .. }
+            if urls.primary == known.url && *expected_size == known.expected_size)
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -533,7 +546,9 @@ mod tests {
         let loaded = AppConfig::load(&path).unwrap();
         assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
         let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
-        assert!(matches!(&loaded.model, ModelConfig::Known { urls, .. } if urls.primary == known.url));
+        assert!(
+            matches!(&loaded.model, ModelConfig::Known { urls, .. } if urls.primary == known.url)
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -552,7 +567,10 @@ mod tests {
         cfg.save(&path).unwrap();
 
         let result = AppConfig::load(&path);
-        assert!(result.is_err(), "kind=Known with unknown filename must fail");
+        assert!(
+            result.is_err(),
+            "kind=Known with unknown filename must fail"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -570,9 +588,15 @@ mod tests {
         cfg.save(&path).unwrap();
 
         let result = AppConfig::load(&path);
-        assert!(result.is_ok(), "Local model with valid size should load: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Local model with valid size should load: {:?}",
+            result
+        );
         let loaded = result.unwrap();
-        assert!(matches!(&loaded.model, ModelConfig::Local { filename, .. } if filename == "my-custom-model.gguf"));
+        assert!(
+            matches!(&loaded.model, ModelConfig::Local { filename, .. } if filename == "my-custom-model.gguf")
+        );
         assert!(!loaded.model.is_known());
 
         let _ = fs::remove_file(&path);
@@ -589,7 +613,10 @@ mod tests {
         cfg.save(&path).unwrap();
 
         let result = AppConfig::load(&path);
-        assert!(result.is_err(), "Local model with expected_size=0 must fail");
+        assert!(
+            result.is_err(),
+            "Local model with expected_size=0 must fail"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -654,7 +681,10 @@ primary = "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1
 "#;
         fs::write(&path, toml).unwrap();
         let result = AppConfig::load(&path);
-        assert!(result.is_err(), "unknown filename + known URL must fail during migration");
+        assert!(
+            result.is_err(),
+            "unknown filename + known URL must fail during migration"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -684,7 +714,11 @@ primary = "https://example.com/custom.gguf"
 "#;
         fs::write(&path, toml).unwrap();
         let result = AppConfig::load(&path);
-        assert!(result.is_ok(), "unknown filename + unknown url + size>0 should migrate to Local: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "unknown filename + unknown url + size>0 should migrate to Local: {:?}",
+            result
+        );
         let loaded = result.unwrap();
         assert!(!loaded.model.is_known(), "migrated model must be Local");
         assert_eq!(loaded.model.filename(), "my-custom-model.gguf");

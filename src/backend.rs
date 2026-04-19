@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::launcher::app_config::{known_model_tuple, AppConfig};
-use crate::messages::{BackendEvent, FrontendCommand, ModelCandidate, ModelCandidateKind, ProcessType};
+use crate::messages::{
+    BackendEvent, FrontendCommand, ModelCandidate, ModelCandidateKind, ProcessType,
+};
 use manager::{ProcessManager, RestartScope};
 
 /// launcher_config.toml の model.filename が権威。
@@ -204,7 +206,10 @@ pub fn start_backend(
                             Err(e) => {
                                 let _ = event_tx.send(BackendEvent::Log(
                                     crate::messages::LogSource::Tenuki,
-                                    format!("CommitModelSelection: load launcher_config failed: {}", e),
+                                    format!(
+                                        "CommitModelSelection: load launcher_config failed: {}",
+                                        e
+                                    ),
                                     crate::messages::LogLevel::Error,
                                     crate::messages::current_timestamp(),
                                 ));

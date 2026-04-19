@@ -1,4 +1,4 @@
-//! 翻訳HTTPサーバーモジュール - 非同期版 (axum + tokio)
+//! Translation HTTP server module (axum + tokio)
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -34,7 +34,7 @@ static OBSERVED_MARKER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"Z[A-Z]+Z").expect("marker regex"));
 
 // ============================================================
-// リクエスト型
+// Request types
 // ============================================================
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,7 +49,7 @@ pub struct ListRequest {
 }
 
 // ============================================================
-// アプリケーション状態
+// Application state
 // ============================================================
 
 #[derive(Clone)]
@@ -63,17 +63,10 @@ pub struct AppState {
     pub translation_settings: TranslationSettings,
     pub llm_client: Arc<dyn translator::LlmClient>,
     pub event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
-    /*
-        /// LLM 生成結果のセッションキャッシュ（揮発・言語変更時にリセット）
-        pub t_cache: Arc<TranslationCache>,
-        /// シャットダウン時に TXT へ書き込む新規エントリ
-        pub n_cache: Arc<NewEntriesCache>,
-        pub input_replay: SharedInputReplayState,
-        pub llm_slots: usize,
-        /// パターン辞書（数値バリエーション対応）
-    }
-
-        */
+    // Session cache of translated results.
+    // New dictionary entries waiting for shutdown flush.
+    // Replay state used by input analysis.
+    // Number of LLM slots available to batch translation.
     pub t_cache: Arc<TranslationCache>,
     pub n_cache: Arc<NewEntriesCache>,
     pub input_replay: SharedInputReplayState,
@@ -219,7 +212,7 @@ struct BatchTranslationOutput {
 fn preview_text(text: &str) -> String {
     const LIMIT: usize = 80;
 
-    let normalized = text.replace("\r", "").replace("\n", " ↩ ");
+    let normalized = text.replace("\r", "").replace("\n", " [nl] ");
     let mut preview = String::new();
 
     for (index, ch) in normalized.chars().enumerate() {
@@ -269,10 +262,6 @@ fn emit_batch_diagnostics(state: &AppState, route: &str, batch: &BatchTranslatio
 
 fn preview_body(text: &str) -> String {
     preview_text(text)
-}
-
-fn contains_placeholder_token(text: &str) -> bool {
-    text.contains('◆')
 }
 
 fn build_translate_request_record(
@@ -431,20 +420,10 @@ fn extract_translate_post_text(content_type: Option<&str>, body: &[u8]) -> Optio
     Some(body_text)
 }
 
-fn source_text_for_translation<'a>(text: &'a str) -> &'a str {
-    if let Some(sep) = analysis::find_unescaped_assignment_separator(text) {
-        &text[..sep]
-    } else {
-        text
-    }
-}
-
 fn translate_texts_batch(
     dictionary: Arc<RwLock<Dictionary>>,
-    processor: Arc<dyn TextProcessor>,
     llm_client: Arc<dyn translator::LlmClient>,
     t_cache: Arc<TranslationCache>,
-    n_cache: Arc<NewEntriesCache>,
     event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
     prefix: String,
     llm_slots: usize,
@@ -454,11 +433,8 @@ fn translate_texts_batch(
 ) -> BatchTranslationOutput {
     fn translate_one_text(
         dictionary: &Arc<RwLock<Dictionary>>,
-        _processor: &Arc<dyn TextProcessor>,
         llm_client: &Arc<dyn translator::LlmClient>,
         t_cache: &Arc<TranslationCache>,
-        n_cache: &Arc<NewEntriesCache>,
-        event_tx: &tokio::sync::mpsc::Sender<BackendEvent>,
         prefix: &str,
         tgt_lang: &str,
         settings: TranslationSettings,
@@ -470,10 +446,9 @@ fn translate_texts_batch(
                 .map(|value| value.clone())
                 .or_else(|| dictionary.blocking_read().lookup(key))
         };
-        let source = source_text_for_translation(text);
 
-        let mut result = translator::translate_chunk(
-            source,
+        let result = translator::translate_chunk(
+            text,
             lookup,
             prefix,
             tgt_lang,
@@ -481,27 +456,6 @@ fn translate_texts_batch(
             settings,
         );
 
-        let registration_entries = if result.new_entries.iter().any(|(key, value)| {
-            contains_placeholder_token(key) || contains_placeholder_token(value)
-        }) {
-            vec![(text.to_string(), result.text.clone())]
-        } else {
-            result.new_entries.clone()
-        };
-        result.new_entries = registration_entries.clone();
-
-        for (key, value) in &registration_entries {
-            t_cache.insert(key.clone(), value.clone());
-            n_cache.insert(key.clone(), value.clone());
-            let (display_original, display_translated) =
-                dictionary_log_display_pair(key, value, &result.logs);
-            let _ = event_tx.try_send(BackendEvent::DictionaryLogEntry(
-                crate::messages::current_timestamp(),
-                display_original,
-                display_translated,
-            ));
-        }
-        // パターン辞書の新規エントリを登録
         let diagnostics = ItemDiagnostics {
             raw_text: text.to_string(),
             input_preview: preview_text(text),
@@ -511,6 +465,21 @@ fn translate_texts_batch(
         };
 
         (result, diagnostics)
+    }
+
+    fn emit_new_entries(
+        result: &TranslationResult,
+        event_tx: &tokio::sync::mpsc::Sender<BackendEvent>,
+    ) {
+        for (key, value) in &result.new_entries {
+            let (display_key, display_value) =
+                dictionary_log_display_pair(key, value, &result.logs);
+            let _ = event_tx.try_send(BackendEvent::DictionaryLogEntry(
+                crate::messages::current_timestamp(),
+                display_key,
+                display_value,
+            ));
+        }
     }
 
     let mut output = BatchTranslationOutput::default();
@@ -525,17 +494,15 @@ fn translate_texts_batch(
         for text in texts {
             let (result, diagnostics) = translate_one_text(
                 &dictionary,
-                &processor,
                 &llm_client,
                 &t_cache,
-                &n_cache,
-                &event_tx,
                 &prefix,
                 &tgt_lang,
                 settings,
                 &text,
             );
 
+            emit_new_entries(&result, &event_tx);
             output.logs.extend(result.logs.clone());
             output.new_entries.extend(result.new_entries.clone());
             output.stats.merge(&result.stats);
@@ -560,11 +527,8 @@ fn translate_texts_batch(
             let jobs = Arc::clone(&jobs);
             let results = Arc::clone(&results);
             let dictionary = Arc::clone(&dictionary);
-            let processor = Arc::clone(&processor);
             let llm_client = Arc::clone(&llm_client);
             let t_cache = Arc::clone(&t_cache);
-            let n_cache = Arc::clone(&n_cache);
-            let event_tx = event_tx.clone();
             let prefix = prefix.clone();
             let tgt_lang = tgt_lang.clone();
             let settings = settings;
@@ -582,11 +546,8 @@ fn translate_texts_batch(
 
                 let result = translate_one_text(
                     &dictionary,
-                    &processor,
                     &llm_client,
                     &t_cache,
-                    &n_cache,
-                    &event_tx,
                     &prefix,
                     &tgt_lang,
                     settings,
@@ -601,6 +562,7 @@ fn translate_texts_batch(
 
     let results = results.lock().expect("results mutex poisoned");
     for (result, diagnostics) in results.iter().flatten() {
+        emit_new_entries(result, &event_tx);
         output.logs.extend(result.logs.clone());
         output.new_entries.extend(result.new_entries.clone());
         output.stats.merge(&result.stats);
@@ -611,9 +573,19 @@ fn translate_texts_batch(
     output
 }
 
+fn commit_new_entries(
+    t_cache: &TranslationCache,
+    n_cache: &NewEntriesCache,
+    entries: &[(String, String)],
+) {
+    for (key, value) in entries {
+        t_cache.insert(key.clone(), value.clone());
+        n_cache.insert(key.clone(), value.clone());
+    }
+}
+
 // ============================================================
-// 翻訳処理（単一テキスト）
-// ============================================================
+// Translation entry point for a single text
 
 async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
     if text.is_empty() {
@@ -622,26 +594,28 @@ async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
 
     let text = text.replace("\r\n", "\n");
     let prefix = state.current_prefix().await;
-    let processor = state.processor.clone();
     let llm_client = state.llm_client.clone();
     let dictionary = state.dictionary.clone();
     let t_cache = state.t_cache.clone();
-    let n_cache = state.n_cache.clone();
     let event_tx = state.event_tx.clone();
     let llm_slots = state.llm_slots;
     let tgt_lang = state.tgt_lang.read().await.clone();
     let settings = state.translation_settings;
 
-    let lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    let texts = vec![text.clone()];
     let batch = tokio::task::spawn_blocking(move || {
         translate_texts_batch(
-            dictionary, processor, llm_client, t_cache, n_cache, event_tx, prefix, llm_slots,
-            tgt_lang, settings, lines,
+            dictionary, llm_client, t_cache, event_tx, prefix, llm_slots, tgt_lang, settings, texts,
         )
     })
     .await
     .unwrap();
 
+    commit_new_entries(
+        state.t_cache.as_ref(),
+        state.n_cache.as_ref(),
+        &batch.new_entries,
+    );
     for log in &batch.logs {
         state.emit_log(log);
     }
@@ -668,9 +642,9 @@ async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
         .try_send(BackendEvent::InputAnalysisUpdated(snapshot));
     translated_text.into_response()
 }
-
 // ============================================================
-// ハンドラ
+// Handlers
+// ============================================================
 // ============================================================
 
 async fn health_handler() -> &'static str {
@@ -743,11 +717,9 @@ async fn list_handler(
     state.emit_request_log(build_list_request_record(&request));
 
     let prefix = state.current_prefix().await;
-    let processor = state.processor.clone();
     let llm_client = state.llm_client.clone();
     let dictionary = state.dictionary.clone();
     let t_cache = state.t_cache.clone();
-    let n_cache = state.n_cache.clone();
     let event_tx = state.event_tx.clone();
     let llm_slots = state.llm_slots;
     let tgt_lang = state.tgt_lang.read().await.clone();
@@ -756,13 +728,17 @@ async fn list_handler(
     let raw_text = texts.join("\n");
     let batch = tokio::task::spawn_blocking(move || {
         translate_texts_batch(
-            dictionary, processor, llm_client, t_cache, n_cache, event_tx, prefix, llm_slots,
-            tgt_lang, settings, texts,
+            dictionary, llm_client, t_cache, event_tx, prefix, llm_slots, tgt_lang, settings, texts,
         )
     })
     .await
     .unwrap();
 
+    commit_new_entries(
+        state.t_cache.as_ref(),
+        state.n_cache.as_ref(),
+        &batch.new_entries,
+    );
     for log in &batch.logs {
         state.emit_log(log);
     }
@@ -794,7 +770,7 @@ async fn list_handler(
 }
 
 async fn shutdown_handler(State(state): State<Arc<AppState>>) -> &'static str {
-    // n_cache → dict.register → flush_buffer（TXT 追記 + BIN 再生成）
+    // n_cache -> dict.register -> flush_buffer
     if !state.n_cache.is_empty() {
         let entries = state.n_cache.drain();
         let mut dict = state.dictionary.write().await;
@@ -822,10 +798,8 @@ async fn shutdown_handler(State(state): State<Arc<AppState>>) -> &'static str {
 }
 
 // ============================================================
-// サーバー起動
-// 【修正】内部で tokio::spawn しない。呼び出し側が spawn を管理する。
-//         これにより manager.rs 側が JoinHandle を正しく保持でき、
-//         shutdown シグナルとタスク追跡が確実に機能する。
+// Server startup
+// Caller owns task spawning and shutdown coordination.
 // ============================================================
 
 pub async fn run_translation_server(
@@ -883,12 +857,12 @@ pub async fn run_translation_server(
 
     let _ = event_tx.try_send(BackendEvent::Log(
         LogSource::Tenuki,
-        format!("翻訳サーバー バインド開始: {}:{}", host, port),
+        format!("Translation server binding: {}:{}", host, port),
         LogLevel::Info,
         crate::messages::current_timestamp(),
     ));
 
-    // バインドリトライ（AddrInUse / os error 10048 の両方を捕捉）
+    // Retry bind for AddrInUse / os error 10048.
     let max_retries: u32 = 10;
     let mut retries = max_retries;
     let listener = loop {
@@ -903,7 +877,7 @@ pub async fn run_translation_server(
                 let _ = event_tx.try_send(BackendEvent::Log(
                     LogSource::Tenuki,
                     format!(
-                        "翻訳サーバー バインド待機中 ({}:{}, 残り{}回): {}",
+                        "Translation server waiting to bind ({}:{}, retries left {}): {}",
                         host, port, retries, e
                     ),
                     LogLevel::Error,
@@ -914,7 +888,7 @@ pub async fn run_translation_server(
             }
             Err(e) => {
                 let _ = startup_tx.send(Err(format!(
-                    "Failed to bind translation server: {}:{} (試行{}/{}回後): {}",
+                    "Failed to bind translation server: {}:{} (attempt {}/{}): {}",
                     host,
                     port,
                     max_retries - retries,
@@ -935,10 +909,10 @@ pub async fn run_translation_server(
         LogLevel::Info,
         crate::messages::current_timestamp(),
     ));
-
+    // Serve with graceful shutdown.
     let _ = startup_tx.send(Ok(()));
 
-    // グレースフルシャットダウン付きで serve
+    // Serve with graceful shutdown.
     let _ = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
@@ -957,10 +931,66 @@ pub async fn run_translation_server(
 mod tests {
     use super::{
         build_list_request_record, build_list_response_record, build_observation_record,
-        build_translate_request_record, build_translate_response_record, contains_observed_markup,
-        extract_translate_post_text, ListRequest,
+        build_translate_request_record, build_translate_response_record, commit_new_entries,
+        contains_observed_markup, extract_translate_post_text, translate_texts_batch, ListRequest,
     };
     use crate::backend::analysis::find_unescaped_assignment_separator;
+    use crate::backend::dictionary::Dictionary;
+    use crate::backend::translator::{
+        self, NewEntriesCache, TranslationCache, TranslationSettings,
+    };
+    use crate::messages::BackendEvent;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::RwLock;
+
+    #[derive(Default)]
+    struct MockLlmClient {
+        calls: Mutex<Vec<String>>,
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl MockLlmClient {
+        fn with_responses(values: &[&str]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(values.iter().map(|v| v.to_string()).collect()),
+            }
+        }
+    }
+
+    impl translator::LlmClient for MockLlmClient {
+        fn translate_sync(&self, text: &str, _prefix: &str) -> Option<String> {
+            self.calls.lock().unwrap().push(text.to_string());
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                None
+            } else {
+                Some(responses.remove(0))
+            }
+        }
+    }
+
+    fn test_settings() -> TranslationSettings {
+        TranslationSettings {
+            enable_model_wrap: true,
+            model_wrap_min_chars: 60,
+            model_wrap_min_tail_chars: 10,
+            enable_model_symbol_cleanup: true,
+        }
+    }
+
+    fn test_dictionary_dir(tag: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tenuki_server_test_{}_{}", tag, unique));
+        std::fs::create_dir_all(dir.join("txt_root")).unwrap();
+        dir
+    }
 
     #[test]
     fn extracts_text_from_form_body() {
@@ -991,25 +1021,25 @@ mod tests {
 
     #[test]
     fn finds_first_unescaped_assignment_separator() {
-        let text = r#"[世界6.12.24]传闻八卦门北方袭击了丐帮<color\=#2779FA>凶邪</color>晏弃特，血战一场最终得胜而归。=[他人6.12.24]broken target"#;
+        let text = r#"[World6.12.24]Rumor says the guild attacked <color\=#2779FA>target</color>.=[Other6.12.24]broken target"#;
         let index = find_unescaped_assignment_separator(text).unwrap();
 
         assert_eq!(
             &text[..index],
-            r#"[世界6.12.24]传闻八卦门北方袭击了丐帮<color\=#2779FA>凶邪</color>晏弃特，血战一场最终得胜而归。"#
+            r#"[World6.12.24]Rumor says the guild attacked <color\=#2779FA>target</color>."#
         );
-        assert_eq!(&text[index + 1..], "[他人6.12.24]broken target");
+        assert_eq!(&text[index + 1..], "[Other6.12.24]broken target");
     }
 
     #[test]
     fn returns_none_without_assignment_separator() {
-        let text = r#"[世界6.12.24]传闻八卦门北方袭击了丐帮<color\=#2779FA>凶邪</color>晏弃特，血战一场最终得胜而归。"#;
+        let text = r#"[World6.12.24]Rumor says the guild attacked <color\=#2779FA>target</color>."#;
         assert_eq!(find_unescaped_assignment_separator(text), None);
     }
 
     #[test]
     fn returns_none_for_operator_style_ui_text() {
-        let text = ">>=移動距離";
+        let text = ">>=Move Distance";
         assert_eq!(find_unescaped_assignment_separator(text), None);
     }
 
@@ -1022,7 +1052,7 @@ mod tests {
     #[test]
     fn detects_tag_or_marker_lines_for_observation() {
         assert!(contains_observed_markup("<b>Attack+150%</b>"));
-        assert!(contains_observed_markup("经脉ZMDZ"));
+        assert!(contains_observed_markup("marker ZMDZ"));
         assert!(!contains_observed_markup("plain text only"));
     }
 
@@ -1135,5 +1165,57 @@ mod tests {
         assert_eq!(json["response_text"], "one\ntwo");
         assert_eq!(json["item_count"], 2);
         assert_eq!(json["line_count"], 2);
+    }
+
+    #[test]
+    fn batch_keeps_translator_new_entries_until_commit_ascii() {
+        let dict_dir = test_dictionary_dir("batch_commit_ascii");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("dict.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+
+        let llm_client: Arc<dyn translator::LlmClient> =
+            Arc::new(MockLlmClient::with_responses(&["*1  #2"]));
+        let t_cache = Arc::new(TranslationCache::default());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        let batch = translate_texts_batch(
+            dictionary,
+            llm_client,
+            Arc::clone(&t_cache),
+            event_tx,
+            "prefix".to_string(),
+            1,
+            "en".to_string(),
+            test_settings(),
+            vec!["*ZMCZ  #ZMDZ".to_string()],
+        );
+
+        assert_eq!(
+            batch.new_entries,
+            vec![("*ZMCZ  #ZMDZ".to_string(), "*ZMCZ  #ZMDZ".to_string())]
+        );
+        assert!(t_cache.get("*ZMCZ  #ZMDZ").is_none());
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
+    #[test]
+    fn commit_keeps_translator_key_in_both_caches_ascii() {
+        let t_cache = TranslationCache::default();
+        let n_cache = NewEntriesCache::default();
+        let entries = vec![("*ZMCZ  #ZMDZ".to_string(), "*ZMCZ  #ZMDZ".to_string())];
+
+        commit_new_entries(&t_cache, &n_cache, &entries);
+
+        assert_eq!(
+            t_cache.get("*ZMCZ  #ZMDZ").map(|value| value.clone()),
+            Some("*ZMCZ  #ZMDZ".to_string())
+        );
+        assert_eq!(n_cache.drain(), entries);
     }
 }

@@ -12,17 +12,17 @@ pub use lang::build_lang_prefix;
 
 use std::time::Duration;
 
-const SEPARATOR_CHARS: [char; 4] = [':', '：', ';', '；'];
+const SEPARATOR_CHARS: [char; 4] = [':', '\u{FF1A}', ';', '\u{FF1B}'];
 const BRACKET_PAIRS: &[(char, char)] = &[
     ('(', ')'),
     ('[', ']'),
     ('{', '}'),
-    ('（', '）'),
-    ('［', '］'),
-    ('｛', '｝'),
-    ('〈', '〉'),
-    ('《', '》'),
-    ('【', '】'),
+    ('\u{FF08}', '\u{FF09}'),
+    ('\u{FF3B}', '\u{FF3D}'),
+    ('\u{FF5B}', '\u{FF5D}'),
+    ('\u{3008}', '\u{3009}'),
+    ('\u{300A}', '\u{300B}'),
+    ('\u{3010}', '\u{3011}'),
 ];
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,255 @@ pub enum LogEvent {
     Error {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockLlmClient {
+        calls: Mutex<Vec<String>>,
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl MockLlmClient {
+        fn with_responses(values: &[&str]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(values.iter().map(|v| v.to_string()).collect()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl LlmClient for MockLlmClient {
+        fn translate_sync(&self, text: &str, _prefix: &str) -> Option<String> {
+            self.calls.lock().unwrap().push(text.to_string());
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                None
+            } else {
+                Some(responses.remove(0))
+            }
+        }
+    }
+
+    fn test_settings() -> TranslationSettings {
+        TranslationSettings {
+            enable_model_wrap: true,
+            model_wrap_min_chars: 60,
+            model_wrap_min_tail_chars: 10,
+            enable_model_symbol_cleanup: true,
+        }
+    }
+
+    fn mapping(pairs: &[(&str, &str)]) -> ZmNumberMapping {
+        ZmNumberMapping {
+            sent_text: String::new(),
+            replacements: pairs
+                .iter()
+                .map(|(n, m)| (n.to_string(), m.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fragment_authority_keeps_source_fragment_as_key() {
+        let authority = establish_fragment_authority("Alpha\nBeta");
+
+        assert_eq!(authority.key, "Alpha\nBeta");
+        assert_eq!(authority.source_fragment, "Alpha\nBeta");
+        assert_eq!(
+            prepare_model_transport_text(&authority.source_fragment),
+            "Alpha\nBeta"
+        );
+    }
+
+    #[test]
+    fn transport_preserves_existing_line_breaks() {
+        assert_eq!(prepare_model_transport_text("A\r\n\r\nB"), "A\r\n\r\nB");
+        assert_eq!(prepare_model_transport_text("A\n\nB"), "A\n\nB");
+    }
+
+    #[test]
+    fn restore_does_not_match_digit_prefix() {
+        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
+        assert_eq!(restore_zm_number_tokens("1 10", &m), "ZAZ ZBZ");
+    }
+
+    #[test]
+    fn restore_preserves_spaces_as_is() {
+        let m = mapping(&[("1", "ZAZ")]);
+        assert_eq!(restore_zm_number_tokens("foo 1 bar", &m), "foo ZAZ bar");
+        assert_eq!(restore_zm_number_tokens("foo  1  bar", &m), "foo  ZAZ  bar");
+        assert_eq!(restore_zm_number_tokens("foo1bar", &m), "fooZAZbar");
+    }
+
+    #[test]
+    fn restore_passes_through_unmatched_token() {
+        let m = mapping(&[("1", "ZAZ")]);
+        assert_eq!(
+            restore_zm_number_tokens("no numbers here", &m),
+            "no numbers here"
+        );
+        assert_eq!(restore_zm_number_tokens("value is 99", &m), "value is 99");
+    }
+
+    #[test]
+    fn restore_adjacent_tokens_preserve_spaces() {
+        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
+        assert_eq!(restore_zm_number_tokens("1 10", &m), "ZAZ ZBZ");
+        assert_eq!(restore_zm_number_tokens("1  10", &m), "ZAZ  ZBZ");
+        assert_eq!(restore_zm_number_tokens("1  10  1", &m), "ZAZ  ZBZ  1");
+    }
+
+    #[test]
+    fn restore_preserves_cjk_spaces() {
+        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
+        assert_eq!(
+            restore_zm_number_tokens("1\u{3000}10\u{3000}1", &m),
+            "ZAZ\u{3000}ZBZ\u{3000}1"
+        );
+    }
+
+    #[test]
+    fn restore_does_not_split_concatenated_digits() {
+        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
+        assert_eq!(restore_zm_number_tokens("110", &m), "110");
+    }
+
+    #[test]
+    fn split_fragments_are_sent_as_is() {
+        let llm = MockLlmClient::with_responses(&["Later", "Cycle"]);
+        let result = translate_chunk("Next;Turn", |_| None, "prefix", "en", &llm, test_settings());
+
+        assert_eq!(llm.calls(), vec!["Next", "Turn"]);
+        assert_eq!(result.text, "Later;Cycle");
+        assert_eq!(
+            result.new_entries,
+            vec![
+                ("Next".to_string(), "Later".to_string()),
+                ("Turn".to_string(), "Cycle".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bracket_only_reprocesses_inner_text() {
+        let llm = MockLlmClient::with_responses(&["Quest"]);
+        let result = translate_chunk(
+            "(Start;Next)",
+            |key| (key == "Start").then(|| "Begin".to_string()),
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
+        );
+
+        assert_eq!(llm.calls(), vec!["Next"]);
+        assert_eq!(result.text, "(Begin;Quest)");
+        assert_eq!(
+            result.new_entries,
+            vec![("Next".to_string(), "Quest".to_string())]
+        );
+    }
+
+    #[test]
+    fn non_whitespace_outside_bracket_stays_single_fragment() {
+        let llm = MockLlmClient::with_responses(&["Translated"]);
+        let result = translate_chunk(
+            "#(Start;Next)ZMCZ",
+            |_| None,
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
+        );
+
+        assert_eq!(llm.calls(), vec!["#(Start;Next)1"]);
+        assert_eq!(result.text, "Translated");
+        assert_eq!(
+            result.new_entries,
+            vec![("#(Start;Next)ZMCZ".to_string(), "Translated".to_string())]
+        );
+    }
+
+    #[test]
+    fn mixed_bracket_segment_passes_as_single_fragment() {
+        let llm = MockLlmClient::with_responses(&["Translated"]);
+        let result = translate_chunk(
+            "foo(Start;Next)bar",
+            |_| None,
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
+        );
+
+        assert_eq!(llm.calls(), vec!["foo(Start;Next)bar"]);
+        assert_eq!(result.text, "Translated");
+        assert_eq!(
+            result.new_entries,
+            vec![("foo(Start;Next)bar".to_string(), "Translated".to_string())]
+        );
+    }
+
+    #[test]
+    fn zm_symbol_only_fragment_uses_raw_authority_key() {
+        let llm = MockLlmClient::with_responses(&[]);
+        let result = translate_chunk(
+            "*ZMCZ  #ZMDZ",
+            |key| (key == "*ZMCZ  #ZMDZ").then(|| "joined".to_string()),
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
+        );
+
+        assert!(llm.calls().is_empty());
+        assert_eq!(result.text, "joined");
+    }
+
+    #[test]
+    fn zm_fragment_with_letters_stays_raw_for_lookup() {
+        let llm = MockLlmClient::with_responses(&[]);
+        let result = translate_chunk(
+            "HP ZMEZ",
+            |key| (key == "HP ZMEZ").then(|| "HP ZMEZ translated".to_string()),
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
+        );
+
+        assert!(llm.calls().is_empty());
+        assert_eq!(result.text, "HP ZMEZ translated");
+    }
+
+    #[test]
+    fn zm_lookup_miss_restores_surface_before_model_transport() {
+        let llm = MockLlmClient::with_responses(&["*1  #2"]);
+        let result = translate_chunk(
+            "*ZMCZ  #ZMDZ",
+            |_| None,
+            "prefix",
+            "en",
+            &llm,
+            test_settings(),
+        );
+
+        assert_eq!(llm.calls(), vec!["*1  #2"]);
+        assert_eq!(result.text, "*ZMCZ  #ZMDZ");
+        assert_eq!(
+            result.new_entries,
+            vec![("*ZMCZ  #ZMDZ".to_string(), "*ZMCZ  #ZMDZ".to_string())]
+        );
+    }
 }
 
 impl LogEvent {
@@ -212,11 +461,8 @@ struct LinePlan {
 // ---------------------------------------------------------------------------
 // ZM-number substitution
 //
-// ZM マーカー（例: ZABZ）を数字に置き換えてモデルに送り、
-// モデル出力から数字を元のマーカーに戻す。
-// スペースは一切操作しない。sent_text に含まれるスペースは
-// そのままモデルに渡り、復元時もそのまま通過する。
-// ---------------------------------------------------------------------------
+// ZM markers are converted to temporary numbers only for model transport.
+// Lookup/register keys stay separate from the transport surface form.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZmNumberMapping {
@@ -224,8 +470,21 @@ struct ZmNumberMapping {
     replacements: Vec<(String, String)>, // (number, original_marker)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FragmentAuthority {
+    key: String,
+    source_fragment: String,
+}
+
 fn is_zm_inner_char(ch: char) -> bool {
     ch.is_ascii_uppercase() && ch != 'Z'
+}
+
+fn establish_fragment_authority(fragment: &str) -> FragmentAuthority {
+    FragmentAuthority {
+        key: fragment.to_string(),
+        source_fragment: fragment.to_string(),
+    }
 }
 
 fn collect_existing_number_tokens(text: &str) -> rustc_hash::FxHashSet<String> {
@@ -248,8 +507,6 @@ fn collect_existing_number_tokens(text: &str) -> rustc_hash::FxHashSet<String> {
     numbers
 }
 
-/// ZM マーカーを数字に置き換えた sent_text とマッピングを返す。
-/// スペースは操作しない。マーカーの位置だけを数字で置換する。
 fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut output = String::with_capacity(text.len());
@@ -275,7 +532,7 @@ fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
             let end = chars.get(probe + 1).map_or(text.len(), |&(i, _)| i);
             let prev_char = (start > 0).then(|| text[..start].chars().last()).flatten();
 
-            // ±ZMZ 形式の算術式はスキップ
+            // 鬯ｩ蟷｢・ｽ・｢髫ｴ雜｣・ｽ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｻ鬯ｩ蟷｢・ｽ・｢郢晢ｽｻ繝ｻ・ｧ鬮ｫ・ｰ郢晢ｽｻ遶乗ｧｭ繝ｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｽ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｽ鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｱZMZ 鬯ｯ・ｯ繝ｻ・ｮ郢晢ｽｻ繝ｻ・ｯ鬮ｮ荵昴・繝ｻ・ｽ繝ｻ・ｷ鬯ｩ蜍淞・ｪ郢晢ｽｻ驛｢譎｢・ｽ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｽ鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・｢鬯ｯ・ｯ繝ｻ・ｮ郢晢ｽｻ繝ｻ・ｯ鬮ｮ荵昴・繝ｻ・ｽ繝ｻ・ｷ鬮ｯ貅ｷ・ｮ闌ｨ・ｽ・ｿ繝ｻ・ｫ驛｢譎｢・ｽ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｸ鬯ｯ・ｩ隲､諞ｺ笳冗ｹ晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｫ鬯ｩ蟷｢・ｽ・｢髫ｴ雜｣・ｽ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｻ鬯ｯ・ｯ繝ｻ・ｯ郢晢ｽｻ繝ｻ・ｩ鬯ｯ・ｮ繝ｻ・ｦ郢晢ｽｻ繝ｻ・ｪ驛｢譎｢・ｽ・ｻ鬯ｯ莨懌・繝ｻ・ｽ繝ｻ・ｬ鬯ｮ・｢・つ鬨ｾ蠅難ｽｺ・ｽ繝ｻ・ｹ隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・｡鬯ｯ・ｮ繝ｻ・ｴ鬯ｮ・ｮ繝ｻ・｣郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・｣鬯ｮ・ｯ陷ｿ・･繝ｻ・ｸ陷ｷ・ｶ郢晢ｽｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｽ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｽ鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｼ鬯ｯ・ｮ繝ｻ・｣髯具ｽｹ郢晢ｽｻ繝ｻ・ｽ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｳ鬯ｯ・ｩ隲､諞ｺ笳冗ｹ晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｫ鬯ｩ蟷｢・ｽ・｢髫ｴ雜｣・ｽ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｻ鬯ｯ・ｯ繝ｻ・ｩ髯晢ｽｷ繝ｻ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・｢鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｧ鬯ｩ蟷｢・ｽ・｢髫ｴ雜｣・ｽ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｻ鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｹ鬯ｯ・ｯ繝ｻ・ｩ髯晢ｽｷ繝ｻ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・｢鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｧ鬯ｩ蟷｢・ｽ・｢髫ｴ雜｣・ｽ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｻ鬩幢ｽ｢隴趣ｽ｢繝ｻ・ｽ繝ｻ・ｻ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｭ鬯ｯ・ｯ繝ｻ・ｩ髯晢ｽｷ繝ｻ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・｢鬯ｮ・ｫ繝ｻ・ｴ髫ｰ・ｫ繝ｻ・ｾ郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｴ鬯ｩ蟷｢・ｽ・｢髫ｴ雜｣・ｽ・｢郢晢ｽｻ繝ｻ・ｽ郢晢ｽｻ繝ｻ・ｻ鬯ｯ・ｩ陝ｷ・｢繝ｻ・ｽ繝ｻ・｢鬮ｫ・ｴ髮懶ｽ｣繝ｻ・ｽ繝ｻ・｢驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｽ驛｢譎｢・ｽ・ｻ郢晢ｽｻ繝ｻ・ｻ
             if matches!(prev_char, Some('+') | Some('-')) {
                 index = probe + 1;
                 continue;
@@ -314,12 +571,8 @@ fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
     })
 }
 
-/// モデル出力中の数字を元の ZM マーカーに戻す。
-///
-/// - O(n) スキャン、O(1) ルックアップ（FxHashMap）
-/// - atomic digit run で "1" が "10" の先頭にマッチするバグを防ぐ
-/// - consumed フラグで各スロットを左から右へ 1 回のみ使用
-/// - スペースは一切操作しない（モデル出力のスペースをそのまま保持）
+/// Restores temporary numeric substitutions back into their original ZM markers.
+/// Matching is one-shot and keeps digit runs intact.
 fn restore_zm_number_tokens(text: &str, mapping: &ZmNumberMapping) -> String {
     use rustc_hash::FxHashMap;
 
@@ -338,8 +591,6 @@ fn restore_zm_number_tokens(text: &str, mapping: &ZmNumberMapping) -> String {
             chars.next();
             continue;
         }
-
-        // 数字列を一括トークンとして消費（"1" が "10" の先頭にマッチするのを防ぐ）
         let start = byte_idx;
         chars.next();
         while matches!(chars.peek(), Some(&(_, c)) if c.is_ascii_digit()) {
@@ -391,8 +642,6 @@ fn split_inner_spaces(text: &str) -> (String, String, String) {
     )
 }
 
-/// テキストからトップレベルのブラケットブロックを BracketSlot トークンとして抽出する。
-/// マッチしないブラケット（閉じなし・開きなし）はプレーンテキストとして素通しする。
 fn extract_bracket_slots(text: &str) -> Vec<StructureToken> {
     let mut tokens = Vec::new();
     let mut stack: Vec<(char, usize)> = Vec::new();
@@ -468,9 +717,6 @@ fn take_leading_spaces(text: &str, start: usize) -> (String, usize) {
     (spaces, consumed)
 }
 
-/// テキストトークンをセパレータ・改行で分割し、隣接スペースを
-/// DelimiterToken に吸着させる。これによりセグメントの両端にスペースが
-/// 残らず、辞書検索・モデル呼び出しのキーが安定する。
 fn split_text_token(text: &str) -> Vec<StructureToken> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut tokens = Vec::new();
@@ -595,6 +841,29 @@ fn reconstruct_segment(tokens: &[StructureToken]) -> String {
     text
 }
 
+fn find_bracket_recursion_target(tokens: &[StructureToken]) -> Option<usize> {
+    let mut bracket_index = None;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            StructureToken::Text(text) => {
+                if text.chars().any(|ch| !ch.is_whitespace()) {
+                    return None;
+                }
+            }
+            StructureToken::Bracket(_) => {
+                if bracket_index.is_some() {
+                    return None;
+                }
+                bracket_index = Some(index);
+            }
+            StructureToken::Delimiter(_) => {}
+        }
+    }
+
+    bracket_index
+}
+
 fn dedupe_entries(entries: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = rustc_hash::FxHashSet::default();
     entries
@@ -607,6 +876,10 @@ fn dedupe_entries(entries: Vec<(String, String)>) -> Vec<(String, String)> {
 // Translation logic
 // ---------------------------------------------------------------------------
 
+fn prepare_model_transport_text(text: &str) -> String {
+    text.to_string()
+}
+
 fn translate_model_only(
     text: &str,
     prefix: &str,
@@ -618,8 +891,11 @@ fn translate_model_only(
         return TranslationResult::empty(text.to_string());
     }
 
-    let zm_mapping = build_zm_number_mapping(text);
-    let model_input = zm_mapping.as_ref().map_or(text, |m| m.sent_text.as_str());
+    let transport_text = prepare_model_transport_text(text);
+    let zm_mapping = build_zm_number_mapping(&transport_text);
+    let model_input = zm_mapping
+        .as_ref()
+        .map_or(transport_text.as_str(), |m| m.sent_text.as_str());
     let start = std::time::Instant::now();
 
     if let Some(translated_raw) = llm_client.translate_sync(model_input, prefix) {
@@ -655,16 +931,23 @@ where
         return TranslationResult::empty(fragment.to_string());
     }
 
+    let authority = establish_fragment_authority(fragment);
     let start = std::time::Instant::now();
-    if let Some(hit) = lookup(fragment) {
-        return TranslationResult::from_dict_hit(hit, fragment, start.elapsed());
+    if let Some(hit) = lookup(&authority.key) {
+        return TranslationResult::from_dict_hit(hit, &authority.key, start.elapsed());
     }
 
-    let mut result = translate_model_only(fragment, prefix, tgt_lang, llm_client, settings);
+    let mut result = translate_model_only(
+        &authority.source_fragment,
+        prefix,
+        tgt_lang,
+        llm_client,
+        settings,
+    );
     if result.stats.model_calls > 0 {
         let value = result.text.trim().to_string();
         if !value.is_empty() {
-            result.new_entries.push((fragment.to_string(), value));
+            result.new_entries.push((authority.key, value));
         }
     }
     result
@@ -699,15 +982,6 @@ where
     result
 }
 
-fn append_translated_piece(
-    result: &mut TranslationResult,
-    rendered: &mut String,
-    piece: TranslationResult,
-) {
-    rendered.push_str(&piece.text);
-    result.absorb(piece);
-}
-
 fn translate_segment_tokens<F>(
     tokens: &[StructureToken],
     lookup: &F,
@@ -719,56 +993,41 @@ fn translate_segment_tokens<F>(
 where
     F: Fn(&str) -> Option<String> + Clone,
 {
-    if let [StructureToken::Bracket(slot)] = tokens {
-        return translate_bracket_slot(slot, lookup, prefix, tgt_lang, llm_client, settings);
-    }
+    if let Some(index) = find_bracket_recursion_target(tokens) {
+        let StructureToken::Bracket(slot) = &tokens[index] else {
+            unreachable!("bracket recursion target must point to a bracket token");
+        };
 
-    if !tokens
-        .iter()
-        .any(|token| matches!(token, StructureToken::Bracket(_)))
-    {
-        return translate_fragment(
-            &reconstruct_segment(tokens),
-            lookup,
-            prefix,
-            tgt_lang,
-            llm_client,
-            settings,
-        );
-    }
+        let mut result =
+            translate_bracket_slot(slot, lookup, prefix, tgt_lang, llm_client, settings);
+        let inner_text = result.text.clone();
+        let mut rendered = String::new();
 
-    // 混在セグメントは、周囲のテキストと括弧内を分けて順に処理する。
-    let mut accumulated = TranslationResult::empty(String::new());
-    let mut rendered = String::new();
-    let mut buffered_text = String::new();
-
-    for token in tokens {
-        match token {
-            StructureToken::Text(t) => buffered_text.push_str(t),
-            StructureToken::Bracket(slot) => {
-                if !buffered_text.is_empty() {
-                    let chunk = std::mem::take(&mut buffered_text);
-                    let translated =
-                        translate_fragment(&chunk, lookup, prefix, tgt_lang, llm_client, settings);
-                    append_translated_piece(&mut accumulated, &mut rendered, translated);
+        for (token_index, token) in tokens.iter().enumerate() {
+            match token {
+                StructureToken::Text(text) => rendered.push_str(text),
+                StructureToken::Bracket(_) if token_index == index => {
+                    rendered.push_str(&inner_text)
                 }
-
-                let translated =
-                    translate_bracket_slot(slot, lookup, prefix, tgt_lang, llm_client, settings);
-                append_translated_piece(&mut accumulated, &mut rendered, translated);
+                StructureToken::Bracket(slot) => {
+                    rendered.push_str(&reconstruct_bracket(slot, &slot.inner_core))
+                }
+                StructureToken::Delimiter(_) => {}
             }
-            StructureToken::Delimiter(_) => {}
         }
+
+        result.text = rendered;
+        return result;
     }
 
-    if !buffered_text.is_empty() {
-        let chunk = std::mem::take(&mut buffered_text);
-        let translated = translate_fragment(&chunk, lookup, prefix, tgt_lang, llm_client, settings);
-        append_translated_piece(&mut accumulated, &mut rendered, translated);
-    }
-
-    accumulated.text = rendered;
-    accumulated
+    translate_fragment(
+        &reconstruct_segment(tokens),
+        lookup,
+        prefix,
+        tgt_lang,
+        llm_client,
+        settings,
+    )
 }
 
 fn translate_text_internal<F>(
@@ -852,185 +1111,3 @@ where
 
 // ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct MockLlmClient {
-        calls: Mutex<Vec<String>>,
-        responses: Mutex<Vec<String>>,
-    }
-
-    impl MockLlmClient {
-        fn with_responses(values: &[&str]) -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                responses: Mutex::new(values.iter().map(|v| v.to_string()).collect()),
-            }
-        }
-
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl LlmClient for MockLlmClient {
-        fn translate_sync(&self, text: &str, _prefix: &str) -> Option<String> {
-            self.calls.lock().unwrap().push(text.to_string());
-            let mut r = self.responses.lock().unwrap();
-            if r.is_empty() {
-                None
-            } else {
-                Some(r.remove(0))
-            }
-        }
-    }
-
-    fn test_settings() -> TranslationSettings {
-        TranslationSettings {
-            enable_model_wrap: true,
-            model_wrap_min_chars: 60,
-            model_wrap_min_tail_chars: 10,
-            enable_model_symbol_cleanup: true,
-        }
-    }
-
-    fn mapping(pairs: &[(&str, &str)]) -> ZmNumberMapping {
-        ZmNumberMapping {
-            sent_text: String::new(),
-            replacements: pairs
-                .iter()
-                .map(|(n, m)| (n.to_string(), m.to_string()))
-                .collect(),
-        }
-    }
-
-    // --- restore_zm_number_tokens -------------------------------------------
-
-    // "1" が "10" の先頭にマッチしないこと
-    #[test]
-    fn restore_does_not_match_digit_prefix() {
-        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
-        assert_eq!(restore_zm_number_tokens("1 10", &m), "ZAZ ZBZ");
-    }
-
-    // スペースは操作しない（モデル出力のスペースをそのまま保持）
-    #[test]
-    fn restore_preserves_spaces_as_is() {
-        let m = mapping(&[("1", "ZAZ")]);
-        assert_eq!(restore_zm_number_tokens("foo 1 bar", &m), "foo ZAZ bar");
-        assert_eq!(restore_zm_number_tokens("foo  1  bar", &m), "foo  ZAZ  bar");
-        assert_eq!(restore_zm_number_tokens("foo1bar", &m), "fooZAZbar");
-    }
-
-    // マッピングにない数字はそのまま通過
-    #[test]
-    fn restore_passes_through_unmatched_token() {
-        let m = mapping(&[("1", "ZAZ")]);
-        assert_eq!(
-            restore_zm_number_tokens("no numbers here", &m),
-            "no numbers here"
-        );
-        assert_eq!(restore_zm_number_tokens("value is 99", &m), "value is 99");
-    }
-
-    // 同じ数字が 2 回出ても最初の 1 回だけ置換
-    #[test]
-    fn restore_consumes_slot_at_most_once() {
-        let m = mapping(&[("1", "ZAZ")]);
-        assert_eq!(restore_zm_number_tokens("chapter 1 1", &m), "chapter ZAZ 1");
-    }
-
-    // 隣接トークン・スペースはそのまま
-    #[test]
-    fn restore_adjacent_tokens_preserve_spaces() {
-        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
-        assert_eq!(restore_zm_number_tokens("1 10", &m), "ZAZ ZBZ");
-        assert_eq!(restore_zm_number_tokens("1  10", &m), "ZAZ  ZBZ");
-        assert_eq!(restore_zm_number_tokens("1  10  1", &m), "ZAZ  ZBZ  1");
-    }
-
-    // CJK 全角スペースもそのまま通過
-    #[test]
-    fn restore_preserves_cjk_spaces() {
-        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
-        assert_eq!(
-            restore_zm_number_tokens("1\u{3000}10\u{3000}1", &m),
-            "ZAZ\u{3000}ZBZ\u{3000}1"
-        );
-    }
-
-    // 連結数字は分割しない
-    #[test]
-    fn restore_does_not_split_concatenated_digits() {
-        let m = mapping(&[("1", "ZAZ"), ("10", "ZBZ")]);
-        assert_eq!(restore_zm_number_tokens("110", &m), "110");
-    }
-
-    // --- translate_chunk ----------------------------------------------------
-
-    #[test]
-    fn split_fragments_are_sent_as_is() {
-        let llm = MockLlmClient::with_responses(&["Later", "Cycle"]);
-        let result = translate_chunk("Next;Turn", |_| None, "prefix", "en", &llm, test_settings());
-
-        assert_eq!(llm.calls(), vec!["Next", "Turn"]);
-        assert_eq!(result.text, "Later;Cycle");
-        assert_eq!(
-            result.new_entries,
-            vec![
-                ("Next".to_string(), "Later".to_string()),
-                ("Turn".to_string(), "Cycle".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn bracket_only_reprocesses_inner_text() {
-        let llm = MockLlmClient::with_responses(&["Quest"]);
-        let result = translate_chunk(
-            "(Start;Next)",
-            |key| (key == "Start").then(|| "Begin".to_string()),
-            "prefix",
-            "en",
-            &llm,
-            test_settings(),
-        );
-
-        assert_eq!(llm.calls(), vec!["Next"]);
-        assert_eq!(result.text, "(Begin;Quest)");
-        assert_eq!(
-            result.new_entries,
-            vec![("Next".to_string(), "Quest".to_string())]
-        );
-    }
-
-    #[test]
-    fn mixed_bracket_segment_reprocesses_inner_text() {
-        let llm = MockLlmClient::with_responses(&["Quest"]);
-        let result = translate_chunk(
-            "foo(Start;Next)bar",
-            |key| match key {
-                "foo" => Some("Foo".to_string()),
-                "Start" => Some("Begin".to_string()),
-                "bar" => Some("Bar".to_string()),
-                _ => None,
-            },
-            "prefix",
-            "en",
-            &llm,
-            test_settings(),
-        );
-
-        assert_eq!(llm.calls(), vec!["Next"]);
-        assert_eq!(result.text, "Foo(Begin;Quest)Bar");
-        assert_eq!(
-            result.new_entries,
-            vec![("Next".to_string(), "Quest".to_string())]
-        );
-    }
-}
