@@ -49,7 +49,7 @@ impl HttpLlmClient {
             "max_tokens": 512,
             "temperature": 0.4,
             "top_k": 30,
-            "top_p": 0.8,
+            "top_p": 0.6,
             "repetition_penalty": 1.05,
             "cache_prompt": false
         });

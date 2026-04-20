@@ -114,6 +114,8 @@ pub enum CheckReadyReason {
         expected: u64,
         actual: u64,
     },
+    /// Authority モデル不在かつ代替候補が複数あり、起動モデルを一意に決定できない。
+    StartupModelUnresolved,
 }
 
 impl std::fmt::Display for CheckReadyReason {
@@ -155,6 +157,10 @@ impl std::fmt::Display for CheckReadyReason {
                     filename, expected, actual
                 )
             }
+            Self::StartupModelUnresolved => write!(
+                f,
+                "起動モデルを決定できません。usable なモデルが複数あり一意に選択できません。再選択が必要です。"
+            ),
         }
     }
 }
@@ -223,18 +229,25 @@ pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyRe
         return Ok(());
     }
 
-    let has_alternative_model = available_models
-        .iter()
-        .any(|candidate| candidate.filename != filename);
-    if has_alternative_model {
+    if crate::backend::resolve_startup_model(&config, &available_models).is_some() {
         diag_file(
             base_dir,
             &format!(
-                "[check_ready] authority model unavailable, but {} alternative model(s) exist",
+                "[check_ready] authority model unavailable, but startup model resolved from {} candidate(s)",
                 available_models.len()
             ),
         );
         return Ok(());
+    }
+    if available_models.len() > 1 {
+        diag_file(
+            base_dir,
+            &format!(
+                "[check_ready] {} candidates exist but startup model unresolvable",
+                available_models.len()
+            ),
+        );
+        return Err(CheckReadyReason::StartupModelUnresolved);
     }
 
     if actual_size == 0 {
@@ -656,6 +669,33 @@ impl AppLauncher {
                 "[ensure_model] → reuse existing model",
             );
             return Ok(model_path);
+        }
+
+        // authority model が不完全でも、別の完成済み .gguf があればそちらを使う。
+        // ダウンロードを起動する前にチェックする。
+        let alternative = std::fs::read_dir(&model_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let is_gguf = path.extension().map(|e| e == "gguf").unwrap_or(false);
+                let is_other = path.file_name().and_then(|n| n.to_str()) != Some(filename.as_str());
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if is_gguf && is_other && size > 0 { Some(path) } else { None }
+            })
+            .next();
+        if let Some(alt_path) = alternative {
+            diag(
+                progress_tx,
+                &self.base_dir,
+                &format!(
+                    "[ensure_model] authority incomplete, using alternative: {}",
+                    alt_path.display()
+                ),
+            );
+            return Ok(alt_path);
         }
 
         // Local model: download 不可。ユーザーに再配置/再選択を促す。

@@ -104,6 +104,14 @@ fn build_initial_launcher_state(
              Re-select the model to update the authority, or restore the original file.",
             filename, expected, actual
         )),
+        Err(launcher::CheckReadyReason::StartupModelUnresolved) => {
+            LauncherUiState::with_startup_reason(
+                "起動モデルを決定できません。\
+                 usable なモデルが複数あり一意に選択できません。\
+                 モデルを再選択してください。"
+                    .to_string(),
+            )
+        }
     }
 }
 

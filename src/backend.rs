@@ -25,7 +25,7 @@ use manager::{ProcessManager, RestartScope};
 
 /// launcher_config.toml の model.filename が権威。
 /// candidates の中に一致するファイルがあれば PathBuf を返す。なければ None。
-fn resolve_startup_model(app_config: &AppConfig, candidates: &[ModelCandidate]) -> Option<PathBuf> {
+pub(crate) fn resolve_startup_model(app_config: &AppConfig, candidates: &[ModelCandidate]) -> Option<PathBuf> {
     let expected_size = app_config.model.expected_size();
     if let Some(candidate) = candidates.iter().find(|candidate| {
         candidate.filename == app_config.model.filename() && candidate.size == expected_size
@@ -402,5 +402,39 @@ mod tests {
         ];
 
         assert_eq!(resolve_startup_model(&cfg, &candidates), None);
+    }
+
+    #[test]
+    fn startup_model_returns_none_for_empty_candidates() {
+        let cfg = known_config("authority.gguf", 100);
+        assert_eq!(resolve_startup_model(&cfg, &[]), None);
+    }
+
+    // Contract: check_ready_detail の Ok() に対応する入力条件では
+    // resolve_startup_model は必ず Some を返す。
+    // Case A: authority exact match
+    #[test]
+    fn contract_ok_authority_exact_match_resolves() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![ModelCandidate {
+            filename: "authority.gguf".to_string(),
+            path: PathBuf::from("models/authority.gguf"),
+            size: 100,
+            kind: ModelCandidateKind::Known,
+        }];
+        assert!(resolve_startup_model(&cfg, &candidates).is_some());
+    }
+
+    // Case B: authority absent, exactly 1 usable alternative
+    #[test]
+    fn contract_ok_single_alternative_resolves() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![ModelCandidate {
+            filename: "other.gguf".to_string(),
+            path: PathBuf::from("models/other.gguf"),
+            size: 500,
+            kind: ModelCandidateKind::Local,
+        }];
+        assert!(resolve_startup_model(&cfg, &candidates).is_some());
     }
 }

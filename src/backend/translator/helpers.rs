@@ -1,4 +1,9 @@
 use crate::backend::normalize::normalize_display;
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+static APOSTROPHE_SPACE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(\p{L})'\s+(\p{L})").unwrap());
 
 fn target_compacts_internal_spaces(tgt_lang: &str) -> bool {
     matches!(tgt_lang, "ja" | "zh" | "zh-CN" | "zh-Hant" | "zh-TW")
@@ -66,6 +71,14 @@ fn reapply_source_space_template(src_text: &str, translated_text: &str) -> Optio
     }
 
     Some(rebuilt)
+}
+
+fn normalize_apostrophes(text: &str) -> String {
+    let s = text
+        .replace('\u{2019}', "'")
+        .replace('\u{02BC}', "'")
+        .replace('`', "'");
+    APOSTROPHE_SPACE.replace_all(&s, "$1'$2").into_owned()
 }
 
 fn fix_extra_spaces(
@@ -191,14 +204,30 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
 
 fn wrap_candidate_score(chars: &[char], index: usize, candidate_width: usize) -> i32 {
     match (chars[index], candidate_width) {
-        ('。', 1) => 12,
-        ('、', 1) => 6,
-        ('，', 1) => 6,
-        ('.', 2) => 12,
-        (',', 2) => 6,
-        (' ', 3) => 12,
+        ('。', 1) => 20,
+        ('、', 1) => 8,
+        ('，', 1) => 8,
+        ('.', 2) => 20,
+        (',', 2) => 8,
+        (' ', 3) => 20,
         _ => 0,
     }
+}
+
+const SPACE_FALLBACK_MIN_CHARS: usize = 80;
+
+fn find_center_ascii_space(chars: &[char]) -> Option<usize> {
+    let center = chars.len() / 2;
+    let mut best: Option<(usize, usize)> = None; // (distance, index)
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == ' ' {
+            let dist = center.abs_diff(i);
+            if best.map_or(true, |(d, _)| dist < d) {
+                best = Some((dist, i));
+            }
+        }
+    }
+    best.map(|(_, i)| i)
 }
 
 pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, _min_tail_length: usize) -> String {
@@ -238,15 +267,21 @@ pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, _min_tail_length
         }
     }
 
-    let Some((_, _, index, candidate_width)) = best else {
+    let (emit_end, next_start) = if let Some((_, _, index, candidate_width)) = best {
+        match candidate_width {
+            1 => (index + 1, index + 1),
+            2 => (index + 1, index + 2),
+            3 => (index, index + 1),
+            _ => return text.to_string(),
+        }
+    } else if len >= SPACE_FALLBACK_MIN_CHARS {
+        if let Some(index) = find_center_ascii_space(&chars) {
+            (index, index + 1)
+        } else {
+            return text.to_string();
+        }
+    } else {
         return text.to_string();
-    };
-
-    let (emit_end, next_start) = match candidate_width {
-        1 => (index + 1, index + 1),
-        2 => (index + 1, index + 2),
-        3 => (index, index + 1),
-        _ => return text.to_string(),
     };
 
     let mut result = String::with_capacity(text.len() + 1);
@@ -264,6 +299,7 @@ pub fn clean_model_output(
 ) -> String {
     let src = src.trim();
     let mut result = normalize_display(translated);
+    result = normalize_apostrophes(&result);
     result = fix_extra_spaces(src, &result, !target_compacts_internal_spaces(tgt_lang));
     if enable_symbol_cleanup {
         result = normalize_plus_minus_spacing(&result);
@@ -380,5 +416,81 @@ mod tests {
         );
         assert_eq!(clean_model_output("A - B", "A - B", "en", true), "A - B");
         assert_eq!(clean_model_output("- foo", "- foo", "en", true), "- foo");
+    }
+
+    #[test]
+    fn clean_model_output_fixes_apostrophe_spacing_for_english_target() {
+        assert_eq!(
+            clean_model_output("one's", "one\u{2019} s", "en", true),
+            "one's"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_fixes_apostrophe_spacing_for_vietnamese_target() {
+        assert_eq!(
+            clean_model_output("d'accord", "d\u{2019} accord", "vi", true),
+            "d'accord"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_fixes_apostrophe_spacing_for_non_ascii_letters() {
+        assert_eq!(
+            clean_model_output("l'ami", "l\u{2019} ami", "fr", true),
+            "l'ami"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_keeps_regular_internal_spaces_for_vietnamese() {
+        assert_eq!(
+            clean_model_output("Kinh nghiem", "  Kinh  nghiem  ", "vi", true),
+            "Kinh  nghiem"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_leaves_cjk_text_unchanged_when_no_apostrophe_pattern() {
+        assert_eq!(
+            clean_model_output("攻撃力10", "攻撃 力 10。", "ja", true),
+            "攻撃力10"
+        );
+    }
+
+    #[test]
+    fn wrap_space_fallback_splits_long_plain_english_at_center_space() {
+        // 80 chars (39 a + space + 40 b), no punctuation candidate → space fallback kicks in
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(text.chars().count(), 80);
+        assert_eq!(
+            apply_wrap(text, true, 60, 10),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn wrap_space_fallback_does_not_split_below_80_chars() {
+        // 79 chars — below fallback threshold, no punctuation → no split
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(text.chars().count(), 79);
+        assert_eq!(apply_wrap(text, true, 60, 10), text);
+    }
+
+    #[test]
+    fn wrap_space_fallback_picks_space_nearest_center() {
+        // Two spaces: one at 20, one at 60 in a 90-char string → center=45, space at 60 is closer
+        let text = format!(
+            "{}{}{}{}",
+            "a".repeat(20),
+            " ",
+            "b".repeat(39),
+            " cccccccccccccccccccccccccccccc"
+        );
+        let result = apply_wrap(&text, true, 60, 10);
+        assert!(result.contains('\n'));
+        // The split must be at the space closest to center (index 60 vs 20)
+        let lines: Vec<&str> = result.splitn(2, '\n').collect();
+        assert_eq!(lines[0].len(), 60);
     }
 }
