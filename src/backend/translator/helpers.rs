@@ -2,8 +2,7 @@ use crate::backend::normalize::normalize_display;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-static APOSTROPHE_SPACE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(\p{L})'\s+(\p{L})").unwrap());
+static APOSTROPHE_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\p{L})'\s+(\p{L})").unwrap());
 
 fn target_compacts_internal_spaces(tgt_lang: &str) -> bool {
     matches!(tgt_lang, "ja" | "zh" | "zh-CN" | "zh-Hant" | "zh-TW")
@@ -187,9 +186,6 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
     if ch == '。' {
         return Some(1);
     }
-    if ch == '，' {
-        return Some(1);
-    }
     if (ch == '.' || ch == ',') && next == Some(' ') {
         return Some(2);
     }
@@ -206,7 +202,6 @@ fn wrap_candidate_score(chars: &[char], index: usize, candidate_width: usize) ->
     match (chars[index], candidate_width) {
         ('。', 1) => 20,
         ('、', 1) => 8,
-        ('，', 1) => 8,
         ('.', 2) => 20,
         (',', 2) => 8,
         (' ', 3) => 20,
@@ -214,7 +209,7 @@ fn wrap_candidate_score(chars: &[char], index: usize, candidate_width: usize) ->
     }
 }
 
-const SPACE_FALLBACK_MIN_CHARS: usize = 80;
+const SPACE_FALLBACK_MIN_CHARS: usize = 100;
 
 fn find_center_ascii_space(chars: &[char]) -> Option<usize> {
     let center = chars.len() / 2;
@@ -230,7 +225,7 @@ fn find_center_ascii_space(chars: &[char]) -> Option<usize> {
     best.map(|(_, i)| i)
 }
 
-pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, _min_tail_length: usize) -> String {
+pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, min_tail_length: usize) -> String {
     if !enabled || text.contains('\n') || text.chars().count() < min_length {
         return text.to_string();
     }
@@ -245,6 +240,16 @@ pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, _min_tail_length
         let Some(candidate_width) = is_wrap_candidate(&chars, index) else {
             continue;
         };
+
+        let next_start = match candidate_width {
+            1 => index + 1,
+            2 => index + 2,
+            3 => index + 1,
+            _ => continue,
+        };
+        if candidate_width != 3 && len.saturating_sub(next_start) < min_tail_length {
+            continue;
+        }
 
         let base = wrap_candidate_score(&chars, index, candidate_width);
         if base == 0 {
@@ -276,6 +281,9 @@ pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, _min_tail_length
         }
     } else if len >= SPACE_FALLBACK_MIN_CHARS {
         if let Some(index) = find_center_ascii_space(&chars) {
+            if len.saturating_sub(index + 1) < min_tail_length {
+                return text.to_string();
+            }
             (index, index + 1)
         } else {
             return text.to_string();
@@ -370,10 +378,14 @@ mod tests {
     }
 
     #[test]
-    fn wrap_ignores_min_tail_length() {
+    fn wrap_respects_min_tail_length() {
         let text = "123456789012345678901234567890. short";
         assert_eq!(
             apply_wrap(text, true, 31, 10),
+            "123456789012345678901234567890. short"
+        );
+        assert_eq!(
+            apply_wrap(text, true, 31, 5),
             "123456789012345678901234567890.\nshort"
         );
     }
@@ -385,6 +397,13 @@ mod tests {
             apply_wrap(text, true, 60, 10),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nใน bbb"
         );
+    }
+
+    #[test]
+    fn wrap_does_not_use_fullwidth_period_as_candidate_below_fallback_threshold() {
+        let text = format!("{} ver．1 {}", "a".repeat(40), "b".repeat(46));
+        assert_eq!(text.chars().count(), 93);
+        assert_eq!(apply_wrap(&text, true, 60, 10), text);
     }
 
     #[test]
@@ -460,33 +479,36 @@ mod tests {
 
     #[test]
     fn wrap_space_fallback_splits_long_plain_english_at_center_space() {
-        // 80 chars (39 a + space + 40 b), no punctuation candidate → space fallback kicks in
-        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        assert_eq!(text.chars().count(), 80);
+        // 100 chars (49 a + space + 50 b), no punctuation candidate → space fallback kicks in
+        let text =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(text.chars().count(), 100);
         assert_eq!(
             apply_wrap(text, true, 60, 10),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
     }
 
     #[test]
-    fn wrap_space_fallback_does_not_split_below_80_chars() {
-        // 79 chars — below fallback threshold, no punctuation → no split
-        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        assert_eq!(text.chars().count(), 79);
+    fn wrap_space_fallback_does_not_split_below_100_chars() {
+        // 99 chars — below fallback threshold, no punctuation → no split
+        let text =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(text.chars().count(), 99);
         assert_eq!(apply_wrap(text, true, 60, 10), text);
     }
 
     #[test]
     fn wrap_space_fallback_picks_space_nearest_center() {
-        // Two spaces: one at 20, one at 60 in a 90-char string → center=45, space at 60 is closer
+        // Two spaces in a 100-char string → center=50, space at 60 is closer
         let text = format!(
             "{}{}{}{}",
             "a".repeat(20),
             " ",
             "b".repeat(39),
-            " cccccccccccccccccccccccccccccc"
+            " ccccccccccccccccccccccccccccccccccccccc"
         );
+        assert_eq!(text.chars().count(), 100);
         let result = apply_wrap(&text, true, 60, 10);
         assert!(result.contains('\n'));
         // The split must be at the space closest to center (index 60 vs 20)

@@ -1,6 +1,36 @@
 # TENUKI - Release Notes
 
 ---
+### Version 1.2.0
+- **Dictionary system overhaul**
+ Changed to register entries containing variables (Attack +5%) in a separate dictionary.
+
+- **Translation system overhaul**
+ Changed so that entries with variables can be registered in the dictionary and matched accordingly. Currently limiting the scope to avoid adverse effects and still experimenting.
+
+- **List mode**
+ A mode that takes text data and produces a translation TXT. Not very useful, so don't worry about it.
+
+- **Bug fix**
+ Fixed an issue where XUnity was sending already translated text in requests, causing infinite proliferation of registered entries.　
+  
+### Version 1.1.4
+- **Bug Fixes** 
+  Fixed issues that had been causing slowdo
+### Version 1.1.5
+  ChatGPT「This time, it's the one that actually made progress.」
+  
+### Version 1.1.4
+- **Bug Fixes** 
+  Fixed issues that had been causing slowdowns and cases where processing was skipped. The major restructuring has also mostly settled down, and it finally feels ready for people to use with confidence.
+
+### Version 1.1.3
+* **Setup Stabilization:** 
+　Fixed an issue where the creation process for new installations was completely left out because I was frantically trying to ensure safe migrations from older versions.
+
+### Version 1.1.2
+* **Setup Stabilization:** 
+　Almost entirely replaced the processing structure to stabilize it. As a result, it ended up completely broken.
 
 ### Version 1.1.1
 
@@ -105,7 +135,29 @@
 # TENUKI - リリースノート
 
 ---
-### バージョン 1.1.0　
+### Version 1.2.0
+  **辞書システム改修**　　　
+  攻撃+5％など変数があるものを別辞書にまとめて登録するように変更
+  
+  翻訳システム改修　
+  変数があるものをまとめて辞書登録と辞書ヒットできるように変更。多少狭くして悪い影響が出ない範囲にまだ絞って試してる。
+  
+  リストモード
+  テキストデータを流し込んで翻訳TXTを作るモード。あんまり使い道ないから気にしないで。
+  
+  バグフィックス
+  XUnityが翻訳後のものをリクエストで送ってくるのを登録して無限増殖していたのに対応
+
+### バージョン 1.1.4　
+* **不具合修正**　　　　速度低下してたものや処理抜けしてたものを修正。ほぼ再構成も一段落してやっと人が使うの安心できる。
+
+### バージョン 1.1.3　
+* **セットアップ安定化**　　古いバージョンから安全に移行できるように必死になってたら新規の場合の作成が抜けてるという状態になってたのを修正
+
+### バージョン 1.1.2　
+* **セットアップ安定化**　　処理構造を安定化するためほぼ入替。結果動かないものになってた。
+
+### バージョン 1.1.1　
 * **セットアップ安定化**　　回線状況への対応を強化　ダブルクリックで起動まで到達できるように色々やった。ほぼ作り直し。
 
 ### バージョン 1.1.0　

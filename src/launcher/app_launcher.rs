@@ -683,7 +683,11 @@ impl AppLauncher {
                 let is_gguf = path.extension().map(|e| e == "gguf").unwrap_or(false);
                 let is_other = path.file_name().and_then(|n| n.to_str()) != Some(filename.as_str());
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if is_gguf && is_other && size > 0 { Some(path) } else { None }
+                if is_gguf && is_other && size > 0 {
+                    Some(path)
+                } else {
+                    None
+                }
             })
             .next();
         if let Some(alt_path) = alternative {
@@ -1028,17 +1032,12 @@ impl AppLauncher {
         }
     }
 
-    /// profiles/default.toml と profiles/game.toml を shipped default で生成する。
+    /// profiles/game.toml と profiles/normal.toml を shipped default で生成する。
     /// game.toml が旧 shipped bad prompt のままの場合は公式文面に修復する。
     fn seed_profiles(&self) -> Result<()> {
         use super::translation_profile::TranslationProfile;
         let profiles_dir = self.base_dir.join("profiles");
         std::fs::create_dir_all(&profiles_dir)?;
-
-        let default_path = profiles_dir.join("default.toml");
-        if !default_path.exists() {
-            TranslationProfile::default().save(&default_path)?;
-        }
 
         const GAME_BAD_PROMPT: &str =
             "Translate the following segment into {target}, preserving all special symbols and tags exactly as they appear. Do not add any explanations.";
@@ -1052,6 +1051,11 @@ impl AppLauncher {
                     TranslationProfile::game_default().save(&game_path)?;
                 }
             }
+        }
+
+        let normal_path = profiles_dir.join("normal.toml");
+        if !normal_path.exists() {
+            TranslationProfile::normal_default().save(&normal_path)?;
         }
 
         Ok(())

@@ -7,13 +7,32 @@ use std::sync::mpsc;
 
 use rustc_hash::FxHashMap;
 
+use regex::Regex;
+
 use crate::backend::normalize::normalize_key;
 use crate::messages::BackendEvent;
 
-#[derive(Default)]
+struct RegexRule {
+    pattern: Regex,
+    replacement: String,
+    #[allow(dead_code)]
+    source_pattern: String,
+}
+
 struct LoadedTxtData {
     index: FxHashMap<String, String>,
-    source_entries: FxHashMap<String, (String, String)>,
+    value_index: FxHashMap<String, String>,
+    regex_rules: Vec<RegexRule>,
+}
+
+impl Default for LoadedTxtData {
+    fn default() -> Self {
+        Self {
+            index: FxHashMap::default(),
+            value_index: FxHashMap::default(),
+            regex_rules: Vec::new(),
+        }
+    }
 }
 
 fn is_excluded(file_name: &str) -> bool {
@@ -39,15 +58,38 @@ fn read_txt_into(path: &Path, loaded: &mut LoadedTxtData) -> usize {
                 continue;
             }
 
+            if let Some((pat, repl)) = try_parse_regex_rule(line) {
+                match Regex::new(&pat) {
+                    Ok(re) => {
+                        loaded.regex_rules.push(RegexRule {
+                            pattern: re,
+                            replacement: repl,
+                            source_pattern: pat,
+                        });
+                        count += 1;
+                    }
+                    Err(e) => {
+                        log::debug!("regex compile failed ({}): {} — {}", path.display(), pat, e);
+                    }
+                }
+                continue;
+            }
+
             if let Some(index) = line.find('=') {
                 let key = line[..index].trim();
                 let value = line[index + 1..].trim();
                 if !key.is_empty() {
-                    let normalized = normalize_key(key);
-                    loaded.index.insert(normalized.clone(), value.to_string());
+                    let normalized_key = normalize_key(key);
+                    let normalized_value = normalize_key(value);
                     loaded
-                        .source_entries
-                        .insert(normalized, (key.to_string(), value.to_string()));
+                        .index
+                        .insert(normalized_key.clone(), value.to_string());
+                    if !normalized_value.is_empty() {
+                        loaded
+                            .value_index
+                            .entry(normalized_value)
+                            .or_insert_with(|| value.to_string());
+                    }
                     count += 1;
                 }
             }
@@ -55,6 +97,24 @@ fn read_txt_into(path: &Path, loaded: &mut LoadedTxtData) -> usize {
     }
 
     count
+}
+
+fn try_parse_regex_rule(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("r:\"") {
+        return None;
+    }
+    let after_prefix = &trimmed[3..]; // skip r:"
+
+    let close_quote = after_prefix.find('"')?;
+    let pattern = after_prefix[..close_quote].to_string();
+    let after_quote = after_prefix[close_quote + 1..].trim_start();
+
+    if !after_quote.starts_with('=') {
+        return None;
+    }
+    let replacement = after_quote[1..].trim().to_string();
+    Some((pattern, replacement))
 }
 
 fn load_txt_files(root_dir: &Path) -> LoadedTxtData {
@@ -117,11 +177,26 @@ fn save_index(bin_file: &Path, entries: &FxHashMap<String, String>) {
     }
 }
 
+fn ensure_bom_file(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if !path.exists() {
+        if let Ok(mut file) = File::create(path) {
+            let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+        }
+    }
+}
+
 pub struct Dictionary {
     index: FxHashMap<String, String>,
-    source_entries: FxHashMap<String, (String, String)>,
-    buffer: Vec<(String, String)>,
-    txt_file: PathBuf,
+    value_index: FxHashMap<String, String>,
+    regex_rules: Vec<RegexRule>,
+    exact_buffer: Vec<(String, String)>,
+    regex_buffer: Vec<(String, String)>,
+    exact_txt_file: PathBuf,
+    regex_txt_file: PathBuf,
     bin_file: PathBuf,
     event_tx: mpsc::Sender<BackendEvent>,
     pub loaded_entries: usize,
@@ -130,40 +205,52 @@ pub struct Dictionary {
 impl Dictionary {
     pub fn new(
         txt_root: PathBuf,
-        txt_file: PathBuf,
+        exact_txt_file: PathBuf,
+        regex_txt_file: PathBuf,
         bin_file: PathBuf,
         event_tx: mpsc::Sender<BackendEvent>,
     ) -> Self {
-        if let Some(parent) = txt_file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        if !txt_file.exists() {
-            if let Ok(mut file) = File::create(&txt_file) {
-                let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
-            }
-        }
+        ensure_bom_file(&exact_txt_file);
+        ensure_bom_file(&regex_txt_file);
 
         let loaded = build_index_from_txt(&txt_root, &bin_file);
-        let loaded_entries = loaded.index.len();
+        let loaded_entries = loaded.index.len() + loaded.regex_rules.len();
 
         let _ = event_tx.send(BackendEvent::DictionaryLoaded(loaded_entries));
         let _ = event_tx.send(BackendEvent::StatisticsUpdate(0, 0));
 
         Self {
             index: loaded.index,
-            source_entries: loaded.source_entries,
-            buffer: Vec::new(),
-            txt_file,
+            value_index: loaded.value_index,
+            regex_rules: loaded.regex_rules,
+            exact_buffer: Vec::new(),
+            regex_buffer: Vec::new(),
+            exact_txt_file,
+            regex_txt_file,
             bin_file,
             event_tx,
             loaded_entries,
         }
     }
 
-    pub fn lookup(&self, key: &str) -> Option<String> {
+    pub fn lookup_source(&self, key: &str) -> Option<String> {
         let normalized = normalize_key(key.trim());
-        self.index.get(&normalized).cloned()
+        if let Some(hit) = self.index.get(&normalized).cloned() {
+            return Some(hit);
+        }
+        for rule in &self.regex_rules {
+            if let Some(caps) = rule.pattern.captures(key) {
+                let mut out = String::new();
+                caps.expand(&rule.replacement, &mut out);
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    pub fn lookup_value(&self, text: &str) -> Option<String> {
+        let normalized = normalize_key(text.trim());
+        self.value_index.get(&normalized).cloned()
     }
 
     pub fn register(&mut self, key: &str, val: &str) {
@@ -173,15 +260,50 @@ impl Dictionary {
             return;
         }
 
+        if let Some((pattern, replacement)) = try_parse_regex_rule(&format!("{key}={val}")) {
+            let already_registered = self.regex_rules.iter().any(|r| r.source_pattern == pattern);
+            if !already_registered {
+                match Regex::new(&pattern) {
+                    Ok(re) => {
+                        self.regex_rules.push(RegexRule {
+                            pattern: re,
+                            replacement: replacement.clone(),
+                            source_pattern: pattern.clone(),
+                        });
+                        self.loaded_entries += 1;
+                    }
+                    Err(e) => {
+                        log::debug!("regex register failed: {} -> {} ({})", key, val, e);
+                        return;
+                    }
+                }
+            }
+
+            self.regex_buffer
+                .push((pattern.clone(), replacement.clone()));
+            let _ = self.event_tx.send(BackendEvent::DictionaryNewEntry(
+                crate::messages::current_timestamp(),
+                key.to_string(),
+                val.to_string(),
+            ));
+            return;
+        }
+
         let normalized = normalize_key(key);
         if self.index.contains_key(&normalized) {
             return;
         }
 
         self.index.insert(normalized, val.to_string());
-        self.source_entries
-            .insert(normalize_key(key), (key.to_string(), val.to_string()));
-        self.buffer.push((key.to_string(), val.to_string()));
+
+        let normalized_value = normalize_key(val);
+        if !normalized_value.is_empty() {
+            self.value_index
+                .entry(normalized_value)
+                .or_insert_with(|| val.to_string());
+        }
+
+        self.exact_buffer.push((key.to_string(), val.to_string()));
         self.loaded_entries += 1;
 
         let _ = self.event_tx.send(BackendEvent::DictionaryNewEntry(
@@ -191,41 +313,248 @@ impl Dictionary {
         ));
     }
 
+    /// Register a regex rule into the live dictionary for immediate session use.
+    /// This does NOT write to the buffer (save is handled by NewEntriesCache).
+    /// Returns false if the same pattern is already registered.
+    pub fn register_regex_rule(&mut self, pattern: String, replacement: String) -> bool {
+        if self.regex_rules.iter().any(|r| r.source_pattern == pattern) {
+            return false;
+        }
+        match Regex::new(&pattern) {
+            Ok(re) => {
+                self.regex_rules.push(RegexRule {
+                    pattern: re,
+                    replacement,
+                    source_pattern: pattern,
+                });
+                self.loaded_entries += 1;
+                true
+            }
+            Err(e) => {
+                log::debug!("regex register failed: {} — {}", pattern, e);
+                false
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn flush_buffer(&mut self) -> usize {
-        if self.buffer.is_empty() {
+        if self.exact_buffer.is_empty() && self.regex_buffer.is_empty() {
             return 0;
         }
 
-        if let Some(parent) = self.txt_file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let exact_count = self.exact_buffer.len();
+        let regex_count = self.regex_buffer.len();
 
-        let file_exists = self.txt_file.exists();
-        let count = self.buffer.len();
-
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.txt_file)
-        {
-            Ok(mut file) => {
-                if !file_exists {
-                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+        if exact_count > 0 {
+            ensure_bom_file(&self.exact_txt_file);
+            let exact_exists = self.exact_txt_file.exists();
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.exact_txt_file)
+            {
+                Ok(mut file) => {
+                    if !exact_exists {
+                        let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+                    }
+                    for (key, value) in &self.exact_buffer {
+                        let _ = writeln!(file, "{}={}", key, value);
+                    }
+                    self.exact_buffer.clear();
                 }
-                for (key, value) in &self.buffer {
-                    let _ = writeln!(file, "{}={}", key, value);
-                }
-                self.buffer.clear();
-
-                save_index(&self.bin_file, &self.index);
-
-                let _ = self
-                    .event_tx
-                    .send(BackendEvent::DictionaryLoaded(self.index.len()));
-                count
+                Err(_) => return 0,
             }
-            Err(_) => 0,
         }
+
+        if regex_count > 0 {
+            ensure_bom_file(&self.regex_txt_file);
+            let regex_exists = self.regex_txt_file.exists();
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.regex_txt_file)
+            {
+                Ok(mut file) => {
+                    if !regex_exists {
+                        let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+                    }
+                    for (pattern, replacement) in &self.regex_buffer {
+                        let _ = writeln!(file, "r:\"{}\"={}", pattern, replacement);
+                    }
+                    self.regex_buffer.clear();
+                }
+                Err(_) => return 0,
+            }
+        }
+
+        save_index(&self.bin_file, &self.index);
+
+        let _ = self
+            .event_tx
+            .send(BackendEvent::DictionaryLoaded(self.loaded_entries));
+
+        exact_count + regex_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::mpsc;
+
+    fn make_dict(tmp: &std::path::Path, rules: &str) -> Dictionary {
+        let txt_dir = tmp.join("dict");
+        std::fs::create_dir_all(&txt_dir).unwrap();
+        let mut f = std::fs::File::create(txt_dir.join("rules.txt")).unwrap();
+        f.write_all(b"\xEF\xBB\xBF").unwrap();
+        writeln!(f, "{}", rules).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        Dictionary::new(
+            txt_dir.clone(),
+            txt_dir.join("_exact.txt"),
+            txt_dir.join("_regex.txt"),
+            txt_dir.join("_out.bin"),
+            tx,
+        )
+    }
+
+    #[test]
+    fn regex_rule_captures_zm_marker() {
+        let tmp = std::env::temp_dir().join("tenuki_dict_test_zm");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dict = make_dict(&tmp, r#"r:"^外伤(Z[A-Z]+Z)$"=外傷$1"#);
+
+        // exact miss → regex hit
+        assert_eq!(dict.lookup_source("外伤ZMCZ"), Some("外傷ZMCZ".into()));
+        // key not matched by the regex
+        assert_eq!(dict.lookup_source("内傷ZMDZ"), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn regex_rule_captures_signed_zm_percent() {
+        let tmp = std::env::temp_dir().join("tenuki_dict_test_signed_zm");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dict = make_dict(&tmp, r#"r:"^HP([+-])(Z[A-Z]+Z)%$"=体力$1$2%"#);
+
+        assert_eq!(dict.lookup_source("HP-ZMDZ%"), Some("体力-ZMDZ%".into()));
+        assert_eq!(dict.lookup_source("HP+ZMCZ%"), Some("体力+ZMCZ%".into()));
+        // key not matched
+        assert_eq!(dict.lookup_source("HP-ZMDZ"), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn register_regex_rule_hits_same_session() {
+        let tmp = std::env::temp_dir().join("tenuki_dict_test_live_regex");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut dict = make_dict(&tmp, "");
+
+        // Before registration: miss
+        assert_eq!(dict.lookup_source("学识潜力+ZMDZ"), None);
+
+        // Register regex rule at runtime
+        let ok = dict.register_regex_rule(
+            "^学识潜力([+＋]Z[A-Z]+Z)$".into(),
+            "学識の潜在能力$1".into(),
+        );
+        assert!(ok);
+
+        // After registration: regex hit with different ZM variant (same sign)
+        assert_eq!(
+            dict.lookup_source("学识潜力+ZMDZ"),
+            Some("学識の潜在能力+ZMDZ".into())
+        );
+        assert_eq!(
+            dict.lookup_source("学识潜力+ZMEZ"),
+            Some("学識の潜在能力+ZMEZ".into())
+        );
+
+        // Exact lookup still works via regex
+        assert_eq!(
+            dict.lookup_source("学识潜力+ZMCZ"),
+            Some("学識の潜在能力+ZMCZ".into())
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn new_provisions_tenuki_files_without_generic_dict_txt() {
+        let tmp = std::env::temp_dir().join("tenuki_dict_test_provision_files");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let _dict = Dictionary::new(
+            tmp.clone(),
+            tmp.join("Tenuki.dict.txt"),
+            tmp.join("Tenuki.regex.txt"),
+            tmp.join("_out.bin"),
+            tx,
+        );
+
+        assert!(tmp.join("Tenuki.dict.txt").exists());
+        assert!(tmp.join("Tenuki.regex.txt").exists());
+        assert!(!tmp.join("dict.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn new_loads_existing_generic_dict_txt_as_read_only_input() {
+        let tmp = std::env::temp_dir().join("tenuki_dict_test_legacy_dict_txt");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut legacy = std::fs::File::create(tmp.join("dict.txt")).unwrap();
+        legacy.write_all(b"\xEF\xBB\xBF").unwrap();
+        writeln!(legacy, "legacy=value").unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let dict = Dictionary::new(
+            tmp.clone(),
+            tmp.join("Tenuki.dict.txt"),
+            tmp.join("Tenuki.regex.txt"),
+            tmp.join("_out.bin"),
+            tx,
+        );
+
+        assert_eq!(dict.lookup_source("legacy"), Some("value".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn flush_buffer_saves_exact_and_regex_to_separate_files() {
+        let tmp = std::env::temp_dir().join("tenuki_dict_test_split_flush");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let mut dict = Dictionary::new(
+            tmp.clone(),
+            tmp.join("Tenuki.dict.txt"),
+            tmp.join("Tenuki.regex.txt"),
+            tmp.join("_out.bin"),
+            tx,
+        );
+
+        dict.register("hello", "bonjour");
+        dict.register(r#"r:"^ATK([+]Z[A-Z]+Z[%])$""#, "Attack$1");
+        assert_eq!(dict.flush_buffer(), 2);
+
+        let exact = std::fs::read_to_string(tmp.join("Tenuki.dict.txt")).unwrap();
+        let regex = std::fs::read_to_string(tmp.join("Tenuki.regex.txt")).unwrap();
+
+        assert!(exact.contains("hello=bonjour"));
+        assert!(!exact.contains("Attack$1"));
+        assert!(regex.contains(r#"r:"^ATK([+]Z[A-Z]+Z[%])$"=Attack$1"#));
+        assert!(!regex.contains("hello=bonjour"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

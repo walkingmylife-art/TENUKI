@@ -12,26 +12,28 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 
-use crate::backend::analysis::{self, SharedInputReplayState};
+use crate::backend::analysis::{
+    self, CompletedAnalysisPayload, CompletedTranslationRecord, SharedInputReplayState,
+};
 use crate::backend::dictionary::Dictionary;
 use crate::backend::logger::{LogEvent as PersistentLogEvent, LOG_TX};
-use crate::backend::processor::TextProcessor;
 use crate::backend::translator::{
-    self, LogEvent, NewEntriesCache, TranslationCache, TranslationResult, TranslationSettings,
-    TranslationStats,
+    self, LogEvent, NewEntriesCache, NewTranslationEntry, PersistEntry, TranslationCache,
+    TranslationResult, TranslationSettings, TranslationStats,
 };
 use crate::messages::{BackendEvent, LogLevel, LogSource};
 
-static OBSERVED_TAG_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<[^>\r\n]+>|＜[^＞\r\n]+＞").expect("tag regex"));
-static OBSERVED_MARKER_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"Z[A-Z]+Z").expect("marker regex"));
+const MAX_LIST_ITEMS: usize = 1024;
+const MAX_LIST_TOTAL_BYTES: usize = 512 * 1024;
+// `/translate` is a single normal translation request, not batch intake.
+// Keep this below /list's total limit so oversized POST bodies are rejected
+// before raw request logging or parsing.
+const MAX_TRANSLATE_BODY_BYTES: usize = 96 * 1024;
+const MAX_TRANSLATE_TEXT_BYTES: usize = 64 * 1024;
 
 // ============================================================
 // Request types
@@ -48,6 +50,11 @@ pub struct ListRequest {
     pub texts: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ListResponse {
+    pub texts: Vec<String>,
+}
+
 // ============================================================
 // Application state
 // ============================================================
@@ -55,7 +62,6 @@ pub struct ListRequest {
 #[derive(Clone)]
 pub struct AppState {
     pub dictionary: Arc<RwLock<Dictionary>>,
-    pub processor: Arc<dyn TextProcessor>,
     pub src_lang: Arc<RwLock<String>>,
     pub tgt_lang: Arc<RwLock<String>>,
     pub custom_lang_name: Arc<RwLock<String>>,
@@ -99,32 +105,30 @@ impl AppState {
     }
 
     fn emit_log(&self, event: &LogEvent) {
-        let (msg, level) = match event {
+        let entry = match event {
             LogEvent::DictHit {
                 elapsed_secs,
                 original,
                 translated,
-            } => (
+            } => Some((
                 format!(
                     "[TENUKI] ({:.2}s) {} -> {}",
                     elapsed_secs, original, translated
                 ),
                 LogLevel::Success,
-            ),
-            LogEvent::PreModelCall { original } => {
-                (format!("[XUnity] {}", original), LogLevel::Info)
+            )),
+            LogEvent::Error { message } => Some((format!("Error {}", message), LogLevel::Error)),
+            LogEvent::Trace { message } if crate::backend::logger::debug_logs_enabled() => {
+                Some((format!("[TRACE] {}", message), LogLevel::Info))
             }
-            LogEvent::ModelResult {
-                elapsed_secs,
-                translated,
-                ..
-            } => (
-                format!("[Model] ({:.2}s) {}", elapsed_secs, translated),
-                LogLevel::Info,
-            ),
-            _ => return,
+            LogEvent::PreModelCall { .. }
+            | LogEvent::ModelResult { .. }
+            | LogEvent::Trace { .. } => None,
         };
-        self.emit_persistent_log(msg, level);
+
+        if let Some((msg, level)) = entry {
+            self.emit_persistent_log(msg, level);
+        }
     }
 
     fn emit_stats(&self, stats: &TranslationStats) {
@@ -143,57 +147,45 @@ impl AppState {
     }
 
     fn emit_observation(&self, message: String) {
-        crate::backend::logger::write_observation(message.clone());
         if crate::backend::logger::debug_logs_enabled() {
+            crate::backend::logger::write_observation(message.clone());
             self.emit_persistent_log(format!("[OBSERVE] {}", message), LogLevel::Info);
         }
     }
 
     fn emit_request_log(&self, message: String) {
-        crate::backend::logger::write_request(message.clone());
         if crate::backend::logger::debug_logs_enabled() {
+            crate::backend::logger::write_request(message.clone());
             self.emit_persistent_log(format!("[REQUEST] {}", message), LogLevel::Info);
         }
     }
 }
 
-fn dictionary_log_display_pair(key: &str, value: &str, logs: &[LogEvent]) -> (String, String) {
-    let trimmed_key = key.trim();
-
-    if let Some((translated, elapsed_secs)) = logs.iter().find_map(|event| match event {
-        LogEvent::ModelResult {
-            original,
-            translated,
-            elapsed_secs,
-        } if original.trim() == trimmed_key => Some((translated.clone(), *elapsed_secs)),
-        _ => None,
-    }) {
-        return (
-            format!("[XUnity] {}", key),
-            format!("[Model] ({:.2}s) {}", elapsed_secs, translated),
-        );
+fn emit_word_log_pairs(event_tx: &tokio::sync::mpsc::Sender<BackendEvent>, logs: &[LogEvent]) {
+    for log in logs {
+        match log {
+            LogEvent::ModelResult {
+                source,
+                translated,
+                elapsed_secs,
+                ..
+            } => {
+                let _ = event_tx.try_send(BackendEvent::DictionaryLogEntry(
+                    crate::messages::current_timestamp(),
+                    format!("[XUnity] {}", source),
+                    format!("[Model] ({:.2}s) {}", elapsed_secs, translated),
+                ));
+            }
+            _ => {}
+        }
     }
-
-    if let Some((translated, elapsed_secs)) = logs.iter().find_map(|event| match event {
-        LogEvent::DictHit {
-            original,
-            translated,
-            elapsed_secs,
-        } if original.trim() == trimmed_key => Some((translated.clone(), *elapsed_secs)),
-        _ => None,
-    }) {
-        return (
-            format!("[XUnity] {}", key),
-            format!("[TENUKI] ({:.2}s) {}", elapsed_secs, translated),
-        );
-    }
-
-    (key.to_string(), value.to_string())
 }
 
 #[derive(Debug, Clone)]
 struct ItemDiagnostics {
     raw_text: String,
+    extracted_text: String,
+    visible_text: String,
     input_preview: String,
     dict_hits: usize,
     model_calls: usize,
@@ -203,10 +195,58 @@ struct ItemDiagnostics {
 #[derive(Default)]
 struct BatchTranslationOutput {
     texts: Vec<String>,
-    new_entries: Vec<(String, String)>,
+    new_entries: Vec<NewTranslationEntry>,
     stats: TranslationStats,
     logs: Vec<LogEvent>,
     item_diagnostics: Vec<ItemDiagnostics>,
+}
+
+#[derive(Clone, Copy)]
+struct PipelineBehavior {
+    use_dictionary_lookup: bool,
+    emit_dictionary_events: bool,
+    commit_new_entries: bool,
+    emit_word_logs: bool,
+    emit_stats: bool,
+    emit_observations: bool,
+}
+
+impl PipelineBehavior {
+    fn normal_translate() -> Self {
+        Self {
+            use_dictionary_lookup: true,
+            emit_dictionary_events: true,
+            commit_new_entries: true,
+            emit_word_logs: true,
+            emit_stats: true,
+            emit_observations: true,
+        }
+    }
+
+    fn list_mode() -> Self {
+        Self {
+            use_dictionary_lookup: false,
+            emit_dictionary_events: false,
+            commit_new_entries: false,
+            emit_word_logs: true,
+            emit_stats: false,
+            emit_observations: false,
+        }
+    }
+}
+
+struct PipelineResult {
+    texts: Vec<String>,
+    translated_text: String,
+    item_count: usize,
+    analysis_payload: Option<CompletedAnalysisPayload>,
+}
+
+#[derive(Default)]
+struct CommitSummary {
+    regex_registered: usize,
+    regex_skipped: usize,
+    exact_committed: usize,
 }
 
 fn preview_text(text: &str) -> String {
@@ -290,6 +330,7 @@ fn build_list_request_record(request: &ListRequest) -> String {
         "raw_request": request,
         "joined_text": request.texts.join("\n"),
         "item_count": request.texts.len(),
+        "total_bytes": total_list_request_bytes(&request.texts),
     })
     .to_string()
 }
@@ -315,8 +356,8 @@ fn build_list_response_record(translated_text: &str, item_count: usize) -> Strin
     .to_string()
 }
 
-fn contains_observed_markup(text: &str) -> bool {
-    OBSERVED_TAG_RE.is_match(text) || OBSERVED_MARKER_RE.is_match(text)
+fn total_list_request_bytes(texts: &[String]) -> usize {
+    texts.iter().map(|text| text.len()).sum()
 }
 
 fn model_inputs_from_logs(logs: &[LogEvent]) -> Vec<String> {
@@ -331,6 +372,8 @@ fn model_inputs_from_logs(logs: &[LogEvent]) -> Vec<String> {
 fn build_observation_record(
     route: &str,
     raw_line: &str,
+    extracted_text: &str,
+    visible_text: &str,
     final_output: &str,
     dict_hits: usize,
     model_calls: usize,
@@ -339,8 +382,8 @@ fn build_observation_record(
     serde_json::json!({
         "route": route,
         "raw_line": raw_line,
-        "extracted_text": raw_line,
-        "visible_text": raw_line,
+        "extracted_text": extracted_text,
+        "visible_text": visible_text,
         "model_inputs": model_inputs,
         "final_output": final_output,
         "dict_hits": dict_hits,
@@ -359,6 +402,8 @@ fn emit_observation_logs(
         let record = build_observation_record(
             route,
             &diagnostic.raw_text,
+            &diagnostic.extracted_text,
+            &diagnostic.visible_text,
             translated,
             diagnostic.dict_hits,
             diagnostic.model_calls,
@@ -366,6 +411,44 @@ fn emit_observation_logs(
         );
         state.emit_observation(record);
     }
+}
+
+fn build_completed_analysis_payload(
+    batch: &BatchTranslationOutput,
+    final_output: &str,
+) -> Option<CompletedAnalysisPayload> {
+    if batch.item_diagnostics.is_empty() {
+        return None;
+    }
+
+    Some(CompletedAnalysisPayload {
+        raw_text: batch
+            .item_diagnostics
+            .iter()
+            .map(|item| item.raw_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        extracted_text: batch
+            .item_diagnostics
+            .iter()
+            .map(|item| item.extracted_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        visible_text: batch
+            .item_diagnostics
+            .iter()
+            .map(|item| item.visible_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        model_inputs: batch
+            .item_diagnostics
+            .iter()
+            .flat_map(|item| item.model_inputs.iter().cloned())
+            .collect(),
+        final_output: final_output.to_string(),
+        dict_hits: batch.stats.dict_hits,
+        model_calls: batch.stats.model_calls,
+    })
 }
 
 fn parse_form_text(body: &str) -> Option<String> {
@@ -429,6 +512,7 @@ fn translate_texts_batch(
     llm_slots: usize,
     tgt_lang: String,
     settings: TranslationSettings,
+    behavior: PipelineBehavior,
     texts: Vec<String>,
 ) -> BatchTranslationOutput {
     fn translate_one_text(
@@ -438,16 +522,100 @@ fn translate_texts_batch(
         prefix: &str,
         tgt_lang: &str,
         settings: TranslationSettings,
+        use_dictionary_lookup: bool,
         text: &str,
     ) -> (TranslationResult, ItemDiagnostics) {
-        let lookup = |key: &str| -> Option<String> {
-            t_cache
-                .get(key)
-                .map(|value| value.clone())
-                .or_else(|| dictionary.blocking_read().lookup(key))
+        let lookup_trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::<LogEvent>::new()));
+        let lookup_trace_clone = std::sync::Arc::clone(&lookup_trace);
+
+        let lookup = move |key: &str| -> Option<String> {
+            if !use_dictionary_lookup {
+                lookup_trace_clone.lock().unwrap().push(LogEvent::Trace {
+                    message: serde_json::json!({
+                        "stage": "after_lookup",
+                        "result": "lookup_disabled",
+                        "key": preview_text(key),
+                        "key_len": key.len(),
+                    })
+                    .to_string(),
+                });
+                return None;
+            }
+
+            if let Some(value) = t_cache.lookup_source(key) {
+                lookup_trace_clone.lock().unwrap().push(LogEvent::Trace {
+                    message: serde_json::json!({
+                        "stage": "after_lookup",
+                        "result": "hit_cache_source",
+                        "key": preview_text(key),
+                        "key_len": key.len(),
+                        "hit_value": crate::backend::server::preview_text(&value),
+                        "hit_value_len": value.len(),
+                    })
+                    .to_string(),
+                });
+                return Some(value);
+            }
+
+            if let Some(value) = dictionary.blocking_read().lookup_source(key) {
+                t_cache.insert(key.to_string(), value.clone());
+                lookup_trace_clone.lock().unwrap().push(LogEvent::Trace {
+                    message: serde_json::json!({
+                        "stage": "after_lookup",
+                        "result": "hit_dictionary_source",
+                        "key": preview_text(key),
+                        "key_len": key.len(),
+                        "hit_value": crate::backend::server::preview_text(&value),
+                        "hit_value_len": value.len(),
+                    })
+                    .to_string(),
+                });
+                return Some(value);
+            }
+
+            if let Some(value) = t_cache.lookup_value(key) {
+                lookup_trace_clone.lock().unwrap().push(LogEvent::Trace {
+                    message: serde_json::json!({
+                        "stage": "after_lookup",
+                        "result": "hit_cache_value",
+                        "key": preview_text(key),
+                        "key_len": key.len(),
+                        "hit_value": crate::backend::server::preview_text(&value),
+                        "hit_value_len": value.len(),
+                    })
+                    .to_string(),
+                });
+                return Some(value);
+            }
+
+            if let Some(value) = dictionary.blocking_read().lookup_value(key) {
+                lookup_trace_clone.lock().unwrap().push(LogEvent::Trace {
+                    message: serde_json::json!({
+                        "stage": "after_lookup",
+                        "result": "hit_dictionary_value",
+                        "key": preview_text(key),
+                        "key_len": key.len(),
+                        "hit_value": crate::backend::server::preview_text(&value),
+                        "hit_value_len": value.len(),
+                    })
+                    .to_string(),
+                });
+                return Some(value);
+            }
+
+            lookup_trace_clone.lock().unwrap().push(LogEvent::Trace {
+                message: serde_json::json!({
+                    "stage": "after_lookup",
+                    "result": "miss",
+                    "key": preview_text(key),
+                    "key_len": key.len(),
+                })
+                .to_string(),
+            });
+            None
         };
 
-        let result = translator::translate_chunk(
+        let mut result = translator::translate_chunk(
             text,
             lookup,
             prefix,
@@ -456,8 +624,13 @@ fn translate_texts_batch(
             settings,
         );
 
+        let lookup_logs = lookup_trace.lock().unwrap().drain(..).collect::<Vec<_>>();
+        result.logs.extend(lookup_logs);
+
         let diagnostics = ItemDiagnostics {
             raw_text: text.to_string(),
+            extracted_text: text.to_string(),
+            visible_text: text.to_string(),
             input_preview: preview_text(text),
             dict_hits: result.stats.dict_hits,
             model_calls: result.stats.model_calls,
@@ -471,13 +644,11 @@ fn translate_texts_batch(
         result: &TranslationResult,
         event_tx: &tokio::sync::mpsc::Sender<BackendEvent>,
     ) {
-        for (key, value) in &result.new_entries {
-            let (display_key, display_value) =
-                dictionary_log_display_pair(key, value, &result.logs);
-            let _ = event_tx.try_send(BackendEvent::DictionaryLogEntry(
+        for entry in &result.new_entries {
+            let _ = event_tx.try_send(BackendEvent::DictionaryNewEntry(
                 crate::messages::current_timestamp(),
-                display_key,
-                display_value,
+                entry.source.clone(),
+                entry.translated.clone(),
             ));
         }
     }
@@ -499,10 +670,13 @@ fn translate_texts_batch(
                 &prefix,
                 &tgt_lang,
                 settings,
+                behavior.use_dictionary_lookup,
                 &text,
             );
 
-            emit_new_entries(&result, &event_tx);
+            if behavior.emit_dictionary_events {
+                emit_new_entries(&result, &event_tx);
+            }
             output.logs.extend(result.logs.clone());
             output.new_entries.extend(result.new_entries.clone());
             output.stats.merge(&result.stats);
@@ -551,6 +725,7 @@ fn translate_texts_batch(
                     &prefix,
                     &tgt_lang,
                     settings,
+                    behavior.use_dictionary_lookup,
                     &text,
                 );
 
@@ -562,7 +737,9 @@ fn translate_texts_batch(
 
     let results = results.lock().expect("results mutex poisoned");
     for (result, diagnostics) in results.iter().flatten() {
-        emit_new_entries(result, &event_tx);
+        if behavior.emit_dictionary_events {
+            emit_new_entries(result, &event_tx);
+        }
         output.logs.extend(result.logs.clone());
         output.new_entries.extend(result.new_entries.clone());
         output.stats.merge(&result.stats);
@@ -573,74 +750,215 @@ fn translate_texts_batch(
     output
 }
 
-fn commit_new_entries(
+async fn commit_new_entries(
+    dictionary: &Arc<RwLock<Dictionary>>,
     t_cache: &TranslationCache,
     n_cache: &NewEntriesCache,
-    entries: &[(String, String)],
-) {
-    for (key, value) in entries {
-        t_cache.insert(key.clone(), value.clone());
-        n_cache.insert(key.clone(), value.clone());
+    entries: &[NewTranslationEntry],
+) -> CommitSummary {
+    let mut summary = CommitSummary::default();
+    for entry in entries {
+        match &entry.persist {
+            PersistEntry::Exact { key, value } => {
+                log::info!(
+                    "[COMMIT] exact_received source=\"{}\" value=\"{}\"",
+                    key,
+                    value
+                );
+                t_cache.insert(key.clone(), value.clone());
+                n_cache.insert(key.clone(), value.clone());
+                log::info!(
+                    "[COMMIT] exact_queued_save key=\"{}\" value=\"{}\"",
+                    key,
+                    value
+                );
+                summary.exact_committed += 1;
+            }
+            PersistEntry::Regex {
+                pattern,
+                replacement,
+            } => {
+                log::info!(
+                    "[COMMIT] regex_received source=\"{}\" pattern=\"{}\" replacement=\"{}\"",
+                    entry.source,
+                    pattern,
+                    replacement
+                );
+                // Register immediately in the live dictionary for same‑session hits
+                let registered = {
+                    let mut dict = dictionary.write().await;
+                    dict.register_regex_rule(pattern.clone(), replacement.clone())
+                };
+
+                log::info!(
+                    "[COMMIT] regex_live_registered ok={} pattern=\"{}\"",
+                    registered,
+                    pattern
+                );
+
+                if registered {
+                    // Save r: line to n_cache for shutdown flush
+                    let key = format!("r:\"{}\"", pattern);
+                    n_cache.insert(key.clone(), replacement.clone());
+                    log::info!(
+                        "[COMMIT] regex_queued_save key='{}' value=\"{}\"",
+                        key,
+                        replacement
+                    );
+                    summary.regex_registered += 1;
+                } else {
+                    // Regex registration failed. Do not queue an exact fallback save.
+                    log::info!(
+                        "[COMMIT] regex_save_skipped source=\"{}\" pattern=\"{}\" reason=live_register_failed",
+                        entry.source,
+                        pattern
+                    );
+                    summary.regex_skipped += 1;
+                }
+            }
+        }
     }
+
+    summary
 }
 
 // ============================================================
-// Translation entry point for a single text
+// Common translation pipeline: translate → commit → emit
+//
+// Handlers own HTTP shape and request/response records.
+// run_pipeline owns everything between: batch execution and side-effects.
 
-async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
-    if text.is_empty() {
-        return "no text".into_response();
-    }
-
-    let text = text.replace("\r\n", "\n");
+async fn run_pipeline(
+    state: &AppState,
+    route: &str,
+    behavior: PipelineBehavior,
+    texts: Vec<String>,
+) -> Result<PipelineResult, String> {
     let prefix = state.current_prefix().await;
     let llm_client = state.llm_client.clone();
     let dictionary = state.dictionary.clone();
+    let dict_for_commit = dictionary.clone();
     let t_cache = state.t_cache.clone();
     let event_tx = state.event_tx.clone();
     let llm_slots = state.llm_slots;
     let tgt_lang = state.tgt_lang.read().await.clone();
     let settings = state.translation_settings;
 
-    let texts = vec![text.clone()];
     let batch = tokio::task::spawn_blocking(move || {
         translate_texts_batch(
-            dictionary, llm_client, t_cache, event_tx, prefix, llm_slots, tgt_lang, settings, texts,
+            dictionary, llm_client, t_cache, event_tx, prefix, llm_slots, tgt_lang, settings,
+            behavior, texts,
         )
     })
     .await
-    .unwrap();
+    .map_err(|e| format!("translation worker panicked: {}", e))?;
 
-    commit_new_entries(
-        state.t_cache.as_ref(),
-        state.n_cache.as_ref(),
-        &batch.new_entries,
-    );
+    let item_count = batch.texts.len();
+    let translated_text = batch.texts.join("\n");
+    let analysis_payload = behavior
+        .emit_observations
+        .then(|| build_completed_analysis_payload(&batch, &translated_text))
+        .flatten();
+
+    if behavior.commit_new_entries {
+        let exact_entries = batch
+            .new_entries
+            .iter()
+            .filter(|entry| matches!(entry.persist, PersistEntry::Exact { .. }))
+            .count();
+        let regex_entries = batch.new_entries.len().saturating_sub(exact_entries);
+        state.emit_log(&LogEvent::Trace {
+            message: serde_json::json!({
+                "stage": "before_commit_new_entries",
+                "new_entries_len": batch.new_entries.len(),
+                "regex_entries": regex_entries,
+                "exact_entries": exact_entries,
+            })
+            .to_string(),
+        });
+
+        let summary = commit_new_entries(
+            &dict_for_commit,
+            state.t_cache.as_ref(),
+            state.n_cache.as_ref(),
+            &batch.new_entries,
+        )
+        .await;
+
+        state.emit_log(&LogEvent::Trace {
+            message: serde_json::json!({
+                "stage": "after_commit_new_entries",
+                "regex_registered": summary.regex_registered,
+                "regex_skipped": summary.regex_skipped,
+                "exact_committed": summary.exact_committed,
+            })
+            .to_string(),
+        });
+    }
+    if behavior.emit_word_logs {
+        emit_word_log_pairs(&state.event_tx, &batch.logs);
+    }
     for log in &batch.logs {
         state.emit_log(log);
     }
-    state.emit_stats(&batch.stats);
-    emit_batch_diagnostics(state.as_ref(), "translate", &batch);
-    emit_observation_logs(
-        state.as_ref(),
+    if behavior.emit_stats {
+        state.emit_stats(&batch.stats);
+    }
+    emit_batch_diagnostics(state, route, &batch);
+    if behavior.emit_observations {
+        emit_observation_logs(state, route, &batch.texts, &batch.item_diagnostics);
+    }
+
+    Ok(PipelineResult {
+        texts: batch.texts,
+        translated_text,
+        item_count,
+        analysis_payload,
+    })
+}
+
+async fn perform_translation(state: Arc<AppState>, text: String) -> Response {
+    let text = text.replace("\r\n", "\n");
+    let result = match run_pipeline(
+        &state,
         "translate",
-        &batch.texts,
-        &batch.item_diagnostics,
-    );
-    let translated_text = batch.texts.join("\n");
-    state.emit_request_log(build_translate_response_record(&translated_text));
+        PipelineBehavior::normal_translate(),
+        vec![text.clone()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.emit_persistent_log(e, LogLevel::Error);
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    state.emit_request_log(build_translate_response_record(&result.translated_text));
+
+    state.emit_log(&LogEvent::Trace {
+        message: serde_json::json!({
+            "stage": "before_response",
+            "response_text": preview_text(&result.translated_text),
+            "response_text_len": result.translated_text.len(),
+        })
+        .to_string(),
+    });
+
+    let Some(authority_payload) = result.analysis_payload else {
+        state.emit_persistent_log(
+            "translate completed without input analysis authority payload".to_string(),
+            LogLevel::Error,
+        );
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let snapshot = analysis::record_completed_translation(
         &state.input_replay,
-        &text,
-        &translated_text,
-        state.processor.as_ref(),
-        batch.stats.dict_hits,
-        batch.stats.model_calls,
+        CompletedTranslationRecord { authority_payload },
     );
     let _ = state
         .event_tx
         .try_send(BackendEvent::InputAnalysisUpdated(snapshot));
-    translated_text.into_response()
+    result.translated_text.into_response()
 }
 // ============================================================
 // Handlers
@@ -668,6 +986,39 @@ async fn translate_get_handler(
         &raw_request,
         &text,
     ));
+    if text.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "no text").into_response();
+    }
+
+    if text.len() > MAX_TRANSLATE_TEXT_BYTES {
+        state.emit_diagnostic(format!(
+            "translate GET rejected: text too large bytes={} limit={}",
+            text.len(),
+            MAX_TRANSLATE_TEXT_BYTES
+        ));
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "translate text too large",
+        )
+            .into_response();
+    }
+
+    state.emit_log(&LogEvent::Trace {
+        message: serde_json::json!({
+            "stage": "request_received",
+            "route": "translate",
+            "source": "query",
+            "content_type": "",
+            "raw_request_preview": preview_text(&raw_request),
+            "raw_request_len": raw_request.len(),
+            "parsed_text_preview": preview_text(&text),
+            "parsed_text_len": text.len(),
+            "normalized_text_preview": preview_text(&text.replace("\r\n", "\n")),
+            "normalized_text_len": text.replace("\r\n", "\n").len(),
+        })
+        .to_string(),
+    });
+
     perform_translation(state, text).await
 }
 
@@ -676,6 +1027,19 @@ pub async fn translate_post_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if body.len() > MAX_TRANSLATE_BODY_BYTES {
+        state.emit_diagnostic(format!(
+            "translate rejected: body too large bytes={} limit={}",
+            body.len(),
+            MAX_TRANSLATE_BODY_BYTES
+        ));
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "translate request body too large",
+        )
+            .into_response();
+    }
+
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
@@ -702,6 +1066,39 @@ pub async fn translate_post_handler(
         ));
     }
 
+    if text.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "no text").into_response();
+    }
+
+    if text.len() > MAX_TRANSLATE_TEXT_BYTES {
+        state.emit_diagnostic(format!(
+            "translate rejected: text too large bytes={} limit={}",
+            text.len(),
+            MAX_TRANSLATE_TEXT_BYTES
+        ));
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "translate text too large",
+        )
+            .into_response();
+    }
+
+    state.emit_log(&LogEvent::Trace {
+        message: serde_json::json!({
+            "stage": "request_received",
+            "route": "translate",
+            "source": "post_body",
+            "content_type": content_type.unwrap_or_default(),
+            "raw_request_preview": preview_text(&raw_request),
+            "raw_request_len": raw_request.len(),
+            "parsed_text_preview": preview_text(&text),
+            "parsed_text_len": text.len(),
+            "normalized_text_preview": preview_text(&text.replace("\r\n", "\n")),
+            "normalized_text_len": text.replace("\r\n", "\n").len(),
+        })
+        .to_string(),
+    });
+
     perform_translation(state, text).await
 }
 
@@ -714,86 +1111,69 @@ async fn list_handler(
         return (axum::http::StatusCode::BAD_REQUEST, "no texts").into_response();
     }
 
+    let item_count = request.texts.len();
+    if item_count > MAX_LIST_ITEMS {
+        state.emit_diagnostic(format!(
+            "list request rejected: item_count={} exceeds limit={}",
+            item_count, MAX_LIST_ITEMS
+        ));
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "too many texts for /list",
+        )
+            .into_response();
+    }
+
+    let total_bytes = total_list_request_bytes(&request.texts);
+    if total_bytes > MAX_LIST_TOTAL_BYTES {
+        state.emit_diagnostic(format!(
+            "list request rejected: total_bytes={} exceeds limit={}",
+            total_bytes, MAX_LIST_TOTAL_BYTES
+        ));
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "list payload too large",
+        )
+            .into_response();
+    }
+
     state.emit_request_log(build_list_request_record(&request));
 
-    let prefix = state.current_prefix().await;
-    let llm_client = state.llm_client.clone();
-    let dictionary = state.dictionary.clone();
-    let t_cache = state.t_cache.clone();
-    let event_tx = state.event_tx.clone();
-    let llm_slots = state.llm_slots;
-    let tgt_lang = state.tgt_lang.read().await.clone();
-    let settings = state.translation_settings;
-    let texts = request.texts;
-    let raw_text = texts.join("\n");
-    let batch = tokio::task::spawn_blocking(move || {
-        translate_texts_batch(
-            dictionary, llm_client, t_cache, event_tx, prefix, llm_slots, tgt_lang, settings, texts,
-        )
-    })
-    .await
-    .unwrap();
-
-    commit_new_entries(
-        state.t_cache.as_ref(),
-        state.n_cache.as_ref(),
-        &batch.new_entries,
-    );
-    for log in &batch.logs {
-        state.emit_log(log);
-    }
-    state.emit_stats(&batch.stats);
-    emit_batch_diagnostics(state.as_ref(), "list", &batch);
-    emit_observation_logs(
-        state.as_ref(),
-        "list",
-        &batch.texts,
-        &batch.item_diagnostics,
-    );
-    let translated_text = batch.texts.join("\n");
+    let result =
+        match run_pipeline(&state, "list", PipelineBehavior::list_mode(), request.texts).await {
+            Ok(r) => r,
+            Err(e) => {
+                state.emit_persistent_log(e, LogLevel::Error);
+                return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
     state.emit_request_log(build_list_response_record(
-        &translated_text,
-        batch.texts.len(),
+        &result.translated_text,
+        result.item_count,
     ));
-    let snapshot = analysis::record_completed_translation(
-        &state.input_replay,
-        &raw_text,
-        &translated_text,
-        state.processor.as_ref(),
-        batch.stats.dict_hits,
-        batch.stats.model_calls,
-    );
-    let _ = state
-        .event_tx
-        .try_send(BackendEvent::InputAnalysisUpdated(snapshot));
-    translated_text.into_response()
+    Json(ListResponse {
+        texts: result.texts,
+    })
+    .into_response()
 }
 
 async fn shutdown_handler(State(state): State<Arc<AppState>>) -> &'static str {
-    // n_cache -> dict.register -> flush_buffer
-    if !state.n_cache.is_empty() {
-        let entries = state.n_cache.drain();
-        let mut dict = state.dictionary.write().await;
-        for (k, v) in &entries {
-            dict.register(&k, &v);
-        }
-        let _ = dict.flush_buffer();
-        let _ = state.event_tx.try_send(BackendEvent::Log(
-            LogSource::Tenuki,
-            format!(
-                "Shutdown: {} new entries flushed to dictionary",
-                entries.len()
-            ),
-            LogLevel::Info,
-            crate::messages::current_timestamp(),
-        ));
+    state.t_cache.clear();
+    let drained = state.n_cache.drain();
+    if !drained.is_empty() {
+        log::info!(
+            "[FLUSH] shutdown_route_drain_discard count={}",
+            drained.len()
+        );
     }
+
     let _ = state.event_tx.try_send(BackendEvent::Log(
         LogSource::Tenuki,
-        "Shutdown request received".to_string(),
+        "Shutdown request received: translation cache cleared".to_string(),
         LogLevel::Info,
         crate::messages::current_timestamp(),
     ));
+
     "ok"
 }
 
@@ -806,7 +1186,6 @@ pub async fn run_translation_server(
     host: String,
     port: u16,
     dictionary: Arc<RwLock<Dictionary>>,
-    processor: Arc<dyn TextProcessor>,
     src_lang: String,
     tgt_lang: String,
     custom_lang_name: String,
@@ -831,7 +1210,6 @@ pub async fn run_translation_server(
 
     let state = Arc::new(AppState {
         dictionary,
-        processor,
         src_lang: Arc::new(RwLock::new(src_lang)),
         tgt_lang: Arc::new(RwLock::new(tgt_lang)),
         custom_lang_name: Arc::new(RwLock::new(custom_lang_name)),
@@ -930,16 +1308,22 @@ pub async fn run_translation_server(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_list_request_record, build_list_response_record, build_observation_record,
-        build_translate_request_record, build_translate_response_record, commit_new_entries,
-        contains_observed_markup, extract_translate_post_text, translate_texts_batch, ListRequest,
+        build_completed_analysis_payload, build_list_request_record, build_list_response_record,
+        build_observation_record, build_translate_request_record, build_translate_response_record,
+        commit_new_entries, emit_word_log_pairs, extract_translate_post_text, list_handler,
+        perform_translation, run_pipeline, total_list_request_bytes, translate_get_handler,
+        translate_post_handler, translate_texts_batch, AppState, BatchTranslationOutput,
+        ItemDiagnostics, ListRequest, ListResponse, PipelineBehavior, TranslateRequest,
+        MAX_LIST_ITEMS, MAX_LIST_TOTAL_BYTES, MAX_TRANSLATE_BODY_BYTES, MAX_TRANSLATE_TEXT_BYTES,
     };
-    use crate::backend::analysis::find_unescaped_assignment_separator;
+    use crate::backend::analysis::InputReplayState;
     use crate::backend::dictionary::Dictionary;
     use crate::backend::translator::{
-        self, NewEntriesCache, TranslationCache, TranslationSettings,
+        self, LogEvent, NewEntriesCache, NewTranslationEntry, PersistEntry, TranslationCache,
+        TranslationSettings, TranslationStats,
     };
     use crate::messages::BackendEvent;
+    use axum::{body::to_bytes, http::StatusCode};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -959,6 +1343,10 @@ mod tests {
                 responses: Mutex::new(values.iter().map(|v| v.to_string()).collect()),
             }
         }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
     }
 
     impl translator::LlmClient for MockLlmClient {
@@ -971,6 +1359,88 @@ mod tests {
                 Some(responses.remove(0))
             }
         }
+    }
+
+    struct PanickingLlmClient;
+
+    impl translator::LlmClient for PanickingLlmClient {
+        fn translate_sync(&self, _text: &str, _prefix: &str) -> Option<String> {
+            panic!("test panic")
+        }
+    }
+
+    struct InjectingLlmClient {
+        inner: MockLlmClient,
+        dictionary: Arc<RwLock<Dictionary>>,
+        pattern: String,
+        replacement: String,
+    }
+
+    impl InjectingLlmClient {
+        fn with_responses(
+            dictionary: Arc<RwLock<Dictionary>>,
+            pattern: &str,
+            replacement: &str,
+            values: &[&str],
+        ) -> Self {
+            Self {
+                inner: MockLlmClient::with_responses(values),
+                dictionary,
+                pattern: pattern.to_string(),
+                replacement: replacement.to_string(),
+            }
+        }
+    }
+
+    impl translator::LlmClient for InjectingLlmClient {
+        fn translate_sync(&self, text: &str, prefix: &str) -> Option<String> {
+            let translated = self.inner.translate_sync(text, prefix);
+            if translated.is_some() {
+                let _ = self
+                    .dictionary
+                    .blocking_write()
+                    .register_regex_rule(self.pattern.clone(), self.replacement.clone());
+            }
+            translated
+        }
+    }
+
+    fn test_app_state_with_event_rx(
+        llm_client: Arc<dyn translator::LlmClient>,
+    ) -> (Arc<AppState>, tokio::sync::mpsc::Receiver<BackendEvent>) {
+        let dict_dir = test_dictionary_dir("handler");
+        let (dict_tx, _) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
+        let state = Arc::new(AppState {
+            dictionary,
+            src_lang: Arc::new(RwLock::new("ja".to_string())),
+            tgt_lang: Arc::new(RwLock::new("en".to_string())),
+            custom_lang_name: Arc::new(RwLock::new(String::new())),
+            prompt_template: String::new(),
+            translation_settings: test_settings(),
+            llm_client,
+            event_tx,
+            t_cache: Arc::new(TranslationCache::default()),
+            n_cache: Arc::new(NewEntriesCache::default()),
+            input_replay: Arc::new(Mutex::new(InputReplayState::default())),
+            llm_slots: 1,
+        });
+        (state, event_rx)
+    }
+
+    fn test_app_state_with_llm(llm_client: Arc<dyn translator::LlmClient>) -> Arc<AppState> {
+        test_app_state_with_event_rx(llm_client).0
+    }
+
+    fn test_app_state() -> Arc<AppState> {
+        test_app_state_with_llm(Arc::new(MockLlmClient::default()))
     }
 
     fn test_settings() -> TranslationSettings {
@@ -990,6 +1460,436 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tenuki_server_test_{}_{}", tag, unique));
         std::fs::create_dir_all(dir.join("txt_root")).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn handler_returns_400_for_empty_input_translate_and_list() {
+        let state = test_app_state();
+
+        let res = translate_get_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Query(TranslateRequest {
+                text: None,
+                content: None,
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = list_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Json(ListRequest { texts: vec![] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_handler_rejects_too_many_items() {
+        let state = test_app_state();
+        let texts = (0..(MAX_LIST_ITEMS + 1))
+            .map(|i| format!("item-{i}"))
+            .collect::<Vec<_>>();
+
+        let res = list_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Json(ListRequest { texts }),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "too many texts for /list"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_handler_rejects_payloads_over_total_byte_limit() {
+        let state = test_app_state();
+        let oversized = "a".repeat(MAX_LIST_TOTAL_BYTES + 1);
+        let texts = vec![oversized];
+
+        assert!(total_list_request_bytes(&texts) > MAX_LIST_TOTAL_BYTES);
+
+        let res = list_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Json(ListRequest { texts }),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "list payload too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_handler_bypasses_dictionary_cache_commit_and_input_analysis_but_emits_word_logs()
+    {
+        let llm_client: Arc<dyn translator::LlmClient> =
+            Arc::new(MockLlmClient::with_responses(&["model result"]));
+        let (state, mut event_rx) = test_app_state_with_event_rx(llm_client);
+
+        state
+            .dictionary
+            .write()
+            .await
+            .register("hello", "dictionary result");
+        state
+            .t_cache
+            .insert("hello".to_string(), "cache result".to_string());
+
+        let res = list_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Json(ListRequest {
+                texts: vec!["hello".to_string()],
+            }),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let response: ListResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.texts, vec!["model result".to_string()]);
+        assert_eq!(
+            state.t_cache.get("hello").map(|value| value.clone()),
+            Some("cache result".to_string())
+        );
+        assert!(state.n_cache.drain().is_empty());
+
+        let mut word_log = None;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                BackendEvent::DictionaryLogEntry(_, source, translated) => {
+                    word_log = Some((source, translated));
+                }
+                BackendEvent::InputAnalysisUpdated(_) | BackendEvent::StatisticsUpdate(_, _) => {
+                    panic!("List mode emitted normal-mode side-effect event: {event:?}");
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            word_log,
+            Some((
+                "[XUnity] hello".to_string(),
+                "[Model] (0.00s) model result".to_string(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_log_keeps_tenuki_entries_but_skips_word_log_entries() {
+        let (state, mut event_rx) =
+            test_app_state_with_event_rx(Arc::new(MockLlmClient::default()));
+
+        state.emit_log(&LogEvent::PreModelCall {
+            original: "hello".to_string(),
+        });
+        state.emit_log(&LogEvent::ModelResult {
+            source: "hello".to_string(),
+            original: "hello".to_string(),
+            translated: "bonjour".to_string(),
+            elapsed_secs: 0.42,
+        });
+        state.emit_log(&LogEvent::DictHit {
+            original: "hello".to_string(),
+            translated: "dictionary".to_string(),
+            elapsed_secs: 0.01,
+        });
+
+        let mut tenuki_messages = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let BackendEvent::Log(_, message, _, _) = event {
+                tenuki_messages.push(message);
+            }
+        }
+
+        assert_eq!(
+            tenuki_messages,
+            vec!["[TENUKI] (0.01s) hello -> dictionary".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_word_log_pairs_emits_dictionary_log_entries_from_model_pairs() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let logs = vec![
+            LogEvent::PreModelCall {
+                original: "ATK+2%".to_string(),
+            },
+            LogEvent::ModelResult {
+                source: "ATK+ZMCZ%".to_string(),
+                original: "ATK+2%".to_string(),
+                translated: "Attack+ZMCZ%".to_string(),
+                elapsed_secs: 0.42,
+            },
+            LogEvent::Trace {
+                message: "ignored".to_string(),
+            },
+        ];
+
+        emit_word_log_pairs(&event_tx, &logs);
+        drop(event_tx);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(BackendEvent::DictionaryLogEntry(_, source, translated))
+                if source == "[XUnity] ATK+ZMCZ%"
+                    && translated == "[Model] (0.42s) Attack+ZMCZ%"
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn normal_translate_emits_dictionary_new_entry_and_single_word_log() {
+        let llm_client: Arc<dyn translator::LlmClient> =
+            Arc::new(MockLlmClient::with_responses(&["bonjour"]));
+        let (state, mut event_rx) = test_app_state_with_event_rx(llm_client);
+
+        let result = run_pipeline(
+            &state,
+            "translate",
+            PipelineBehavior {
+                use_dictionary_lookup: false,
+                emit_dictionary_events: true,
+                commit_new_entries: false,
+                emit_word_logs: true,
+                emit_stats: false,
+                emit_observations: false,
+            },
+            vec!["hello".to_string()],
+        )
+        .await
+        .expect("pipeline should succeed");
+
+        assert_eq!(result.translated_text, "bonjour");
+
+        let mut new_entry_events = Vec::new();
+        let mut word_log_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                BackendEvent::DictionaryNewEntry(_, source, translated) => {
+                    new_entry_events.push((source, translated));
+                }
+                BackendEvent::DictionaryLogEntry(_, source, translated) => {
+                    word_log_events.push((source, translated));
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            new_entry_events,
+            vec![("hello".to_string(), "bonjour".to_string())]
+        );
+        assert_eq!(
+            word_log_events,
+            vec![(
+                "[XUnity] hello".to_string(),
+                "[Model] (0.00s) bonjour".to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn translate_post_rejects_oversized_raw_body() {
+        let state = test_app_state();
+        let oversized = "a".repeat(MAX_TRANSLATE_BODY_BYTES + 1);
+
+        let res = translate_post_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(oversized),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "translate request body too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn translate_post_rejects_oversized_parsed_text() {
+        let state = test_app_state();
+        // body within limit, but parsed text exceeds text limit
+        let padding = "a".repeat(MAX_TRANSLATE_TEXT_BYTES + 1);
+        let json_body = format!(r#"{{"text":"{}"}}"#, padding);
+
+        let res = translate_post_handler(
+            axum::extract::State(Arc::clone(&state)),
+            {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".parse().unwrap(),
+                );
+                headers
+            },
+            axum::body::Bytes::from(json_body),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "translate text too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn translate_post_accepts_normal_json_body() {
+        let state = test_app_state();
+
+        let res = translate_post_handler(
+            axum::extract::State(Arc::clone(&state)),
+            {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".parse().unwrap(),
+                );
+                headers
+            },
+            axum::body::Bytes::from(r#"{"text":"Hello"}"#),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn translate_post_returns_400_for_empty_body() {
+        let state = test_app_state();
+        let res = translate_post_handler(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pipeline_join_error_returns_500() {
+        let state = test_app_state_with_llm(Arc::new(PanickingLlmClient));
+        let res = perform_translation(Arc::clone(&state), "hello".to_string()).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn translate_emits_input_analysis_from_authority_payload() {
+        let (state, mut event_rx) =
+            test_app_state_with_event_rx(Arc::new(MockLlmClient::with_responses(&["translated"])));
+        let res = perform_translation(Arc::clone(&state), "hello".to_string()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut snapshot = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let BackendEvent::InputAnalysisUpdated(value) = event {
+                snapshot = Some(value);
+                break;
+            }
+        }
+        let snapshot = snapshot.expect("translation should emit input analysis");
+
+        assert_eq!(snapshot.raw_text, "hello");
+        assert_eq!(snapshot.extracted_text, "hello");
+        assert_eq!(snapshot.visible_text, "hello");
+        assert_eq!(snapshot.model_inputs, vec!["hello".to_string()]);
+        assert_eq!(snapshot.final_output.as_deref(), Some("translated"));
+        assert_eq!(snapshot.dict_hits, 0);
+        assert_eq!(snapshot.model_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn zm_regex_request_returns_200_and_commits_live_regex() {
+        let llm_client: Arc<dyn translator::LlmClient> =
+            Arc::new(MockLlmClient::with_responses(&["Attack+2%"]));
+        let state = test_app_state_with_llm(llm_client);
+
+        let res = perform_translation(Arc::clone(&state), "ATK+ZMCZ%".to_string()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "Attack+ZMCZ%");
+        assert!(state.t_cache.get("ATK+ZMCZ%").is_none());
+        assert_eq!(
+            state.dictionary.read().await.lookup_source("ATK+ZMDZ%"),
+            Some("Attack+ZMDZ%".to_string())
+        );
+        assert_eq!(
+            state.n_cache.drain(),
+            vec![(
+                "r:\"^ATK([+＋\\-－−]?Z[A-Z]+Z[%％]?)$\"".to_string(),
+                "Attack$1".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_regex_live_register_does_not_break_pipeline_response() {
+        let dict_dir = test_dictionary_dir("duplicate_regex_http_200");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+        let llm_client: Arc<dyn translator::LlmClient> =
+            Arc::new(InjectingLlmClient::with_responses(
+                Arc::clone(&dictionary),
+                "^ATK([+＋\\-－−]?Z[A-Z]+Z[%％]?)$",
+                "Attack$1",
+                &["Attack+2%"],
+            ));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        let state = Arc::new(AppState {
+            dictionary,
+            src_lang: Arc::new(RwLock::new("ja".to_string())),
+            tgt_lang: Arc::new(RwLock::new("en".to_string())),
+            custom_lang_name: Arc::new(RwLock::new(String::new())),
+            prompt_template: String::new(),
+            translation_settings: test_settings(),
+            llm_client,
+            event_tx,
+            t_cache: Arc::new(TranslationCache::default()),
+            n_cache: Arc::new(NewEntriesCache::default()),
+            input_replay: Arc::new(Mutex::new(InputReplayState::default())),
+            llm_slots: 1,
+        });
+
+        let result = run_pipeline(
+            &state,
+            "translate",
+            PipelineBehavior {
+                use_dictionary_lookup: false,
+                emit_dictionary_events: true,
+                commit_new_entries: true,
+                emit_word_logs: true,
+                emit_stats: true,
+                emit_observations: true,
+            },
+            vec!["ATK+ZMCZ%".to_string()],
+        )
+        .await
+        .expect("pipeline should still return response on duplicate live regex");
+
+        assert_eq!(result.translated_text, "Attack+ZMCZ%");
+        assert!(state.t_cache.get("ATK+ZMCZ%").is_none());
+        assert!(state.n_cache.drain().is_empty());
+
+        let _ = std::fs::remove_dir_all(dict_dir);
     }
 
     #[test]
@@ -1020,46 +1920,11 @@ mod tests {
     }
 
     #[test]
-    fn finds_first_unescaped_assignment_separator() {
-        let text = r#"[World6.12.24]Rumor says the guild attacked <color\=#2779FA>target</color>.=[Other6.12.24]broken target"#;
-        let index = find_unescaped_assignment_separator(text).unwrap();
-
-        assert_eq!(
-            &text[..index],
-            r#"[World6.12.24]Rumor says the guild attacked <color\=#2779FA>target</color>."#
-        );
-        assert_eq!(&text[index + 1..], "[Other6.12.24]broken target");
-    }
-
-    #[test]
-    fn returns_none_without_assignment_separator() {
-        let text = r#"[World6.12.24]Rumor says the guild attacked <color\=#2779FA>target</color>."#;
-        assert_eq!(find_unescaped_assignment_separator(text), None);
-    }
-
-    #[test]
-    fn returns_none_for_operator_style_ui_text() {
-        let text = ">>=Move Distance";
-        assert_eq!(find_unescaped_assignment_separator(text), None);
-    }
-
-    #[test]
-    fn returns_none_for_equals_inside_sprite_tag() {
-        let text = r#"<sprite name="Half-Elf">"#;
-        assert_eq!(find_unescaped_assignment_separator(text), None);
-    }
-
-    #[test]
-    fn detects_tag_or_marker_lines_for_observation() {
-        assert!(contains_observed_markup("<b>Attack+150%</b>"));
-        assert!(contains_observed_markup("marker ZMDZ"));
-        assert!(!contains_observed_markup("plain text only"));
-    }
-
-    #[test]
     fn observation_record_includes_snapshot_fields_for_tag_lines() {
         let record = build_observation_record(
             "translate",
+            r#"<sprite name="Half-Elf">=Target"#,
+            r#"<sprite name="Half-Elf">=Target"#,
             r#"<sprite name="Half-Elf">=Target"#,
             r#"<sprite name="Half-Elf">"#,
             1,
@@ -1085,6 +1950,8 @@ mod tests {
             "list",
             "plain text",
             "plain text",
+            "plain text",
+            "plain text",
             0,
             1,
             &["plain text".to_string()],
@@ -1100,6 +1967,39 @@ mod tests {
         assert_eq!(json["final_output"], "plain text");
         assert_eq!(json["dict_hits"], 0);
         assert_eq!(json["model_calls"], 1);
+    }
+
+    #[test]
+    fn completed_analysis_payload_uses_item_diagnostics() {
+        let batch = BatchTranslationOutput {
+            stats: TranslationStats {
+                dict_hits: 1,
+                model_calls: 2,
+            },
+            item_diagnostics: vec![ItemDiagnostics {
+                raw_text: "raw".to_string(),
+                extracted_text: "extracted".to_string(),
+                visible_text: "visible".to_string(),
+                input_preview: "raw".to_string(),
+                dict_hits: 1,
+                model_calls: 2,
+                model_inputs: vec!["model A".to_string(), "model B".to_string()],
+            }],
+            ..Default::default()
+        };
+
+        let payload = build_completed_analysis_payload(&batch, "final").unwrap();
+
+        assert_eq!(payload.raw_text, "raw");
+        assert_eq!(payload.extracted_text, "extracted");
+        assert_eq!(payload.visible_text, "visible");
+        assert_eq!(
+            payload.model_inputs,
+            vec!["model A".to_string(), "model B".to_string()]
+        );
+        assert_eq!(payload.final_output, "final");
+        assert_eq!(payload.dict_hits, 1);
+        assert_eq!(payload.model_calls, 2);
     }
 
     #[test]
@@ -1138,6 +2038,7 @@ mod tests {
         assert_eq!(json["raw_request"]["texts"][1], "two");
         assert_eq!(json["joined_text"], "one\ntwo");
         assert_eq!(json["item_count"], 2);
+        assert_eq!(json["total_bytes"], 6);
     }
 
     #[test]
@@ -1168,18 +2069,19 @@ mod tests {
     }
 
     #[test]
-    fn batch_keeps_translator_new_entries_until_commit_ascii() {
+    fn batch_keeps_zm_entry_when_regex_is_available() {
         let dict_dir = test_dictionary_dir("batch_commit_ascii");
         let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
         let dictionary = Arc::new(RwLock::new(Dictionary::new(
             dict_dir.join("txt_root"),
-            dict_dir.join("dict.txt"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
 
         let llm_client: Arc<dyn translator::LlmClient> =
-            Arc::new(MockLlmClient::with_responses(&["*1  #2"]));
+            Arc::new(MockLlmClient::with_responses(&["*2  #3"]));
         let t_cache = Arc::new(TranslationCache::default());
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
 
@@ -1192,30 +2094,143 @@ mod tests {
             1,
             "en".to_string(),
             test_settings(),
+            PipelineBehavior::normal_translate(),
             vec!["*ZMCZ  #ZMDZ".to_string()],
         );
 
-        assert_eq!(
-            batch.new_entries,
-            vec![("*ZMCZ  #ZMDZ".to_string(), "*ZMCZ  #ZMDZ".to_string())]
-        );
+        assert_eq!(batch.new_entries.len(), 1);
+        assert_eq!(batch.new_entries[0].source, "*ZMCZ  #ZMDZ");
         assert!(t_cache.get("*ZMCZ  #ZMDZ").is_none());
 
         let _ = std::fs::remove_dir_all(dict_dir);
     }
 
-    #[test]
-    fn commit_keeps_translator_key_in_both_caches_ascii() {
+    #[tokio::test]
+    async fn commit_keeps_exact_entry_in_both_caches() {
+        let dict_dir = test_dictionary_dir("commit_cache_ascii");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+
         let t_cache = TranslationCache::default();
         let n_cache = NewEntriesCache::default();
-        let entries = vec![("*ZMCZ  #ZMDZ".to_string(), "*ZMCZ  #ZMDZ".to_string())];
+        let entries = vec![NewTranslationEntry {
+            source: "hello".to_string(),
+            translated: "bonjour".to_string(),
+            persist: PersistEntry::Exact {
+                key: "hello".to_string(),
+                value: "bonjour".to_string(),
+            },
+        }];
 
-        commit_new_entries(&t_cache, &n_cache, &entries);
+        commit_new_entries(&dictionary, &t_cache, &n_cache, &entries).await;
 
         assert_eq!(
-            t_cache.get("*ZMCZ  #ZMDZ").map(|value| value.clone()),
-            Some("*ZMCZ  #ZMDZ".to_string())
+            t_cache.get("hello").map(|value| value.clone()),
+            Some("bonjour".to_string())
         );
-        assert_eq!(n_cache.drain(), entries);
+        assert_eq!(
+            n_cache.drain(),
+            vec![("hello".to_string(), "bonjour".to_string())]
+        );
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
+    #[tokio::test]
+    async fn commit_regex_registers_live_rule_without_source_t_cache() {
+        let dict_dir = test_dictionary_dir("commit_regex_cache");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+
+        let t_cache = TranslationCache::default();
+        let n_cache = NewEntriesCache::default();
+        let pattern = "^ATK([+]Z[A-Z]+Z[%])$".to_string();
+        let entries = vec![NewTranslationEntry {
+            source: "ATK+ZMCZ%".to_string(),
+            translated: "Attack+ZMCZ%".to_string(),
+            persist: PersistEntry::Regex {
+                pattern: pattern.clone(),
+                replacement: "Attack$1".to_string(),
+            },
+        }];
+
+        commit_new_entries(&dictionary, &t_cache, &n_cache, &entries).await;
+
+        assert!(t_cache.get("ATK+ZMCZ%").is_none());
+        assert_eq!(
+            dictionary.read().await.lookup_source("ATK+ZMDZ%"),
+            Some("Attack+ZMDZ%".to_string())
+        );
+        assert_eq!(
+            n_cache.drain(),
+            vec![(format!("r:\"{}\"", pattern), "Attack$1".to_string())]
+        );
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
+    #[tokio::test]
+    async fn commit_regex_duplicate_live_register_does_not_fallback_to_exact_save() {
+        let dict_dir = test_dictionary_dir("commit_regex_duplicate");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+
+        let t_cache = TranslationCache::default();
+        let n_cache = NewEntriesCache::default();
+        let entry = NewTranslationEntry {
+            source: "ATK+ZMCZ%".to_string(),
+            translated: "Attack+ZMCZ%".to_string(),
+            persist: PersistEntry::Regex {
+                pattern: "^ATK([+]Z[A-Z]+Z[%])$".to_string(),
+                replacement: "Attack$1".to_string(),
+            },
+        };
+
+        commit_new_entries(&dictionary, &t_cache, &n_cache, &[entry.clone()]).await;
+        let _ = n_cache.drain();
+
+        commit_new_entries(&dictionary, &t_cache, &n_cache, &[entry]).await;
+
+        assert!(t_cache.get("ATK+ZMCZ%").is_none());
+        assert!(n_cache.drain().is_empty());
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
+    #[tokio::test]
+    async fn second_same_session_zm_request_uses_live_regex_not_source_t_cache() {
+        let llm = Arc::new(MockLlmClient::with_responses(&["Attack+2%"]));
+        let llm_client: Arc<dyn translator::LlmClient> = llm.clone();
+        let state = test_app_state_with_llm(llm_client);
+
+        let first = perform_translation(Arc::clone(&state), "ATK+ZMCZ%".to_string()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&first_body).unwrap(), "Attack+ZMCZ%");
+        assert!(state.t_cache.get("ATK+ZMCZ%").is_none());
+
+        let second = perform_translation(Arc::clone(&state), "ATK+ZMCZ%".to_string()).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&second_body).unwrap(), "Attack+ZMCZ%");
+        assert_eq!(llm.calls(), vec!["ATK+2%".to_string()]);
     }
 }

@@ -4,6 +4,7 @@
 
 mod backend;
 mod config;
+mod file_translate;
 mod launcher;
 mod logic;
 mod messages;
@@ -15,15 +16,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::anyhow;
-use serde::Serialize;
-
+use file_translate::asset_intake::{load_source_preview, scan_asset_sources_with_progress};
+use file_translate::commands::FileTranslateUiCommand;
+use file_translate::preview::{build_preview_summary, build_run_log_seed};
+use file_translate::runner::run_file_translate;
+use file_translate::state::{
+    evaluate_run_readiness, DictSlotAction, FileTranslatePreviewMessage, FileTranslateScanMessage,
+};
+use file_translate::types::{
+    ColumnMode, FileTranslateRunConfig, HeaderMode, PreviewState, SourceKind, SourcePreview,
+};
 use launcher::{show_launcher_screen, LaunchProgress, LauncherUiState};
 use messages::{BackendEvent, FrontendCommand, LogLevel};
-use ui::container::{LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
+use ui::container::{LeftPanelTab, LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
+use ui::list_text::{self, ListText};
+use ui::work_result_text;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AppMode {
@@ -44,12 +54,14 @@ struct TenukiApp {
     backend_thread: Option<thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 
-    // ランチャー用
+    // Launcher runtime state.
     launcher_state: LauncherUiState,
     launcher_rx: mpsc::Receiver<LaunchProgress>,
     launcher_tx: mpsc::Sender<LaunchProgress>,
     launcher_thread: Option<thread::JoinHandle<()>>,
     launcher_cancel: Arc<AtomicBool>,
+    // List mode run cancellation state.
+    file_translate_cancel: Option<Arc<AtomicBool>>,
 }
 
 fn sanitize_ui_lang(lang: &str) -> String {
@@ -106,10 +118,7 @@ fn build_initial_launcher_state(
         )),
         Err(launcher::CheckReadyReason::StartupModelUnresolved) => {
             LauncherUiState::with_startup_reason(
-                "起動モデルを決定できません。\
-                 usable なモデルが複数あり一意に選択できません。\
-                 モデルを再選択してください。"
-                    .to_string(),
+                "Unable to resolve a startup model. Re-select the model.".to_string(),
             )
         }
     }
@@ -142,24 +151,6 @@ fn reset_backend_runtime(
     let (new_tx, new_rx) = mpsc::channel();
     *command_tx = new_tx;
     *command_rx = Some(new_rx);
-}
-
-#[derive(Serialize)]
-struct ListPayload {
-    texts: Vec<String>,
-}
-
-fn wait_for_translation_server(port: u16, client: &reqwest::blocking::Client) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", port);
-    for _ in 0..40 {
-        if let Ok(resp) = client.get(&url).send() {
-            if resp.status().is_success() {
-                return true;
-            }
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    false
 }
 
 fn provision_launcher_config_from_misplaced(misplaced_path: &Path, launcher_config_path: &Path) {
@@ -223,7 +214,7 @@ impl TenukiApp {
         if let Err(err) = self.ui.load_input_records() {
             self.ui.add_log(
                 LogSource::Tenuki,
-                format!("入力履歴の読み込みに失敗しました: {}", err),
+                format!("Failed to load input history: {}", err),
                 LogLevel::Error,
                 messages::current_timestamp(),
             );
@@ -234,7 +225,7 @@ impl TenukiApp {
         if let Err(err) = self.ui.save_input_records() {
             self.ui.add_log(
                 LogSource::Tenuki,
-                format!("入力履歴の保存に失敗しました: {}", err),
+                format!("Failed to save input history: {}", err),
                 LogLevel::Error,
                 messages::current_timestamp(),
             );
@@ -251,99 +242,539 @@ impl TenukiApp {
             .cloned()
             .collect();
 
-        if pickup_records.is_empty() {
-            self.ui.set_work_result(
-                "pickup".to_string(),
-                "pickup はまだありません".to_string(),
-                false,
+        let (title, preview) =
+            work_result_text::pickup_preview(&self.ui.display.ui_lang, &pickup_records);
+        self.ui.set_work_result(title, preview, false);
+    }
+
+    // File Translate / List mode is a separate entry from normal translation.
+    // /list does not update dictionary, cache, or input analysis.
+    // Output is {source_stem}.txt in dict.txt format, written incrementally via .partial.txt.
+    fn file_translate_readiness(&self) -> file_translate::state::FileTranslateRunReadiness {
+        evaluate_run_readiness(
+            &self.ui.state.file_translate,
+            self.ui.display.dict_slot.as_deref(),
+            &self.ui.display.tgt_lang,
+            &self.base_dir,
+        )
+    }
+
+    fn refresh_file_translate_summary(&mut self) {
+        let readiness = self.file_translate_readiness();
+        let preview = self.ui.state.file_translate.preview.clone();
+        let column_modes = self.ui.state.file_translate.column_modes.clone();
+        let selected_source = self.ui.state.file_translate.selected_source.clone();
+        let root = self.ui.state.file_translate.root.clone();
+        let sources = self.ui.state.file_translate.sources.clone();
+
+        match &selected_source {
+            Some(file) => {
+                let (text, is_error) = build_preview_summary(
+                    &self.ui.display.ui_lang,
+                    &preview,
+                    &column_modes,
+                    &readiness,
+                );
+                self.ui
+                    .set_work_result(file.display().to_string(), text, is_error);
+            }
+            None => {
+                let lang = &self.ui.display.ui_lang;
+                let root = root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let summary = [
+                    list_text::field(lang, ListText::Root, root),
+                    list_text::field(lang, ListText::Sources, sources.len()),
+                    list_text::field(
+                        lang,
+                        ListText::Delimited,
+                        sources
+                            .iter()
+                            .filter(|source| source.kind == SourceKind::DelimitedText)
+                            .count(),
+                    ),
+                    list_text::field(
+                        lang,
+                        ListText::Json,
+                        sources
+                            .iter()
+                            .filter(|source| source.kind == SourceKind::JsonText)
+                            .count(),
+                    ),
+                    list_text::field(
+                        lang,
+                        ListText::Markup,
+                        sources
+                            .iter()
+                            .filter(|source| source.kind == SourceKind::MarkupText)
+                            .count(),
+                    ),
+                    list_text::field(
+                        lang,
+                        ListText::PlainLines,
+                        sources
+                            .iter()
+                            .filter(|source| source.kind == SourceKind::PlainLines)
+                            .count(),
+                    ),
+                    list_text::field(
+                        lang,
+                        ListText::UnsupportedBinary,
+                        sources
+                            .iter()
+                            .filter(|source| source.kind == SourceKind::UnsupportedBinary)
+                            .count(),
+                    ),
+                    list_text::text(lang, ListText::SelectSourceToPreview).to_string(),
+                ]
+                .join("\n");
+                self.ui.set_work_result(
+                    list_text::text(lang, ListText::FileTranslateTitle).to_string(),
+                    summary,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn start_file_translate_scan(&mut self, selection: PathBuf) {
+        let root = if selection.is_dir() {
+            selection.clone()
+        } else {
+            selection
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.base_dir.clone())
+        };
+        let (scan_tx, scan_rx) = mpsc::channel();
+        self.ui
+            .state
+            .file_translate
+            .reset_for_root(Some(root.clone()), Vec::new());
+        self.ui.state.file_translate.enter_list_mode();
+        self.ui.state.file_translate.scan_in_progress = true;
+        self.ui.state.file_translate.scan_rx = Some(scan_rx);
+        self.ui.state.log_panel_tab = LeftPanelTab::List;
+        self.ui.set_work_running(false);
+        self.ui.reset_file_translate_progress();
+        self.ui
+            .reset_file_translate_logs(vec![format!("[scan] root: {}", root.display())]);
+        self.ui.set_file_translate_status_text(
+            list_text::text(&self.ui.display.ui_lang, ListText::Scanning).to_string(),
+        );
+        self.refresh_file_translate_summary();
+
+        thread::spawn(move || {
+            let sources = scan_asset_sources_with_progress(&root, |index, candidate| {
+                let _ = scan_tx.send(FileTranslateScanMessage::Scanned {
+                    index,
+                    path: candidate.path.clone(),
+                });
+            });
+            let _ = scan_tx.send(FileTranslateScanMessage::Done { root, sources });
+        });
+    }
+
+    fn poll_file_translate_scan(&mut self) {
+        let mut messages = Vec::new();
+        let mut done = None;
+
+        if let Some(rx) = &self.ui.state.file_translate.scan_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        done = Some((
+                            self.ui
+                                .state
+                                .file_translate
+                                .root
+                                .clone()
+                                .unwrap_or_else(|| self.base_dir.clone()),
+                            Vec::new(),
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        for message in messages {
+            match message {
+                FileTranslateScanMessage::Scanned { index, path } => {
+                    self.ui.append_file_translate_log(
+                        format!("[scan][{}] {}", index, path.display()),
+                        LogLevel::Info,
+                    );
+                }
+                FileTranslateScanMessage::Done { root, sources } => {
+                    done = Some((root, sources));
+                }
+            }
+        }
+
+        if let Some((root, sources)) = done {
+            let first_source = sources.first().map(|source| source.path.clone());
+            let file_count = sources.len();
+            self.ui
+                .state
+                .file_translate
+                .reset_for_root(Some(root), sources);
+            self.ui.state.file_translate.scan_rx = None;
+            self.ui.append_file_translate_log(
+                format!(
+                    "[scan] {}",
+                    list_text::scan_done(&self.ui.display.ui_lang, file_count)
+                ),
+                LogLevel::Info,
             );
+            self.ui.set_file_translate_status_text(list_text::scan_done(
+                &self.ui.display.ui_lang,
+                file_count,
+            ));
+
+            if let Some(file) = first_source {
+                self.select_file_translate_source(file);
+            } else {
+                self.refresh_file_translate_summary();
+            }
+        }
+    }
+
+    fn start_file_translate_preview_load(
+        &mut self,
+        file: PathBuf,
+        header_mode: HeaderMode,
+        reset_columns: bool,
+    ) {
+        let (preview_tx, preview_rx) = mpsc::channel();
+        {
+            let state = &mut self.ui.state.file_translate;
+            state.selected_source = Some(file.clone());
+            state.preview = PreviewState::Empty;
+            state.preview_loading = true;
+            state.preview_target = Some(file.clone());
+            state.preview_header_mode = header_mode;
+            state.table_preview_row_limit = 100;
+            state.text_preview_line_limit =
+                crate::ui::file_translate_panel::TEXT_PREVIEW_INITIAL_LINE_LIMIT;
+            state.preview_rx = Some(preview_rx);
+            if reset_columns {
+                state.column_modes.clear();
+            }
+        }
+        self.ui.set_file_translate_status_text(
+            list_text::text(&self.ui.display.ui_lang, ListText::LoadingPreview).to_string(),
+        );
+        self.refresh_file_translate_summary();
+
+        thread::spawn(move || {
+            let result = load_source_preview(&file, header_mode).map_err(|err| err.to_string());
+            let _ = preview_tx.send(FileTranslatePreviewMessage::Done {
+                file,
+                header_mode,
+                result,
+            });
+        });
+    }
+
+    fn poll_file_translate_preview(&mut self) {
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.ui.state.file_translate.preview_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut refresh = false;
+        for message in messages {
+            match message {
+                FileTranslatePreviewMessage::Done {
+                    file,
+                    header_mode,
+                    result,
+                } => {
+                    let state = &mut self.ui.state.file_translate;
+                    let matches_current = state.selected_source.as_ref() == Some(&file)
+                        && state.preview_target.as_ref() == Some(&file)
+                        && state.preview_header_mode == header_mode;
+                    if !matches_current {
+                        continue;
+                    }
+
+                    state.preview_loading = false;
+                    state.preview_target = None;
+                    state.preview_rx = None;
+                    state.preview = match result {
+                        Ok(preview) => {
+                            // Auto-resolve header mode from preview suggestion
+                            // when the current mode is still Unknown.
+                            // Transform the table data in memory (no extra I/O).
+                            let preview = if header_mode == HeaderMode::Unknown {
+                                match preview {
+                                    SourcePreview::Table(table)
+                                        if table.supports_header_toggle() =>
+                                    {
+                                        let resolved_mode = if table.suggested_header {
+                                            HeaderMode::Present
+                                        } else {
+                                            HeaderMode::Absent
+                                        };
+                                        state.preview_header_mode = resolved_mode;
+                                        SourcePreview::Table(
+                                            file_translate::asset_intake::apply_delimited_header_mode_from_unknown(
+                                                table,
+                                                resolved_mode,
+                                            ),
+                                        )
+                                    }
+                                    other => other,
+                                }
+                            } else {
+                                preview
+                            };
+
+                            PreviewState::Ready(preview)
+                        }
+                        Err(err) => PreviewState::Error(err),
+                    };
+                    refresh = true;
+                }
+            }
+        }
+
+        if disconnected && self.ui.state.file_translate.preview_loading {
+            let state = &mut self.ui.state.file_translate;
+            state.preview_loading = false;
+            state.preview_target = None;
+            state.preview_rx = None;
+            state.preview = PreviewState::Error("preview worker disconnected".to_string());
+            refresh = true;
+        }
+
+        if refresh {
+            self.refresh_file_translate_summary();
+        }
+    }
+
+    fn select_file_translate_source(&mut self, file: PathBuf) {
+        self.start_file_translate_preview_load(file, HeaderMode::Unknown, true);
+    }
+
+    fn set_file_translate_column_mode(&mut self, file: PathBuf, column: usize, mode: ColumnMode) {
+        if self.ui.state.file_translate.selected_source.as_ref() != Some(&file) {
             return;
         }
 
-        let mut sections = Vec::new();
-
-        for record in &pickup_records {
-            let preview = format!(
-                "[{}] {}\n原文: {}\n抽出: {}\n可視: {}\nモデル入力: {}\nメモ: {}",
-                record.timestamp,
-                if record.occurrences > 1 {
-                    format!("x{}", record.occurrences)
-                } else {
-                    "x1".to_string()
-                },
-                record.snapshot.raw_text,
-                record.snapshot.extracted_text,
-                if record.snapshot.visible_text.is_empty() {
-                    "-".to_string()
-                } else {
-                    record.snapshot.visible_text.clone()
-                },
-                if record.snapshot.model_inputs.is_empty() {
-                    "-".to_string()
-                } else {
-                    record.snapshot.model_inputs.join(" | ")
-                },
-                if record.note.trim().is_empty() {
-                    "-".to_string()
-                } else {
-                    record.note.clone()
-                }
-            );
-            sections.push(preview);
+        if mode == ColumnMode::None {
+            self.ui.state.file_translate.column_modes.remove(&column);
+        } else {
+            self.ui
+                .state
+                .file_translate
+                .column_modes
+                .insert(column, mode);
         }
-
-        self.ui.set_work_result(
-            format!("pickup {}件", pickup_records.len()),
-            sections.join("\n\n--------------------------------\n\n"),
-            false,
-        );
+        self.refresh_file_translate_summary();
     }
 
-    fn start_file_work(&mut self, file_path: PathBuf) {
-        let port = config::load(&self.config_path)
-            .map(|cfg| cfg.server_port)
-            .unwrap_or(14371);
-        let event_tx = self.event_tx.clone();
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .expect("Failed to build HTTP client");
+    fn set_file_translate_header_mode(&mut self, file: PathBuf, mode: HeaderMode) {
+        if self.ui.state.file_translate.selected_source.as_ref() != Some(&file) {
+            return;
+        }
+
+        self.start_file_translate_preview_load(file, mode, false);
+    }
+
+    fn resolve_file_translate_slot(&mut self, action: DictSlotAction) -> Result<PathBuf, String> {
+        match action {
+            DictSlotAction::UseCommitted(path) => {
+                std::fs::create_dir_all(&path)
+                    .map_err(|e| format!("slot directory create failed: {}", e))?;
+                self.ui.append_file_translate_log(
+                    format!(
+                        "[slot] using committed output directory: {}",
+                        path.display()
+                    ),
+                    LogLevel::Info,
+                );
+                Ok(path)
+            }
+            DictSlotAction::CreateForRun {
+                parent,
+                target_lang,
+            } => {
+                let slot = parent.join("list_output");
+                let committed_mismatch = self
+                    .ui
+                    .display
+                    .dict_slot
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .is_some_and(|path| {
+                        !backend::manager::dict_slot_matches_target(Path::new(path), &target_lang)
+                    });
+                let message = if committed_mismatch {
+                    format!(
+                        "[slot] committed slot does not match target {}; using List output directory: {}",
+                        target_lang,
+                        slot.display()
+                    )
+                } else {
+                    format!("[slot] List output directory: {}", slot.display())
+                };
+                self.ui.append_file_translate_log(message, LogLevel::Info);
+                Ok(slot)
+            }
+        }
+    }
+
+    fn start_file_translate_run(&mut self) {
+        let readiness = self.file_translate_readiness();
+        if !readiness.is_ready() {
+            let message = list_text::readiness(&self.ui.display.ui_lang, &readiness);
+            self.ui.set_work_result(
+                list_text::text(&self.ui.display.ui_lang, ListText::FileTranslateTitle).to_string(),
+                message.clone(),
+                true,
+            );
+            self.ui
+                .append_file_translate_log(format!("[need] {}", message), LogLevel::Error);
+            return;
+        }
+
+        let table_source = readiness
+            .table_source
+            .clone()
+            .expect("ready state must include table source");
+        let selected_file = table_source.file.clone();
+
+        let config = match config::load(&self.config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                self.ui.set_work_result(
+                    list_text::text(&self.ui.display.ui_lang, ListText::FileTranslateTitle)
+                        .to_string(),
+                    format!("config load failed: {}", err),
+                    true,
+                );
+                return;
+            }
+        };
+
+        let dict_slot = match self.resolve_file_translate_slot(
+            readiness
+                .dict_slot_action
+                .clone()
+                .expect("ready state must include dict slot action"),
+        ) {
+            Ok(slot) => slot,
+            Err(err) => {
+                self.ui.set_work_result(
+                    list_text::text(&self.ui.display.ui_lang, ListText::FileTranslateTitle)
+                        .to_string(),
+                    err,
+                    true,
+                );
+                return;
+            }
+        };
+
+        // launcher_config.toml authority lives under install_root.
+        let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
+        let parallel_slots = launcher::app_config::AppConfig::load(&launcher_config_path)
+            .map(|c| c.server.parallel_slots.max(1) as usize)
+            .unwrap_or(2);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let run_config = FileTranslateRunConfig {
+            source: table_source,
+            dict_slot,
+            column_modes: self.ui.state.file_translate.column_modes.clone(),
+            ui_lang: self.ui.display.ui_lang.clone(),
+            server_host: config.server_host.clone(),
+            server_port: config.server_port,
+            chunk_size: config.list.effective_chunk_size(parallel_slots),
+            request_timeout_secs: config.list.effective_timeout_secs(),
+            cancel_flag: cancel_flag.clone(),
+            event_tx: self.event_tx.clone(),
+        };
+
+        self.file_translate_cancel = Some(cancel_flag);
+        self.ui.state.log_panel_tab = LeftPanelTab::List;
         self.ui.set_work_running(true);
+        self.ui.reset_file_translate_progress();
+        self.ui.set_file_translate_status_text(
+            list_text::text(&self.ui.display.ui_lang, ListText::Started).to_string(),
+        );
         self.ui
-            .set_work_result(file_path.display().to_string(), "".to_string(), false);
+            .append_file_translate_log("[run] started".to_string(), LogLevel::Info);
+        for line in build_run_log_seed(
+            &self.ui.display.ui_lang,
+            &self.ui.state.file_translate.preview,
+            &self.ui.state.file_translate.column_modes,
+            &readiness,
+        ) {
+            self.ui.append_file_translate_log(line, LogLevel::Info);
+        }
+        self.ui
+            .set_work_result(selected_file.display().to_string(), "".to_string(), false);
 
+        let event_tx = self.event_tx.clone();
         thread::spawn(move || {
-            let title = file_path.display().to_string();
-            let result = (|| -> anyhow::Result<String> {
-                let content = fs::read_to_string(&file_path)?;
-                let texts = content
-                    .split('\n')
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>();
-                if texts.is_empty() {
-                    return Ok(String::new());
-                }
-
-                if !wait_for_translation_server(port, &client) {
-                    anyhow::bail!("translation server is not ready");
-                }
-
-                let url = format!("http://127.0.0.1:{}/list", port);
-                let response = client.post(&url).json(&ListPayload { texts }).send()?;
-                Ok(response.text()?)
-            })();
-
-            let (text, is_error) = match result {
-                Ok(text) => (text, false),
-                Err(err) => (format!("ファイル翻訳に失敗しました: {}", err), true),
-            };
-
+            let outcome = run_file_translate(run_config);
             let _ = event_tx.send(BackendEvent::WorkResult {
-                title,
-                text,
-                is_error,
+                title: outcome.title,
+                text: outcome.text,
+                is_error: outcome.is_error,
             });
         });
+    }
+
+    fn stop_file_translate_run(&mut self) {
+        if let Some(cancel_flag) = &self.file_translate_cancel {
+            cancel_flag.store(true, Ordering::Relaxed);
+            self.ui
+                .append_file_translate_log("[stop] requested".to_string(), LogLevel::Info);
+            self.ui.set_file_translate_status_text(
+                list_text::text(&self.ui.display.ui_lang, ListText::Stopping).to_string(),
+            );
+        }
+    }
+
+    fn handle_file_translate_command(&mut self, command: FileTranslateUiCommand) {
+        match command {
+            FileTranslateUiCommand::StartFileTranslateScan(path) => {
+                self.start_file_translate_scan(path);
+            }
+            FileTranslateUiCommand::SelectFileTranslateSource(path) => {
+                self.select_file_translate_source(path);
+            }
+            FileTranslateUiCommand::SetFileTranslateColumnMode { file, column, mode } => {
+                self.set_file_translate_column_mode(file, column, mode);
+            }
+            FileTranslateUiCommand::SetFileTranslateHeaderMode { file, mode } => {
+                self.set_file_translate_header_mode(file, mode);
+            }
+            FileTranslateUiCommand::RunFileTranslate => {
+                self.start_file_translate_run();
+            }
+            FileTranslateUiCommand::StopFileTranslate => {
+                self.stop_file_translate_run();
+            }
+        }
     }
 
     fn new(
@@ -356,11 +787,11 @@ impl TenukiApp {
     ) -> Self {
         ui::fonts::setup_fonts(cc);
 
-        // install_root 解決 / launcher_config.toml の権威位置
+        // launcher_config.toml authority lives under install_root.
         let install_root = launcher::resolve_install_root();
         let launcher_config_path = install_root.join("launcher_config.toml");
 
-        // 誤配置対策: target/debug または target/release の config を移設
+        // Retire misplaced debug/release launcher_config.toml copies.
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
@@ -369,20 +800,18 @@ impl TenukiApp {
             provision_launcher_config_from_misplaced(&wrong_debug, &launcher_config_path);
         }
 
-        // 起動ログ
+        // Keep resolved authority paths visible in launcher logs.
         eprintln!("[INFO] InstallRoot: {}", install_root.display());
         eprintln!("[INFO] LauncherConfig: {}", launcher_config_path.display());
 
         let base_dir = install_root.clone();
         let config_path = base_dir.join("config.toml");
 
-        // ランチャー用チャンネル
         let (launcher_tx, launcher_rx) = mpsc::channel();
         let launcher_cancel = Arc::new(AtomicBool::new(false));
         let launcher_thread = None;
 
-        // preflight は missing config を provision できるため exists() ガードは不要。
-        // Normal 判定前に必ず通す。
+        // Preflight can provision missing config, so always run it before normal mode.
         let config_ready_for_normal = provision_runtime_config_before_normal(&config_path);
 
         let config_result = if config_ready_for_normal {
@@ -458,6 +887,7 @@ impl TenukiApp {
             launcher_tx,
             launcher_thread,
             launcher_cancel,
+            file_translate_cancel: None,
         };
 
         app.ui.update_src_lang(&initial_src_lang);
@@ -465,18 +895,17 @@ impl TenukiApp {
             .update_tgt_lang(&initial_tgt_lang, Some(&initial_custom_lang_name));
         app.ui.update_dict_slot(initial_dict_slot);
         app.ui.update_profile(&initial_profile);
+        app.ui.update_mode(&initial_profile_runtime.mode);
         app.ui
-            .update_translation_mode(&initial_profile_runtime.translation_mode);
-        app.ui
-            .update_structural_options(initial_profile_runtime.structural.into());
+            .update_game_text_options(initial_profile_runtime.game_text.into());
         app.ui.update_ui_lang(&initial_ui_lang);
         app.ui
             .refresh_available_profiles(&app.base_dir.join("profiles"));
         app.load_input_records_or_log();
 
-        // 通常起動時は backend を自動起動する
+        // In normal mode, start the backend immediately.
         if app.mode == AppMode::Normal {
-            // Launcher を経由しない場合でも基本ディレクトリは確保する
+            // Ensure the basic runtime directories exist even when bypassing launcher setup.
             for dir in ["profiles", "logs", "tmp"] {
                 let _ = fs::create_dir_all(app.base_dir.join(dir));
             }
@@ -494,92 +923,6 @@ impl TenukiApp {
         logic::check_models(&self.base_dir, &mut self.cached_model_check)
     }
 
-    #[allow(dead_code)]
-    fn start_backend_after_setup_legacy(&mut self) {
-        if let Some(command_rx) = self.command_rx.take() {
-            if !provision_runtime_config_before_normal(&self.config_path) {
-                self.ui.add_log(
-                    ui::container::LogSource::Tenuki,
-                    "config.toml を current shape に再構成できなかったため launcher へ戻します"
-                        .to_string(),
-                    messages::LogLevel::Error,
-                    messages::current_timestamp(),
-                );
-                self.mode = AppMode::Launcher;
-                self.launcher_state = LauncherUiState::error(
-                    "config.toml を再構成できませんでした。Retry してください。".to_string(),
-                );
-                self.launcher_cancel
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.launcher_thread = None;
-                self.command_rx = Some(command_rx);
-                return;
-            }
-
-            let config = match config::load(&self.config_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.ui.add_log(
-                        ui::container::LogSource::Tenuki,
-                        format!(
-                            "config.toml の読み込みに失敗したため backend を起動できません: {}",
-                            e
-                        ),
-                        messages::LogLevel::Error,
-                        messages::current_timestamp(),
-                    );
-                    self.ui
-                        .set_status(StatusKey::ConfigError, StatusIcon::Warning, true);
-                    self.mode = AppMode::Launcher;
-                    self.launcher_state =
-                        LauncherUiState::error(format!("config.toml 読み込み失敗: {e}"));
-                    self.launcher_cancel
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    self.launcher_thread = None;
-                    self.command_rx = Some(command_rx);
-                    return;
-                }
-            };
-
-            let launcher_config_path =
-                launcher::resolve_install_root().join("launcher_config.toml");
-            let app_config = match launcher::app_config::AppConfig::load(&launcher_config_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.ui.add_log(
-                        ui::container::LogSource::Tenuki,
-                        format!(
-                            "launcher_config.toml の読み込みに失敗したため launcher へ戻ります: {}",
-                            e
-                        ),
-                        messages::LogLevel::Error,
-                        messages::current_timestamp(),
-                    );
-                    self.mode = AppMode::Launcher;
-                    self.launcher_state =
-                        LauncherUiState::error(format!("launcher_config.toml 読み込み失敗: {e}"));
-                    self.launcher_cancel
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    self.launcher_thread = None;
-                    self.command_rx = Some(command_rx);
-                    return;
-                }
-            };
-
-            let shutdown_clone = self.shutdown.clone();
-            let event_tx_clone = self.event_tx.clone();
-            let base_dir_clone = self.base_dir.clone();
-            self.backend_thread = Some(backend::start_backend(
-                config,
-                app_config,
-                base_dir_clone,
-                shutdown_clone,
-                event_tx_clone,
-                command_rx,
-            ));
-        }
-    }
-
     fn start_backend_after_setup(&mut self) -> Result<(), String> {
         let Some(command_rx) = self.command_rx.take() else {
             return Err("backend command receiver unavailable".to_string());
@@ -588,12 +931,12 @@ impl TenukiApp {
         if !provision_runtime_config_before_normal(&self.config_path) {
             self.ui.add_log(
                 ui::container::LogSource::Tenuki,
-                "config.toml current shape の再構成に失敗したため launcher へ戻します".to_string(),
+                "config.toml could not be prepared for startup".to_string(),
                 messages::LogLevel::Error,
                 messages::current_timestamp(),
             );
             self.command_rx = Some(command_rx);
-            return Err("config.toml を再構成できませんでした。Retry してください。".to_string());
+            return Err("config.toml could not be prepared for startup".to_string());
         }
 
         let config = match config::load(&self.config_path) {
@@ -601,35 +944,30 @@ impl TenukiApp {
             Err(e) => {
                 self.ui.add_log(
                     ui::container::LogSource::Tenuki,
-                    format!(
-                        "config.toml の読み込みに失敗したため backend を起動できません: {}",
-                        e
-                    ),
+                    format!("config.toml load failed: {}", e),
                     messages::LogLevel::Error,
                     messages::current_timestamp(),
                 );
                 self.ui
                     .set_status(StatusKey::ConfigError, StatusIcon::Warning, true);
                 self.command_rx = Some(command_rx);
-                return Err(format!("config.toml 読み込み失敗: {e}"));
+                return Err(format!("config.toml load failed: {e}"));
             }
         };
 
+        // launcher_config.toml authority lives under install_root.
         let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
         let app_config = match launcher::app_config::AppConfig::load(&launcher_config_path) {
             Ok(c) => c,
             Err(e) => {
                 self.ui.add_log(
                     ui::container::LogSource::Tenuki,
-                    format!(
-                        "launcher_config.toml の読み込みに失敗したため launcher へ戻ります: {}",
-                        e
-                    ),
+                    format!("launcher_config.toml load failed: {}", e),
                     messages::LogLevel::Error,
                     messages::current_timestamp(),
                 );
                 self.command_rx = Some(command_rx);
-                return Err(format!("launcher_config.toml 読み込み失敗: {e}"));
+                return Err(format!("launcher_config.toml load failed: {e}"));
             }
         };
 
@@ -683,7 +1021,6 @@ impl eframe::App for TenukiApp {
 
         let mut needs_repaint = false;
 
-        // backend イベント処理。Normal モードで適用する
         while let Ok(event) = self.event_rx.try_recv() {
             needs_repaint = true;
             match event {
@@ -705,6 +1042,14 @@ impl eframe::App for TenukiApp {
                     self.ui
                         .add_dictionary_log_entry(timestamp, original, translated);
                 }
+                BackendEvent::FileTranslateProgress { done, total } => {
+                    self.ui.update_file_translate_progress(done, total);
+                    self.ui
+                        .set_file_translate_status_text(format!("{}/{}", done, total));
+                }
+                BackendEvent::FileTranslateLog { line, level } => {
+                    self.ui.append_file_translate_log(line, level);
+                }
                 BackendEvent::StatisticsUpdate(dict_hits, model_calls) => {
                     self.ui.update_statistics(dict_hits, model_calls);
                 }
@@ -712,9 +1057,7 @@ impl eframe::App for TenukiApp {
                     if self.ui.update_input_analysis(snapshot) {
                         self.save_input_records_or_log();
                     }
-                    if self.ui.state.work_source == ui::container::WorkSource::PickupList
-                        && self.ui.state.immediate_apply
-                    {
+                    if self.ui.state.immediate_apply {
                         self.refresh_pickup_preview();
                     }
                 }
@@ -723,8 +1066,40 @@ impl eframe::App for TenukiApp {
                     text,
                     is_error,
                 } => {
+                    self.file_translate_cancel = None;
                     self.ui.set_work_running(false);
+                    self.ui.finish_file_translate_progress(is_error);
+                    let done_count = self.ui.display.file_translate_done;
+                    let status_text = if is_error {
+                        list_text::text(&self.ui.display.ui_lang, ListText::Failed).to_string()
+                    } else if text.trim() == "Stopped" {
+                        list_text::stopped(&sanitize_ui_lang(&self.ui.display.ui_lang), done_count)
+                    } else {
+                        list_text::completed(
+                            &sanitize_ui_lang(&self.ui.display.ui_lang),
+                            done_count,
+                        )
+                    };
+                    self.ui.set_file_translate_status_text(status_text);
+                    if is_error {
+                        self.ui.append_file_translate_log(
+                            format!("[error] {}", text.lines().next().unwrap_or("failed")),
+                            LogLevel::Error,
+                        );
+                    } else if text.trim() == "Stopped" {
+                        self.ui.append_file_translate_log(
+                            format!(
+                                "[stopped] {}/{}",
+                                self.ui.display.file_translate_done,
+                                self.ui.display.file_translate_total
+                            ),
+                            LogLevel::Info,
+                        );
+                    }
                     self.ui.set_work_result(title, text, is_error);
+                }
+                BackendEvent::StatusNotice { title, message } => {
+                    self.ui.set_work_result(title, message, false);
                 }
                 BackendEvent::ProcessStatus(proc_type, running) => {
                     let pt = match proc_type {
@@ -732,7 +1107,6 @@ impl eframe::App for TenukiApp {
                         messages::ProcessType::Tenuki => ProcessType::Tenuki,
                     };
                     self.ui.update_process_status(pt, running);
-                    // 停止中に Tenuki が落ちたら Stopped へ遷移する
                     if !running && pt == ProcessType::Tenuki {
                         if self.ui.display.status_key == StatusKey::Stopping {
                             self.ui
@@ -747,14 +1121,14 @@ impl eframe::App for TenukiApp {
                     self.ui.update_selected_model(model);
                 }
                 BackendEvent::DictSlotChanged(slot) => {
-                    self.ui.update_dict_slot(Some(slot));
+                    self.ui.update_dict_slot(Some(slot.clone()));
                     self.load_input_records_or_log();
                 }
                 BackendEvent::LanguageChanged(lang) => {
                     self.ui.update_tgt_lang(&lang, None);
                     self.ui.add_log(
                         LogSource::Tenuki,
-                        format!("翻訳先を {} に切り替えました", lang),
+                        format!("Language changed: {}", lang),
                         LogLevel::Info,
                         messages::current_timestamp(),
                     );
@@ -798,10 +1172,10 @@ impl eframe::App for TenukiApp {
                     needs_repaint = true;
                 }
 
-                // Launcher から Normal へ切り替わったら backend を起動する
+                // When launcher setup completes, switch to normal mode and start backend.
                 if switch_to_normal {
                     self.mode = AppMode::Normal;
-                    // profiles/ は launcher 側でも作られるが、UI 用に再読込しておく
+                    // Refresh profiles for the normal-mode UI.
                     self.ui
                         .refresh_available_profiles(&self.base_dir.join("profiles"));
                     self.ui
@@ -815,6 +1189,8 @@ impl eframe::App for TenukiApp {
             }
 
             AppMode::Normal => {
+                self.poll_file_translate_scan();
+                self.poll_file_translate_preview();
                 let mut commands = self.ui.show(ctx);
 
                 if commands.exit_app {
@@ -824,8 +1200,7 @@ impl eframe::App for TenukiApp {
 
                 if !has_server && (commands.start_backend || commands.restart_backend) {
                     self.return_to_launcher_with_cleanup(LauncherUiState::error(
-                        "llama-server が見つかりません。セットアップを再実行してください。"
-                            .to_string(),
+                        "llama-server was not found. Run setup again.".to_string(),
                     ));
                     commands.start_backend = false;
                     commands.restart_backend = false;
@@ -839,8 +1214,7 @@ impl eframe::App for TenukiApp {
                     } else {
                         self.mode = AppMode::Launcher;
                         self.launcher_state = LauncherUiState::error(
-                            "llama-server が見つかりません。セットアップを再実行してください。"
-                                .to_string(),
+                            "llama-server was not found. Run setup again.".to_string(),
                         );
                         self.launcher_cancel.store(false, Ordering::Relaxed);
                         self.launcher_thread = None;
@@ -859,8 +1233,7 @@ impl eframe::App for TenukiApp {
                     } else {
                         self.mode = AppMode::Launcher;
                         self.launcher_state = LauncherUiState::error(
-                            "llama-server が見つかりません。セットアップを再実行してください。"
-                                .to_string(),
+                            "llama-server was not found. Run setup again.".to_string(),
                         );
                         self.launcher_cancel.store(false, Ordering::Relaxed);
                         self.launcher_thread = None;
@@ -879,12 +1252,14 @@ impl eframe::App for TenukiApp {
                 if let Some((src, tgt, tgt_name, dict_slot)) = pending_lang_pair {
                     self.ui.update_src_lang(&src);
                     self.ui.update_tgt_lang(&tgt, tgt_name.as_deref());
-                    // dict_slot は送信前にここで確定する。None は「新規スロットが必要」を意味する。
-                    let resolved_slot = dict_slot.unwrap_or_else(|| {
-                        backend::manager::create_new_slot(&tgt, &self.base_dir)
-                            .to_string_lossy()
-                            .to_string()
-                    });
+                    let resolved_slot = match dict_slot.as_deref() {
+                        Some(slot) if !slot.trim().is_empty() => slot.trim().to_string(),
+                        _ => backend::manager::resolve_lang_pair_dict_slot(
+                            None,
+                            &tgt,
+                            &self.base_dir,
+                        ),
+                    };
                     self.command_tx
                         .send(FrontendCommand::SetLanguagePair {
                             src,
@@ -905,8 +1280,8 @@ impl eframe::App for TenukiApp {
                 if let Some(profile_name) = commands.set_profile.take() {
                     self.ui.update_profile(&profile_name);
                     if let Ok(profile) = config::load_profile(&self.config_path, &profile_name) {
-                        self.ui.update_translation_mode(&profile.translation_mode);
-                        self.ui.update_structural_options(profile.structural.into());
+                        self.ui.update_mode(&profile.mode);
+                        self.ui.update_game_text_options(profile.game_text.into());
                     }
                     self.command_tx
                         .send(FrontendCommand::SetProfile(profile_name))
@@ -919,17 +1294,15 @@ impl eframe::App for TenukiApp {
                         .ok();
                 }
 
-                if let Some(folder) = commands.set_work_folder.take() {
-                    self.ui.state.work_folder = Some(folder);
-                    self.ui.state.selected_work_file = None;
+                let file_translate_commands = std::mem::take(&mut commands.file_translate_commands);
+                for command in file_translate_commands {
+                    self.handle_file_translate_command(command);
                 }
 
                 if let Some((id, pickup)) = commands.set_input_pickup.take() {
                     if self.ui.set_input_pickup(id, pickup) {
                         self.save_input_records_or_log();
-                        if self.ui.state.work_source == ui::container::WorkSource::PickupList
-                            && self.ui.state.immediate_apply
-                        {
+                        if self.ui.state.immediate_apply {
                             self.refresh_pickup_preview();
                         }
                     }
@@ -938,17 +1311,15 @@ impl eframe::App for TenukiApp {
                 if let Some((id, note)) = commands.set_input_pickup_note.take() {
                     if self.ui.update_input_pickup_note(id, note) {
                         self.save_input_records_or_log();
-                        if self.ui.state.work_source == ui::container::WorkSource::PickupList
-                            && self.ui.state.immediate_apply
-                        {
+                        if self.ui.state.immediate_apply {
                             self.refresh_pickup_preview();
                         }
                     }
                 }
 
-                let structural_options = commands.set_structural_options.take();
-                if let Some(options) = structural_options.as_ref() {
-                    self.ui.update_structural_options(*options);
+                let game_text_options = commands.set_game_text_options.take();
+                if let Some(options) = game_text_options.as_ref() {
+                    self.ui.update_game_text_options(*options);
                 }
 
                 if commands.refresh_pickup_preview {
@@ -956,7 +1327,7 @@ impl eframe::App for TenukiApp {
                 }
 
                 let update_cmd = FrontendCommand::UpdateSettings {
-                    structural: structural_options,
+                    game_text: game_text_options,
                     server_port: commands.set_server_port.take(),
                     server_host: commands.set_server_host.take(),
                 };
@@ -964,28 +1335,8 @@ impl eframe::App for TenukiApp {
                 if !update_cmd.is_empty_update() {
                     let _ = self.command_tx.send(update_cmd);
                 }
-
-                if commands.run_work {
-                    match self.ui.state.work_source {
-                        ui::container::WorkSource::PickupList => {
-                            self.refresh_pickup_preview();
-                        }
-                        ui::container::WorkSource::File => {
-                            if let Some(file_path) = self.ui.state.selected_work_file.clone() {
-                                self.start_file_work(file_path);
-                            } else {
-                                self.ui.set_work_result(
-                                    "ファイル翻訳".to_string(),
-                                    "ファイルが選択されていません。".to_string(),
-                                    true,
-                                );
-                            }
-                        }
-                    }
-                }
             }
         }
-
         if needs_repaint {
             ctx.request_repaint();
         }

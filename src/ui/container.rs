@@ -1,6 +1,8 @@
 // src/ui/container.rs
 
-use crate::config::StructuralOptions;
+use crate::config::GameTextOptions;
+use crate::file_translate::commands::FileTranslateUiCommand;
+use crate::file_translate::state::FileTranslateState;
 use crate::launcher::app_config::ModelConfig;
 use crate::messages::{InputAnalysisSnapshot, LogLevel, ModelCandidate};
 use anyhow::Result;
@@ -21,13 +23,7 @@ pub enum LeftPanelTab {
     TenukiLog,
     ServerLog,
     Dictionary,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum WorkSource {
-    #[default]
-    File,
-    PickupList,
+    List,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,12 +63,17 @@ pub struct UiDisplayData {
     pub tenuki_logs: VecDeque<LogEntry>,
     pub llama_logs: VecDeque<LogEntry>,
     pub translation_logs: VecDeque<LogEntry>,
+    pub file_translate_logs: VecDeque<LogEntry>,
     pub input_snapshot: Option<InputAnalysisSnapshot>,
     pub input_records: VecDeque<InputAnalysisRecord>,
     pub work_result_title: String,
     pub work_result_text: String,
     pub work_result_error: bool,
     pub work_running: bool,
+    pub file_translate_done: usize,
+    pub file_translate_total: usize,
+    pub file_translate_error: bool,
+    pub file_translate_status_text: String,
     pub dictionary_loaded: usize,
     pub dictionary_new: usize,
     pub dictionary_history: VecDeque<(String, String, String)>,
@@ -94,8 +95,8 @@ pub struct UiDisplayData {
     pub local_ip: String,
     pub custom_lang_name: String,
     pub dict_slot: Option<String>,
-    pub translation_mode: String,
-    pub structural: StructuralOptions,
+    pub mode: String,
+    pub game_text: GameTextOptions,
     pub profile: String,
     pub available_profiles: Vec<String>,
     pub vram_mb: f32,
@@ -114,42 +115,6 @@ pub enum StatusKey {
     Stopping,
     Restarting,
     ConfigError,
-}
-
-impl StatusKey {
-    pub fn label(&self, ui_lang: &str) -> &'static str {
-        match (self, ui_lang) {
-            (StatusKey::None, _) => "",
-            (StatusKey::Ready, "en") => "Ready",
-            (StatusKey::Ready, "zh-CN") => "就绪",
-            (StatusKey::Ready, "zh-TW") => "就緒",
-            (StatusKey::Ready, _) => "準備完了",
-            (StatusKey::Failed, "en") => "Failed",
-            (StatusKey::Failed, "zh-CN") => "失败",
-            (StatusKey::Failed, "zh-TW") => "失敗",
-            (StatusKey::Failed, _) => "起動に失敗しました",
-            (StatusKey::Stopped, "en") => "Stopped",
-            (StatusKey::Stopped, "zh-CN") => "已停止",
-            (StatusKey::Stopped, "zh-TW") => "已停止",
-            (StatusKey::Stopped, _) => "停止しました",
-            (StatusKey::Starting, "en") => "Starting...",
-            (StatusKey::Starting, "zh-CN") => "正在启动...",
-            (StatusKey::Starting, "zh-TW") => "正在啟動...",
-            (StatusKey::Starting, _) => "起動しています...",
-            (StatusKey::Stopping, "en") => "Stopping...",
-            (StatusKey::Stopping, "zh-CN") => "正在停止...",
-            (StatusKey::Stopping, "zh-TW") => "正在停止...",
-            (StatusKey::Stopping, _) => "停止しています...",
-            (StatusKey::Restarting, "en") => "Restarting...",
-            (StatusKey::Restarting, "zh-CN") => "正在重启...",
-            (StatusKey::Restarting, "zh-TW") => "正在重新啟動...",
-            (StatusKey::Restarting, _) => "再起動しています...",
-            (StatusKey::ConfigError, "en") => "Config error",
-            (StatusKey::ConfigError, "zh-CN") => "配置错误",
-            (StatusKey::ConfigError, "zh-TW") => "設定錯誤",
-            (StatusKey::ConfigError, _) => "設定エラー",
-        }
-    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -175,30 +140,24 @@ impl StatusIcon {
 #[derive(Default)]
 pub struct UiState {
     pub log_panel_tab: LeftPanelTab,
-    pub work_source: WorkSource,
     pub immediate_apply: bool,
     pub show_lang_panel: bool,
-    pub show_structural_panel: bool,
+    pub show_game_text_panel: bool,
     pub lang_panel_tab: LangPanelTab,
     pub lang_panel_anchor: egui::Pos2,
-    pub structural_edit: StructuralOptions,
+    pub game_text_edit: GameTextOptions,
     pub dict_slot_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
-    pub work_folder: Option<PathBuf>,
-    pub selected_work_file: Option<PathBuf>,
-    pub dict_confirm: Option<DictConfirmPending>,
     pub custom_tgt_val_buf: String,
     pub custom_tgt_name_buf: String,
     pub pending_tgt_lang: Option<String>,
+    /// 言語切替時に現在の dict_slot が次ターゲットと一致しない場合に表示する確認ダイアログの保留状態。
+    /// (src, tgt, tgt_name, current_slot)
+    pub dict_check_pending: Option<(String, String, Option<String>, String)>,
     pub network_host_buf: String,
     pub network_port_buf: String,
     pub selected_input_record_id: Option<u64>,
     pub pickup_note_edit: String,
-}
-
-pub struct DictConfirmPending {
-    pub tgt: String,
-    pub tgt_name: Option<String>,
-    pub current_slot: Option<String>,
+    pub file_translate: FileTranslateState,
 }
 
 #[derive(Default)]
@@ -210,16 +169,15 @@ pub struct UiCommands {
     pub set_ui_lang: Option<String>,
     pub set_dict_slot: Option<String>,
     pub exit_app: bool,
-    pub set_structural_options: Option<StructuralOptions>,
+    pub set_game_text_options: Option<GameTextOptions>,
     pub set_profile: Option<String>,
     pub select_model: Option<ModelConfig>,
     pub set_input_pickup: Option<(u64, bool)>,
     pub set_input_pickup_note: Option<(u64, String)>,
-    pub set_work_folder: Option<PathBuf>,
-    pub run_work: bool,
     pub refresh_pickup_preview: bool,
     pub set_server_port: Option<u16>,
     pub set_server_host: Option<String>,
+    pub file_translate_commands: Vec<FileTranslateUiCommand>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -245,14 +203,14 @@ impl UiContainer {
     }
 
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
-        let default_work_folder = if base_dir.join("Text").is_dir() {
+        let default_file_translate_root = if base_dir.join("Text").is_dir() {
             Some(base_dir.join("Text"))
         } else {
             Some(base_dir.clone())
         };
 
         let state = UiState {
-            work_folder: default_work_folder,
+            file_translate: FileTranslateState::with_root(default_file_translate_root.clone()),
             ..Default::default()
         };
 
@@ -264,8 +222,8 @@ impl UiContainer {
                 ui_lang: "ja".to_string(),
                 dictionary_loaded: 0,
                 dictionary_new: 0,
-                translation_mode: "structural".to_string(),
-                structural: StructuralOptions::default(),
+                mode: "game".to_string(),
+                game_text: GameTextOptions::default(),
                 ..Default::default()
             },
             state,
@@ -386,6 +344,53 @@ impl UiContainer {
 
     pub fn set_work_running(&mut self, running: bool) {
         self.display.work_running = running;
+    }
+
+    pub fn reset_file_translate_logs(&mut self, lines: impl IntoIterator<Item = String>) {
+        self.display.file_translate_logs.clear();
+        for line in lines {
+            self.push_file_translate_log(LogEntry {
+                timestamp: crate::messages::current_timestamp(),
+                message: line,
+                level: LogLevel::Info,
+            });
+        }
+    }
+
+    pub fn append_file_translate_log(&mut self, line: String, level: LogLevel) {
+        self.push_file_translate_log(LogEntry {
+            timestamp: crate::messages::current_timestamp(),
+            message: line,
+            level,
+        });
+    }
+
+    pub fn reset_file_translate_progress(&mut self) {
+        self.display.file_translate_done = 0;
+        self.display.file_translate_total = 0;
+        self.display.file_translate_error = false;
+        self.display.file_translate_status_text.clear();
+    }
+
+    pub fn update_file_translate_progress(&mut self, done: usize, total: usize) {
+        self.display.file_translate_done = done;
+        self.display.file_translate_total = total;
+        self.display.file_translate_error = false;
+    }
+
+    pub fn set_file_translate_status_text(&mut self, text: String) {
+        self.display.file_translate_status_text = text;
+    }
+
+    pub fn finish_file_translate_progress(&mut self, is_error: bool) {
+        self.display.file_translate_error = is_error;
+    }
+
+    fn push_file_translate_log(&mut self, entry: LogEntry) {
+        self.display.file_translate_logs.push_back(entry);
+        while self.display.file_translate_logs.len() > 4000 {
+            self.display.file_translate_logs.pop_front();
+        }
     }
 
     pub fn update_src_lang(&mut self, lang: &str) {
@@ -526,8 +531,8 @@ impl UiContainer {
         self.display.ui_lang = lang.to_string();
     }
 
-    pub fn update_translation_mode(&mut self, mode: &str) {
-        self.display.translation_mode = mode.to_string();
+    pub fn update_mode(&mut self, mode: &str) {
+        self.display.mode = mode.to_string();
     }
 
     pub fn refresh_available_profiles(&mut self, profiles_dir: &std::path::Path) {
@@ -537,7 +542,13 @@ impl UiContainer {
                 let path = entry.path();
                 if path.extension().map(|e| e == "toml").unwrap_or(false) {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        names.push(stem.to_string());
+                        let normalized = match stem {
+                            "default" => "game",
+                            other => other,
+                        };
+                        if !names.iter().any(|name| name == normalized) {
+                            names.push(normalized.to_string());
+                        }
                     }
                 }
             }
@@ -550,10 +561,10 @@ impl UiContainer {
         self.display.profile = profile.to_string();
     }
 
-    pub fn update_structural_options(&mut self, options: StructuralOptions) {
-        self.display.structural = options;
-        if !self.state.show_structural_panel {
-            self.state.structural_edit = options;
+    pub fn update_game_text_options(&mut self, options: GameTextOptions) {
+        self.display.game_text = options;
+        if !self.state.show_game_text_panel {
+            self.state.game_text_edit = options;
         }
     }
 

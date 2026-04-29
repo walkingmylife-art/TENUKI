@@ -334,7 +334,7 @@ impl AppConfig {
     /// model/runtime_urls は空のデフォルト値。server の batch 系のみ参照すること。
     pub fn default_for_mode(mode: &str) -> Self {
         let server = match mode {
-            "passthrough" => ServerConfig {
+            "normal" => ServerConfig {
                 ctx_size: 2048,
                 batch_size: 256,
                 ubatch_size: 128,

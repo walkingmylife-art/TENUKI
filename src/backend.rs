@@ -1,12 +1,19 @@
 //! バックエンドモジュール
 
+//!
+//! Backend runtime wiring and public module boundary.
+//!
+//! The backend adopts committed launcher/config authority and starts the
+//! inference engine plus TENUKI entry server. Input analysis is produced from
+//! translation completion payloads and replayed from saved snapshots; there is
+//! no public processor module in the backend live path.
+
 mod analysis;
 mod dictionary;
 mod logger;
 pub mod manager;
 mod normalize;
 pub(crate) mod process;
-pub mod processor;
 mod server;
 pub mod translator;
 
@@ -25,12 +32,28 @@ use manager::{ProcessManager, RestartScope};
 
 /// launcher_config.toml の model.filename が権威。
 /// candidates の中に一致するファイルがあれば PathBuf を返す。なければ None。
-pub(crate) fn resolve_startup_model(app_config: &AppConfig, candidates: &[ModelCandidate]) -> Option<PathBuf> {
+pub(crate) fn resolve_authority_model(
+    app_config: &AppConfig,
+    candidates: &[ModelCandidate],
+) -> Option<PathBuf> {
     let expected_size = app_config.model.expected_size();
-    if let Some(candidate) = candidates.iter().find(|candidate| {
-        candidate.filename == app_config.model.filename() && candidate.size == expected_size
-    }) {
-        return Some(candidate.path.clone());
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.filename == app_config.model.filename() && candidate.size == expected_size
+        })
+        .map(|candidate| candidate.path.clone())
+}
+
+/// setup/recovery で使う既存救済込みの解決。
+/// normal startup の authority exact match だけが必要な箇所では
+/// resolve_authority_model を使う。
+pub(crate) fn resolve_startup_model(
+    app_config: &AppConfig,
+    candidates: &[ModelCandidate],
+) -> Option<PathBuf> {
+    if let Some(authority) = resolve_authority_model(app_config, candidates) {
+        return Some(authority);
     }
 
     let usable = candidates
@@ -165,7 +188,6 @@ pub fn start_backend(
                             Ok(config) => config,
                             Err(_) => return,
                         };
-                        let _ = std::fs::create_dir_all(&dict_slot);
                         config.src_lang = src.clone();
                         config.tgt_lang = tgt.clone();
                         config.custom_lang_name = tgt_name.unwrap_or_default();
@@ -197,18 +219,43 @@ pub fn start_backend(
                                     ));
                                 } else {
                                     let models = find_available_models(&base_dir);
-                                    let selected = resolve_startup_model(&app_cfg, &models);
+                                    let selected = resolve_authority_model(&app_cfg, &models);
                                     let _ = event_tx.send(BackendEvent::AvailableModels(models));
                                     let _ = event_tx.send(BackendEvent::SelectedModelResolved(
                                         selected.clone(),
                                     ));
+                                    manager.check_alive();
+                                    let engine_was_running = manager.is_engine_running();
                                     manager.selected_model = selected;
-                                    manager.stop_all();
-                                    manager.start_all();
-                                    let _ = event_tx.send(BackendEvent::BackendReady {
-                                        engine_success: manager.is_engine_running(),
-                                        translator_success: manager.is_translation_server_running(),
-                                    });
+
+                                    let title = if ui_lang == "en" {
+                                        "Model selected".to_string()
+                                    } else {
+                                        "モデルを選択しました".to_string()
+                                    };
+                                    if engine_was_running {
+                                        let _ = event_tx.send(BackendEvent::StatusNotice {
+                                            title,
+                                            message: if ui_lang == "en" {
+                                                "Restarting backend to apply the selected model..."
+                                                    .to_string()
+                                            } else {
+                                                "選択したモデルを適用するため再起動しています..."
+                                                    .to_string()
+                                            },
+                                        });
+                                        manager.restart_for_model_switch();
+                                    } else {
+                                        let _ = event_tx.send(BackendEvent::StatusNotice {
+                                            title,
+                                            message: if ui_lang == "en" {
+                                                "Restart TENUKI backend to apply the selected model."
+                                                    .to_string()
+                                            } else {
+                                                "選択したモデルは再起動後に適用されます。".to_string()
+                                            },
+                                        });
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -266,18 +313,18 @@ pub fn start_backend(
                         let _ = event_tx.send(BackendEvent::DictSlotChanged(slot));
                     }
                     FrontendCommand::UpdateSettings {
-                        structural,
+                        game_text,
                         server_port,
                         server_host,
                     } => {
                         let mut scope = RestartScope::TranslatorOnly;
-                        if let Some(structural_options) = structural {
-                            manager.set_structural_options(structural_options);
+                        if let Some(game_text_options) = game_text {
+                            manager.set_game_text_options(game_text_options);
                             if let Ok(config) = crate::config::load(&config_path) {
-                                let _ = crate::config::save_profile_structural(
+                                let _ = crate::config::save_profile_game_text(
                                     &config_path,
                                     &config.profile,
-                                    structural_options,
+                                    game_text_options,
                                 );
                             }
                         }
@@ -329,7 +376,9 @@ pub fn start_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_startup_model, ModelCandidate, ModelCandidateKind};
+    use super::{
+        resolve_authority_model, resolve_startup_model, ModelCandidate, ModelCandidateKind,
+    };
     use crate::launcher::app_config::{ModelConfig, UrlPair};
     use std::path::PathBuf;
 
@@ -365,6 +414,35 @@ mod tests {
             resolve_startup_model(&cfg, &candidates),
             Some(PathBuf::from("models/authority.gguf"))
         );
+    }
+
+    #[test]
+    fn authority_model_uses_exact_filename_and_size_match() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![ModelCandidate {
+            filename: "authority.gguf".to_string(),
+            path: PathBuf::from("models/authority.gguf"),
+            size: 100,
+            kind: ModelCandidateKind::Local,
+        }];
+
+        assert_eq!(
+            resolve_authority_model(&cfg, &candidates),
+            Some(PathBuf::from("models/authority.gguf"))
+        );
+    }
+
+    #[test]
+    fn authority_model_does_not_fallback_to_single_usable_model() {
+        let cfg = known_config("authority.gguf", 100);
+        let candidates = vec![ModelCandidate {
+            filename: "local-7b.gguf".to_string(),
+            path: PathBuf::from("models/local-7b.gguf"),
+            size: 777,
+            kind: ModelCandidateKind::Local,
+        }];
+
+        assert_eq!(resolve_authority_model(&cfg, &candidates), None);
     }
 
     #[test]

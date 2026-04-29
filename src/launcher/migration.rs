@@ -7,7 +7,7 @@ use std::path::Path;
 use toml::Value;
 
 use super::app_config::AppConfig;
-use super::translation_profile::{StructuralOptions, TranslationProfile};
+use super::translation_profile::{GameTextOptions, TranslationProfile};
 use crate::config::Config as LegacyConfig;
 
 fn is_legacy_format(root: &Value) -> bool {
@@ -17,8 +17,10 @@ fn is_legacy_format(root: &Value) -> bool {
 
     table.contains_key("prompt_template")
         || table.contains_key("translation_mode")
+        || table.contains_key("mode")
         || table.contains_key("enable_model_wrap")
         || table.contains_key("structural")
+        || table.contains_key("game_text")
 }
 
 fn log_migration_decision(message: &str) {
@@ -209,9 +211,14 @@ fn provision_profiles_from_legacy(base_dir: &Path, legacy: &LegacyConfig) -> Res
         profile.save(&profile_path)?;
     }
 
-    let default_profile_path = profiles_dir.join("default.toml");
-    if !default_profile_path.exists() {
-        TranslationProfile::default().save(&default_profile_path)?;
+    let game_profile_path = profiles_dir.join("game.toml");
+    if !game_profile_path.exists() {
+        TranslationProfile::game_default().save(&game_profile_path)?;
+    }
+
+    let normal_profile_path = profiles_dir.join("normal.toml");
+    if !normal_profile_path.exists() {
+        TranslationProfile::normal_default().save(&normal_profile_path)?;
     }
 
     Ok(())
@@ -366,21 +373,14 @@ fn build_translation_profile(legacy: &LegacyConfig, profile_name: &str) -> Trans
 
     profile.prompt_template = legacy.prompt_template.clone();
 
-    if ["structural", "passthrough"].contains(&legacy.translation_mode.as_str()) {
-        profile.translation_mode = legacy.translation_mode.clone();
-    } else {
-        log::warn!(
-            "Unknown translation_mode '{}', using default",
-            legacy.translation_mode
-        );
-    }
+    profile.mode = crate::config::normalize_mode_value(&legacy.mode);
 
-    profile.structural = StructuralOptions {
-        protect_tags: legacy.structural.protect_tags,
-        protect_brackets: legacy.structural.protect_brackets,
-        protect_escaped_sequences: legacy.structural.protect_escaped_sequences,
-        protect_placeholders: legacy.structural.protect_placeholders,
-        split_symbolic_segments: legacy.structural.split_symbolic_segments,
+    profile.game_text = GameTextOptions {
+        protect_tags: legacy.game_text.protect_tags,
+        protect_brackets: legacy.game_text.protect_brackets,
+        protect_escaped_sequences: legacy.game_text.protect_escaped_sequences,
+        protect_placeholders: legacy.game_text.protect_placeholders,
+        split_symbolic_segments: legacy.game_text.split_symbolic_segments,
     };
     profile.model_processing.enable_model_wrap = legacy.enable_model_wrap;
     profile.model_processing.model_wrap_min_chars = legacy.model_wrap_min_chars as usize;
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_format_detected_by_translation_mode_key() {
+    fn legacy_format_detected_by_legacy_mode_key() {
         let toml: Value = toml::from_str(r#"translation_mode = "structural""#).unwrap();
         assert!(is_legacy_format(&toml));
     }

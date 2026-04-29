@@ -18,12 +18,11 @@ use tokio::sync::RwLock;
 use crate::backend::analysis::{self, SharedInputReplayState};
 use crate::backend::dictionary::Dictionary;
 use crate::backend::process::LlamaProcess;
-use crate::backend::processor::{ProcessorFactory, TextProcessor, TranslationMode};
 use crate::backend::server;
 use crate::backend::translator::TranslationSettings;
 use crate::backend::translator::{HttpLlmClient, LlmClient, NewEntriesCache, TranslationCache};
 use crate::backend_info;
-use crate::config::{Config, StructuralOptions};
+use crate::config::{Config, GameTextOptions};
 use crate::launcher::app_config::ServerConfig;
 use crate::messages::{BackendEvent, LogLevel, LogSource, ProcessType};
 
@@ -41,25 +40,24 @@ fn max_existing_slot_num(text_dir: &Path, lang: &str) -> Option<u32> {
             }
 
             let name = e.file_name().to_string_lossy().into_owned();
-            slot_num_from_name(&name, lang)
+            current_slot_num_from_name(&name, lang)
         })
         .max()
 }
 
 fn is_slot_dir_name_for_lang(name: &str, lang: &str) -> bool {
-    slot_num_from_name(name, lang).is_some()
+    compatible_slot_num_from_name(name, lang).is_some()
 }
 
-fn slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
+fn current_slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
     let (prefix, suffix) = name.rsplit_once('_')?;
     if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
 
     let is_current_lang_slot = !lang.is_empty() && prefix == lang;
-    let is_legacy_slot = prefix == "S" && suffix.len() == 4;
 
-    if is_current_lang_slot || is_legacy_slot {
+    if is_current_lang_slot {
         suffix.parse::<u32>().ok()
     } else if lang.is_empty()
         && !prefix.is_empty()
@@ -73,13 +71,76 @@ fn slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
     }
 }
 
+fn compatible_slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
+    let current = current_slot_num_from_name(name, lang);
+    if current.is_some() {
+        return current;
+    }
+
+    let (prefix, suffix) = name.rsplit_once('_')?;
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let is_legacy_slot = prefix == "S" && suffix.len() == 4;
+    if !lang.is_empty() && is_legacy_slot {
+        suffix.parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
 fn find_slot_ancestor(path: &Path, lang: &str) -> Option<PathBuf> {
-    path.ancestors().find_map(|ancestor| {
-        ancestor
+    path.ancestors()
+        .filter(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| is_slot_dir_name_for_lang(name, lang))
+        })
+        .last()
+        .map(Path::to_path_buf)
+}
+
+pub fn dict_slot_matches_target(slot: &Path, target_lang: &str) -> bool {
+    let target_lang = target_lang.trim();
+    if target_lang.is_empty() {
+        return false;
+    }
+
+    slot.ancestors().any(|candidate| {
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if compatible_slot_num_from_name(name, target_lang).is_none() {
+            return false;
+        }
+
+        let Some(text_dir) = candidate.parent() else {
+            return false;
+        };
+        let Some(lang_dir) = text_dir.parent() else {
+            return false;
+        };
+        let Some(dicts_dir) = lang_dir.parent() else {
+            return false;
+        };
+
+        text_dir
             .file_name()
             .and_then(|name| name.to_str())
-            .filter(|name| is_slot_dir_name_for_lang(name, lang))
-            .map(|_| ancestor.to_path_buf())
+            .map(|name| name.eq_ignore_ascii_case("text"))
+            .unwrap_or(false)
+            && lang_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == target_lang)
+                .unwrap_or(false)
+            && dicts_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("dicts"))
+                .unwrap_or(false)
     })
 }
 
@@ -94,7 +155,7 @@ pub fn is_slot_dir(p: &Path) -> bool {
     parent_is_text
         && p.file_name()
             .and_then(|n| n.to_str())
-            .map(|name| slot_num_from_name(name, "").is_some())
+            .map(|name| compatible_slot_num_from_name(name, "").is_some())
             .unwrap_or(false)
 }
 
@@ -128,12 +189,32 @@ pub fn find_or_create_slot_under(container: &Path, lang: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_new_slot, find_or_create_slot_under, find_slot_ancestor, is_slot_dir,
-        is_slot_dir_name_for_lang, resolve_slot_dir,
+        create_new_slot, dict_slot_matches_target, find_or_create_slot_under, is_slot_dir,
+        is_slot_dir_name_for_lang, resolve_lang_pair_dict_slot, resolve_slot_dir, EngineWaitKind,
     };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn normal_startup_wait_policy_is_shorter_than_setup_verify_window() {
+        let policy = EngineWaitKind::NormalStartup.policy();
+        assert_eq!(policy.max_attempts, 24);
+        assert_eq!(policy.log_interval_attempts, 2);
+        assert_eq!(policy.initial_backoff, Duration::from_millis(500));
+        assert_eq!(policy.max_backoff, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn model_switch_wait_policy_is_shorter_than_normal_startup() {
+        let normal = EngineWaitKind::NormalStartup.policy();
+        let model_switch = EngineWaitKind::ModelSwitch.policy();
+        assert!(model_switch.max_attempts < normal.max_attempts);
+        assert_eq!(model_switch.max_attempts, 12);
+        assert_eq!(model_switch.log_interval_attempts, 1);
+        assert_eq!(model_switch.initial_backoff, Duration::from_millis(500));
+        assert_eq!(model_switch.max_backoff, Duration::from_secs(3));
+    }
 
     #[test]
     fn detects_real_slot_only_under_text_dir() {
@@ -149,9 +230,35 @@ mod tests {
     }
 
     #[test]
-    fn finds_language_slot_ancestor_from_legacy_nested_slot() {
-        let slot = find_slot_ancestor(Path::new(r"C:\dicts\ja\text\ja_001\s_0001"), "ja");
-        assert_eq!(slot, Some(PathBuf::from(r"C:\dicts\ja\text\ja_001")));
+    fn slot_match_accepts_current_target_root() {
+        assert!(dict_slot_matches_target(
+            Path::new(r"C:\dicts\ja\text\ja_001"),
+            "ja"
+        ));
+    }
+
+    #[test]
+    fn slot_match_accepts_legacy_slot_under_current_target() {
+        assert!(dict_slot_matches_target(
+            Path::new(r"C:\dicts\ja\text\S_0001"),
+            "ja"
+        ));
+    }
+
+    #[test]
+    fn slot_match_rejects_other_target_slot() {
+        assert!(!dict_slot_matches_target(
+            Path::new(r"C:\dicts\ja\text\ja_001"),
+            "en"
+        ));
+    }
+
+    #[test]
+    fn slot_match_rejects_non_authority_shape() {
+        assert!(!dict_slot_matches_target(
+            Path::new(r"C:\custom\dict\ja_001"),
+            "ja"
+        ));
     }
 
     #[test]
@@ -171,7 +278,7 @@ mod tests {
         std::fs::create_dir_all(text_dir.join("S_0001")).unwrap();
 
         let slot = find_or_create_slot_under(&text_dir, "ja");
-        assert_eq!(slot, text_dir.join("ja_002"));
+        assert_eq!(slot, text_dir.join("ja_001"));
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }
@@ -240,6 +347,74 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }
+
+    #[test]
+    fn resolve_reuses_committed_slot_when_target_matches() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_manager_test_{}", unique));
+
+        let text_dir = base_dir.join("dicts").join("ja").join("text");
+        std::fs::create_dir_all(text_dir.join("ja_001")).unwrap();
+
+        let resolved = resolve_lang_pair_dict_slot(
+            Some(text_dir.join("ja_001").to_string_lossy().as_ref()),
+            "ja",
+            &base_dir,
+        );
+
+        assert_eq!(
+            resolved,
+            text_dir.join("ja_001").to_string_lossy().to_string()
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn resolve_creates_new_slot_when_target_differs_from_committed() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_manager_test_{}", unique));
+
+        let resolved =
+            resolve_lang_pair_dict_slot(Some(r"C:\dicts\ja\text\ja_001"), "en", &base_dir);
+
+        let expected = base_dir
+            .join("dicts")
+            .join("en")
+            .join("text")
+            .join("en_001");
+        assert_eq!(resolved, expected.to_string_lossy().to_string());
+        assert!(expected.is_dir());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn resolve_creates_new_slot_when_none_is_committed() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("tenuki_manager_test_{}", unique));
+
+        let resolved = resolve_lang_pair_dict_slot(None, "zh-CN", &base_dir);
+
+        let expected = base_dir
+            .join("dicts")
+            .join("zh-CN")
+            .join("text")
+            .join("zh-CN_001");
+        assert_eq!(resolved, expected.to_string_lossy().to_string());
+        assert!(expected.is_dir());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
 }
 
 pub fn create_new_slot(tgt_lang: &str, base_dir: &PathBuf) -> PathBuf {
@@ -251,6 +426,28 @@ pub fn create_new_slot(tgt_lang: &str, base_dir: &PathBuf) -> PathBuf {
     let slot = text_dir.join(format!("{}_{:03}", tgt_lang, next_num));
     let _ = std::fs::create_dir_all(&slot);
     slot
+}
+
+/// Resolve the dict_slot authority for a target language.
+///
+/// When an existing committed slot matches the target language, it is reused.
+/// Otherwise, a new slot is created for the target.
+/// The caller is responsible for downstream commit; this function does not save.
+pub fn resolve_lang_pair_dict_slot(
+    dict_slot: Option<&str>,
+    target_lang: &str,
+    base_dir: &PathBuf,
+) -> String {
+    dict_slot
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .filter(|slot| dict_slot_matches_target(Path::new(slot), target_lang))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            create_new_slot(target_lang, base_dir)
+                .to_string_lossy()
+                .to_string()
+        })
 }
 
 fn resolve_explicit_slot_dir(config: &Config) -> Option<PathBuf> {
@@ -282,8 +479,16 @@ pub fn resolve_slot_dir(config: &Config, base_dir: &PathBuf) -> PathBuf {
     provision_slot_dir(config, base_dir)
 }
 
+pub fn get_exact_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
+    resolve_slot_dir(config, base_dir).join("Tenuki.dict.txt")
+}
+
+pub fn get_regex_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
+    resolve_slot_dir(config, base_dir).join("Tenuki.regex.txt")
+}
+
 pub fn get_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    resolve_slot_dir(config, base_dir).join("dict.txt")
+    get_exact_dict_path(config, base_dir)
 }
 
 /// dict.bin は常に起動時に再生成されるため dicts/ 直下に1つだけ置く
@@ -343,6 +548,46 @@ pub enum RestartScope {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineWaitKind {
+    NormalStartup,
+    ModelSwitch,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EngineWaitPolicy {
+    max_attempts: u32,
+    log_interval_attempts: u32,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl EngineWaitKind {
+    fn policy(self) -> EngineWaitPolicy {
+        match self {
+            Self::NormalStartup => EngineWaitPolicy {
+                max_attempts: 24,
+                log_interval_attempts: 2,
+                initial_backoff: Duration::from_millis(500),
+                max_backoff: Duration::from_secs(3),
+            },
+            Self::ModelSwitch => EngineWaitPolicy {
+                max_attempts: 12,
+                log_interval_attempts: 1,
+                initial_backoff: Duration::from_millis(500),
+                max_backoff: Duration::from_secs(3),
+            },
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NormalStartup => "normal startup",
+            Self::ModelSwitch => "model switch",
+        }
+    }
+}
+
 // ============================================================
 // ProcessManager
 // ============================================================
@@ -352,8 +597,6 @@ pub struct ProcessManager {
     /// llama-server 起動条件（launcher_config.toml 由来・唯一の権威）
     server_cfg: ServerConfig,
     base_dir: PathBuf,
-    current_processor: Arc<dyn TextProcessor>,
-    translation_mode: TranslationMode,
     dictionary: Arc<RwLock<Dictionary>>,
     llama_process: Option<LlamaProcess>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -397,85 +640,26 @@ fn find_llama_exe(base_dir: &Path) -> Option<PathBuf> {
     crate::launcher::runtime_downloader::find_llama_server_exe(&backend_dir)
 }
 
-/// llama-server の /health エンドポイントが {"status":"ok"} を返すまで待機
-///
-/// llama-server.exe はモデルロード前にポートを開くため、TCP 接続成功だけでは
-/// モデルが準備完了かどうか判定できない。/health が 200 OK を返すまで待つ。
-/// 最大待機: 約 120 秒（大型モデルの VRAM ロードを考慮）
-fn wait_for_llama_server(
-    host: &str,
-    port: u16,
+fn emit_engine_wait_notice(
     event_tx: &mpsc::Sender<BackendEvent>,
-    shutdown: &Arc<AtomicBool>,
     ui_lang: &str,
-) -> bool {
-    let connect_host = llama_connect_host(host);
-    let addr: SocketAddr = format!("{}:{}", connect_host, port).parse().unwrap();
-    let health_url = format!("{}/health", llama_base_url(host, port));
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(500))
-        .timeout_read(Duration::from_secs(5))
-        .build();
-
-    let mut backoff = Duration::from_millis(500);
-    for attempt in 0..60 {
-        if shutdown.load(Ordering::Relaxed) {
-            return false;
-        }
-        // まず TCP レベルで到達できるか確認（ポートが開いていない段階をスキップ）
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
-            thread::sleep(backoff);
-            backoff = std::cmp::min(backoff * 2, Duration::from_secs(3));
-            continue;
-        }
-
-        // TCP は開いている → /health を確認
-        match agent.get(&health_url).call() {
-            Ok(response) if response.status() == 200 => {
-                // body を読んで "ok" を確認（読めなくても 200 なら OK とみなす）
-                let is_ok = response
-                    .into_string()
-                    .map(|s| s.contains("\"ok\""))
-                    .unwrap_or(true);
-                if is_ok {
-                    return true;
-                }
-                // {"status":"loading model"} → まだ待つ
-                let msg = if ui_lang == "en" {
-                    format!("llama-server loading model... (attempt {})", attempt + 1)
-                } else {
-                    format!("llama-server モデルロード中... ({}回目)", attempt + 1)
-                };
-                let _ = event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki,
-                    msg,
-                    LogLevel::Info,
-                    crate::messages::current_timestamp(),
-                ));
-            }
-            Ok(_) => {
-                // 503 など → まだロード中
-                let msg = if ui_lang == "en" {
-                    format!("llama-server loading model... (attempt {})", attempt + 1)
-                } else {
-                    format!("llama-server モデルロード中... ({}回目)", attempt + 1)
-                };
-                let _ = event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki,
-                    msg,
-                    LogLevel::Info,
-                    crate::messages::current_timestamp(),
-                ));
-            }
-            Err(_) => {
-                // 接続エラー → 待つ
-            }
-        }
-
-        thread::sleep(backoff);
-        backoff = std::cmp::min(backoff * 2, Duration::from_secs(3));
-    }
-    false
+    kind: EngineWaitKind,
+    attempt: u32,
+    status_en: &str,
+    status_ja: &str,
+) {
+    let status = if ui_lang == "en" {
+        status_en
+    } else {
+        status_ja
+    };
+    let msg = format!("llama-server {}: {} ({})", kind.label(), status, attempt);
+    let _ = event_tx.send(BackendEvent::Log(
+        LogSource::Tenuki,
+        msg,
+        LogLevel::Info,
+        crate::messages::current_timestamp(),
+    ));
 }
 
 fn parse_metric_value(body: &str, metric_name: &str) -> Option<f32> {
@@ -627,33 +811,25 @@ mod pdh_vram {
 
 impl ProcessManager {
     fn emit_rebuilt_input_snapshot(&self, mark_result_stale: bool) {
-        if let Some(snapshot) = analysis::rebuild_latest_snapshot(
-            &self.input_replay,
-            self.current_processor.as_ref(),
-            mark_result_stale,
-        ) {
+        if let Some(snapshot) =
+            analysis::rebuild_latest_snapshot(&self.input_replay, mark_result_stale)
+        {
             let _ = self
                 .event_tx
                 .send(BackendEvent::InputAnalysisUpdated(snapshot));
         }
     }
 
-    fn rebuild_processor(&mut self) {
-        self.current_processor = Arc::from(ProcessorFactory::create(
-            self.translation_mode,
-            self.config.structural,
-        ));
-        self.emit_rebuilt_input_snapshot(true);
-    }
-
     fn rebuild_dictionary(&mut self) {
         let new_slot_dir = resolve_slot_dir(&self.config, &self.base_dir);
-        let new_dict_path = get_dict_path(&self.config, &self.base_dir);
+        let new_exact_dict_path = get_exact_dict_path(&self.config, &self.base_dir);
+        let new_regex_dict_path = get_regex_dict_path(&self.config, &self.base_dir);
         let new_bin_path = get_bin_path(&self.config, &self.base_dir);
 
         self.dictionary = Arc::new(RwLock::new(Dictionary::new(
             new_slot_dir.clone(),
-            new_dict_path,
+            new_exact_dict_path,
+            new_regex_dict_path,
             new_bin_path,
             self.event_tx.clone(),
         )));
@@ -674,8 +850,8 @@ impl ProcessManager {
             let dict_changed = force_dictionary_reload
                 || self.config.tgt_lang != new_config.tgt_lang
                 || self.config.dict_slot != new_config.dict_slot;
-            let mode_changed = self.config.translation_mode != new_config.translation_mode;
-            let structural_changed = self.config.structural != new_config.structural;
+            let mode_changed = self.config.mode != new_config.mode;
+            let game_text_changed = self.config.game_text != new_config.game_text;
             let language_changed = self.config.src_lang != new_config.src_lang
                 || self.config.tgt_lang != new_config.tgt_lang
                 || self.config.custom_lang_name != new_config.custom_lang_name;
@@ -686,12 +862,7 @@ impl ProcessManager {
                 self.rebuild_dictionary();
             }
 
-            if mode_changed {
-                let new_mode = TranslationMode::from_str(&self.config.translation_mode);
-                self.set_translation_mode(new_mode);
-            } else if structural_changed {
-                self.rebuild_processor();
-            } else if language_changed {
+            if mode_changed || game_text_changed || language_changed {
                 self.emit_rebuilt_input_snapshot(true);
             }
         }
@@ -772,6 +943,124 @@ impl ProcessManager {
         alive
     }
 
+    /// Normal startup waits are intentionally shorter than setup verification.
+    /// Setup still uses AppLauncher::test_backend_exe and its long verification path.
+    fn wait_for_llama_server(&mut self, kind: EngineWaitKind) -> bool {
+        let policy = kind.policy();
+        let connect_host = llama_connect_host(&self.server_cfg.host);
+        let addr: SocketAddr = format!("{}:{}", connect_host, self.server_cfg.port)
+            .parse()
+            .unwrap();
+        let health_url = format!(
+            "{}/health",
+            llama_base_url(&self.server_cfg.host, self.server_cfg.port)
+        );
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(500))
+            .timeout_read(Duration::from_secs(5))
+            .build();
+
+        let mut backoff = policy.initial_backoff;
+        emit_engine_wait_notice(
+            &self.event_tx,
+            &self.config.ui_lang,
+            kind,
+            0,
+            "starting",
+            "開始中",
+        );
+
+        for attempt in 0..policy.max_attempts {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return false;
+            }
+
+            let display_attempt = attempt + 1;
+            if !self.has_live_llama_process() {
+                emit_engine_wait_notice(
+                    &self.event_tx,
+                    &self.config.ui_lang,
+                    kind,
+                    display_attempt,
+                    "process exited",
+                    "プロセスが終了しました",
+                );
+                return false;
+            }
+
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
+                if attempt % policy.log_interval_attempts == 0 {
+                    emit_engine_wait_notice(
+                        &self.event_tx,
+                        &self.config.ui_lang,
+                        kind,
+                        display_attempt,
+                        "waiting for port",
+                        "ポート待機中",
+                    );
+                }
+                thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, policy.max_backoff);
+                continue;
+            }
+
+            match agent.get(&health_url).call() {
+                Ok(response) if response.status() == 200 => {
+                    let is_ok = response
+                        .into_string()
+                        .map(|s| s.contains("\"ok\""))
+                        .unwrap_or(true);
+                    if is_ok {
+                        return true;
+                    }
+                    emit_engine_wait_notice(
+                        &self.event_tx,
+                        &self.config.ui_lang,
+                        kind,
+                        display_attempt,
+                        "loading model",
+                        "モデルロード中",
+                    );
+                }
+                Ok(_) => {
+                    emit_engine_wait_notice(
+                        &self.event_tx,
+                        &self.config.ui_lang,
+                        kind,
+                        display_attempt,
+                        "loading model",
+                        "モデルロード中",
+                    );
+                }
+                Err(_) => {
+                    if attempt % policy.log_interval_attempts == 0 {
+                        emit_engine_wait_notice(
+                            &self.event_tx,
+                            &self.config.ui_lang,
+                            kind,
+                            display_attempt,
+                            "waiting for health",
+                            "health待機中",
+                        );
+                    }
+                }
+            }
+
+            thread::sleep(backoff);
+            backoff = std::cmp::min(backoff * 2, policy.max_backoff);
+        }
+
+        emit_engine_wait_notice(
+            &self.event_tx,
+            &self.config.ui_lang,
+            kind,
+            policy.max_attempts,
+            "timeout",
+            "タイムアウト",
+        );
+        false
+    }
+
     pub fn new(
         config: Config,
         server_cfg: ServerConfig,
@@ -780,8 +1069,6 @@ impl ProcessManager {
         selected_model: Option<PathBuf>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
-        let mode = TranslationMode::from_str(&config.translation_mode);
-
         let (async_tx, mut async_rx) = tokio_mpsc::channel(1000);
 
         let bridge_tx = event_tx.clone();
@@ -791,15 +1078,15 @@ impl ProcessManager {
             }
         });
 
-        let processor: Arc<dyn TextProcessor> =
-            Arc::from(ProcessorFactory::create(mode, config.structural));
         let input_replay = Arc::new(std::sync::Mutex::new(analysis::InputReplayState::default()));
         let slot_dir = resolve_slot_dir(&config, &base_dir);
-        let dict_path = get_dict_path(&config, &base_dir);
+        let exact_dict_path = get_exact_dict_path(&config, &base_dir);
+        let regex_dict_path = get_regex_dict_path(&config, &base_dir);
         let bin_file = get_bin_path(&config, &base_dir);
         let dictionary = Arc::new(RwLock::new(Dictionary::new(
             slot_dir.clone(),
-            dict_path,
+            exact_dict_path,
+            regex_dict_path,
             bin_file,
             event_tx.clone(),
         )));
@@ -818,8 +1105,6 @@ impl ProcessManager {
             config,
             server_cfg,
             base_dir,
-            current_processor: processor,
-            translation_mode: mode,
             dictionary,
             llama_process: None,
             server_handle: None,
@@ -904,21 +1189,13 @@ impl ProcessManager {
         Some((tokens_per_second, vram_mb, shared_mb))
     }
 
-    pub fn set_translation_mode(&mut self, mode: TranslationMode) {
-        if self.translation_mode == mode {
-            return;
-        }
-        self.translation_mode = mode;
-        self.rebuild_processor();
-    }
-
-    pub fn set_structural_options(&mut self, options: StructuralOptions) {
-        if self.config.structural == options {
+    pub fn set_game_text_options(&mut self, options: GameTextOptions) {
+        if self.config.game_text == options {
             return;
         }
 
-        self.config.structural = options;
-        self.rebuild_processor();
+        self.config.game_text = options;
+        self.emit_rebuilt_input_snapshot(true);
     }
 
     /// ポートを設定する。実際に値が変化した場合のみ true を返す。
@@ -944,6 +1221,10 @@ impl ProcessManager {
     }
 
     pub fn start_all(&mut self) {
+        self.start_all_with_wait_kind(EngineWaitKind::NormalStartup);
+    }
+
+    fn start_all_with_wait_kind(&mut self, wait_kind: EngineWaitKind) {
         if self.starting {
             return;
         }
@@ -953,7 +1234,7 @@ impl ProcessManager {
         let engine_success = if self.has_live_llama_process() {
             true
         } else {
-            self.start_llama_server()
+            self.start_llama_server(wait_kind)
         };
 
         let translator_success = if engine_success {
@@ -983,6 +1264,11 @@ impl ProcessManager {
         });
 
         self.starting = false;
+    }
+
+    pub fn restart_for_model_switch(&mut self) {
+        self.stop_all();
+        self.start_all_with_wait_kind(EngineWaitKind::ModelSwitch);
     }
 
     pub fn stop_all(&mut self) {
@@ -1039,10 +1325,13 @@ impl ProcessManager {
         // 未停止の場合に備えて念のため呼ぶ（n_cache が空なら即リターン）。
         self.flush_n_cache_to_dict();
         let dict = self.dictionary.clone();
-        self.server_runtime.block_on(async {
+        log::info!("[FLUSH] dictionary_flush_buffer start");
+        let written = self.server_runtime.block_on(async {
             let mut d = dict.write().await;
             d.flush_buffer()
-        })
+        });
+        log::info!("[FLUSH] dictionary_flush_buffer done count={}", written);
+        written
     }
 
     /// n_cache の全エントリを dict.register して n_cache をクリアする
@@ -1051,10 +1340,12 @@ impl ProcessManager {
             return;
         }
         let entries = self.n_cache.drain();
+        log::info!("[FLUSH] n_cache_drain count={}", entries.len());
         let dict = self.dictionary.clone();
         self.server_runtime.block_on(async {
             let mut d = dict.write().await;
             for (k, v) in &entries {
+                log::info!("[FLUSH] dictionary_register key='{}'", k);
                 d.register(k, v);
             }
         });
@@ -1088,7 +1379,7 @@ impl ProcessManager {
 
     // ----------------------------------------------------------
 
-    fn start_llama_server(&mut self) -> bool {
+    fn start_llama_server(&mut self, wait_kind: EngineWaitKind) -> bool {
         if self.has_live_llama_process() {
             return true;
         }
@@ -1160,13 +1451,7 @@ impl ProcessManager {
                     ProcessType::InferenceEngine,
                     true,
                 ));
-                if wait_for_llama_server(
-                    &self.server_cfg.host,
-                    self.server_cfg.port,
-                    &self.event_tx,
-                    &self.shutdown,
-                    &self.config.ui_lang,
-                ) {
+                if self.wait_for_llama_server(wait_kind) {
                     self.selected_model = Some(model);
                     return true;
                 }
@@ -1220,7 +1505,6 @@ impl ProcessManager {
         }
 
         let dictionary = self.dictionary.clone();
-        let processor = self.current_processor.clone();
         let src_lang = self.config.src_lang.clone();
         let tgt_lang = self.config.tgt_lang.clone();
         let custom_lang_name = self.config.custom_lang_name.clone();
@@ -1252,7 +1536,6 @@ impl ProcessManager {
             host.clone(),
             port,
             dictionary,
-            processor,
             src_lang,
             tgt_lang,
             custom_lang_name,

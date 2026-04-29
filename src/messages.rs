@@ -2,22 +2,36 @@
 //!
 //! GUI ↔ バックエンド 間の通信で使用するコマンドとイベントを定義する。
 
-use crate::config::StructuralOptions;
+use crate::config::GameTextOptions;
 use crate::launcher::app_config::ModelConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// GUI/backend contract for the latest normal translation input analysis.
+///
+/// Fresh snapshots are produced only from the authority payload recorded when a
+/// normal `/translate` request completes. Stale snapshots are clones of the
+/// last saved snapshot with `result_stale` set; they are not recomputed from
+/// mode, game-text options, or a processor.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputAnalysisSnapshot {
+    /// Original request text after newline normalization.
     pub raw_text: String,
+    /// Text selected by the translation pipeline as analysis source.
     pub extracted_text: String,
+    /// Human-readable source view recorded in the authority payload.
     pub visible_text: String,
+    /// Model call inputs observed during the completed translation.
     pub model_inputs: Vec<String>,
+    /// Final translated output for fresh snapshots; retained for stale replay.
     pub final_output: Option<String>,
+    /// True when this is a replay after mode/language/game-text changes.
     pub result_stale: bool,
+    /// Dictionary hits recorded by the completed translation.
     pub dict_hits: usize,
+    /// Model calls recorded by the completed translation.
     pub model_calls: usize,
 }
 
@@ -48,6 +62,10 @@ pub enum FrontendCommand {
     Start,
     Stop,
     Restart,
+    /// `dict_slot` is already resolved and committed by the UI/preflight path.
+    ///
+    /// The backend adopts it into `config.toml` and reloads; it must not
+    /// provision or infer a different authority slot from this command.
     /// dict_slot は上流で確定済みの commit 済み authority。backend は adopt して save するだけ。
     SetLanguagePair {
         src: String,
@@ -61,7 +79,7 @@ pub enum FrontendCommand {
     /// backend は adopt して save するだけ。filename 単独渡し禁止。
     CommitModelSelection(ModelConfig),
     UpdateSettings {
-        structural: Option<StructuralOptions>,
+        game_text: Option<GameTextOptions>,
         server_port: Option<u16>,
         server_host: Option<String>,
     },
@@ -71,10 +89,10 @@ impl FrontendCommand {
     pub fn is_empty_update(&self) -> bool {
         match self {
             FrontendCommand::UpdateSettings {
-                structural,
+                game_text,
                 server_port,
                 server_host,
-            } => structural.is_none() && server_port.is_none() && server_host.is_none(),
+            } => game_text.is_none() && server_port.is_none() && server_host.is_none(),
             _ => false,
         }
     }
@@ -90,12 +108,28 @@ pub enum BackendEvent {
     DictionaryLoaded(usize),
     DictionaryNewEntry(String, String, String),
     DictionaryLogEntry(String, String, String),
+    FileTranslateProgress {
+        done: usize,
+        total: usize,
+    },
+    FileTranslateLog {
+        line: String,
+        level: LogLevel,
+    },
     StatisticsUpdate(usize, usize),
+    /// Normal-translation input analysis update.
+    ///
+    /// `/list` must not emit this event. Mode, game-text, and language changes
+    /// may emit only stale replay of the last saved snapshot.
     InputAnalysisUpdated(InputAnalysisSnapshot),
     WorkResult {
         title: String,
         text: String,
         is_error: bool,
+    },
+    StatusNotice {
+        title: String,
+        message: String,
     },
     ProcessStatus(ProcessType, bool),
     BackendReady {
