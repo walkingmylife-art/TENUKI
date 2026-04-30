@@ -1,44 +1,59 @@
 # TENUKI
 
-TENUKI is a XUnity Auto Translator tool built in Rust and powered by a local LLM.
+TENUKI は `llama-server` バックエンドを用いたリアルタイム翻訳ツールです。
 
-## Quick Start
+## List mode
 
-## English
+List mode は、選択したフォルダ内の表形式テキストを翻訳し、位置情報を保持した `.translated.jsonl` を出力します。
+通常翻訳の辞書登録・cache・input analysis は更新しません。
 
-1. Download the latest release.
-2. Run `TENUKI.exe`.  
-   TENUKI will automatically download and set up `HY-MT1.5-1.8B-Q6_K.gguf` and the llama.cpp runtime that matches your backend.  
-   Windows SmartScreen may show a warning.
-3. When setup is finished, select the language you want to translate into. TENUKI will then automatically translate your game text.
+### 出力
 
-## 日本語
+- 出力先: `dicts/{target}/text/list_output`
+- 出力形式: `.translated.jsonl`
+- 各行は `column_index`, `row_index`, `source`, `target`, `mode` を含む
 
-1. 最新版をダウンロードします。
-2. `TENUKI.exe` を起動します。  
-   `HY-MT1.5-1.8B-Q6_K.gguf` と、バックエンドに合った llama.cpp runtime を自動でダウンロードしてセットアップします。  
-   （Windows の SmartScreen が反応する場合があります。）
-3. セットアップが終わったら、翻訳したい言語を選択します。以後、ゲームのテキストを自動で翻訳します。
+### Column mode
 
-## 简体中文
+| mode      | 説明 |
+|-----------|------|
+| Translate | セルを `/list` で翻訳して出力する |
+| Original  | セルを翻訳せずそのまま出力する（`target == source`） |
+| None      | その列は出力しない |
 
-1. 下载最新版本。
-2. 运行 `TENUKI.exe`。  
-   TENUKI 会自动下载并设置 `HY-MT1.5-1.8B-Q6_K.gguf` 以及适合当前后端的 llama.cpp runtime。  
-   Windows SmartScreen 可能会显示警告。
-3. 设置完成后，选择想要翻译成的语言。之后，TENUKI 会自动翻译游戏文本。
+### CSV / 区切りテキスト
 
+- 初期状態は header 未確定（`HeaderMode::Unknown`）として読み、preview suggestion から header あり（`Present`）／なし（`Absent`）を確定する
+- header と判定された行はデータ行として出力しない
 
-   
-```ini
-[Service]
-Endpoint=CustomTranslate
-FallbackEndpoint=
+### JSON
 
-[Behaviour]
-TemplateAllNumberAway=True
+- `JSON array<object>`: object の key を列名として扱い、value を行として扱う
+- `JSON array<array>`: array の各行を表の行として扱い、列名は `col N` になる
+- JSON はデータ形状から表を決めるため、header toggle は表示しない
 
-[Custom]
-Url=http://127.0.0.1:14371
-EnableShortDelay=False
-DisableSpamChecks=True
+### Preview
+
+- 初期表示は最大100行
+- スクロールで段階的に最後まで表示
+
+### List ログ
+
+- `[n/total] source` 行は source 色（白系）
+- `=> target` 行は target 色（青系）
+- `[done]` 行は success 色（緑）
+- Error 行は赤
+- 辞書 hit 色（緑）を List 翻訳行に流用しない
+
+### 言語切替時の辞書確認
+
+- target 変更時、現在の辞書が新 target と一致しない場合、確認ダイアログを表示する
+- 「そのまま使う」「新しく作る」をユーザーが選ぶ
+- 選択前に `config.toml` の `dict_slot` を変更しない
+
+### 既知の制限
+
+- 現在の List mode は JSONL 出力のみ
+- 元の CSV / JSON ファイルへ直接書き戻さない
+- AssetStudio 的なバイナリ抽出は未対応
+- List mode 用の tag / placeholder 保護は別フェーズ

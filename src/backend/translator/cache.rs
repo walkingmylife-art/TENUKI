@@ -3,8 +3,6 @@
 use dashmap::DashMap;
 use std::sync::Mutex;
 
-use crate::backend::normalize::normalize_key;
-
 /// セッション中のLLM翻訳結果キャッシュ（揮発・スレッドセーフ）
 #[derive(Default)]
 pub struct TranslationCache {
@@ -14,24 +12,22 @@ pub struct TranslationCache {
 
 impl TranslationCache {
     pub fn insert(&self, key: String, value: String) {
-        let normalized_key = normalize_key(key.trim());
-        let normalized_value = normalize_key(value.trim());
+        self.source_index.insert(key, value.clone());
 
-        self.source_index.insert(normalized_key, value.clone());
-
-        if !normalized_value.is_empty() {
-            self.value_index.entry(normalized_value).or_insert(value);
+        // Value observation index: raw translated value -> same raw value.
+        // This is not source authority and must not normalize or trim.
+        if !value.is_empty() {
+            self.value_index.entry(value.clone()).or_insert(value);
         }
     }
 
     pub fn lookup_source(&self, key: &str) -> Option<String> {
-        let normalized = normalize_key(key.trim());
-        self.source_index.get(&normalized).map(|v| v.clone())
+        self.source_index.get(key).map(|v| v.clone())
     }
 
+    /// Raw value observation lookup. This is not a source lookup.
     pub fn lookup_value(&self, text: &str) -> Option<String> {
-        let normalized = normalize_key(text.trim());
-        self.value_index.get(&normalized).map(|v| v.clone())
+        self.value_index.get(text).map(|v| v.clone())
     }
 
     #[cfg(test)]
@@ -67,5 +63,30 @@ impl NewEntriesCache {
     /// 全エントリを挿入順で取り出し、内部をクリアする
     pub fn drain(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.inner.lock().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_cache_source_lookup_uses_raw_key() {
+        let cache = TranslationCache::default();
+        cache.insert("ATK ".to_string(), " Value ".to_string());
+
+        assert_eq!(cache.lookup_source("ATK "), Some(" Value ".to_string()));
+        assert_eq!(cache.lookup_source("ATK"), None);
+        assert_eq!(cache.lookup_source("atk "), None);
+    }
+
+    #[test]
+    fn translation_cache_value_lookup_uses_raw_value() {
+        let cache = TranslationCache::default();
+        cache.insert("source".to_string(), " Value ".to_string());
+
+        assert_eq!(cache.lookup_value(" Value "), Some(" Value ".to_string()));
+        assert_eq!(cache.lookup_value("Value"), None);
+        assert_eq!(cache.lookup_value(" value "), None);
     }
 }

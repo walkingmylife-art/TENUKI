@@ -1,173 +1,216 @@
 # TENUKI Forbid
 
-## 0. Purpose
+## 0. 目的
 
-This file lists destructive patterns.
+この文書は、破壊的な実装パターンを列挙する。
 
-Do not apply these bans by keyword alone.
+この禁止事項を、キーワードだけで機械的に適用してはいけない。
 
-Judge whether the code is:
-- changing authority in the wrong layer
-- hiding failure
-- duplicating responsibility
-- treating observation as committed truth
-- preserving legacy behavior as current specification
-- making temporary rescue permanent
+見るべきことは、コードが以下をしていないかである。
 
-Stable files must contain principles, prohibitions, and checklists.
-They must not contain active phase plans.
+* authority を誤った層で変更していないか
+* failure を隠していないか
+* 責務を重複させていないか
+* observation を committed truth として扱っていないか
+* legacy behavior を current specification として保護していないか
+* temporary rescue を permanent にしていないか
+* 派生入れ物を、元 source / TXT / fragment の代替 authority として扱っていないか
 
-## 1. Authority Violations
+Stable files には、principles、prohibitions、checklists を置く。
 
-Do not use observation as authority.
+Stable files に active phase plan を置いてはいけない。
 
-Do not treat a found file as truth just because it exists.
+## 1. Authority 違反
 
-Do not treat a saved value, previous success, old comment, old plan, old memory,
-legacy path, or detected candidate as current authority.
+Observation を authority として使ってはいけない。
 
-Do not commit effective values before verification.
+見つかったファイルを、存在しているという理由だけで truth として扱ってはいけない。
 
-Do not let backend startup repair config shape.
+saved value、previous success、old comment、old plan、old memory、legacy path、detected candidate を current authority として扱ってはいけない。
 
-Do not let a downstream consumer infer, select, replace, repair, provision, save,
-or recommit authority.
+verification 前に effective value を commit してはいけない。
 
-Do not make temporary rescue permanent without an explicit adopt reason and
-commit path.
+backend startup に config shape を repair させてはいけない。
 
-Do not use “it worked last time” as current evidence.
+downstream consumer に authority の infer / select / replace / repair / provision / save / recommit をさせてはいけない。
 
-Do not allow download only because a backend is named in authority config.
+explicit adopt reason と commit path のない temporary rescue を permanent にしてはいけない。
 
-## 2. Route and Pipeline Violations
+「前回動いた」を current evidence として使ってはいけない。
 
-Do not duplicate core translation logic per route.
+authority config に backend 名があることだけを理由に download permission としてはいけない。
 
-Do not create separate hidden translation behavior for /translate, /list,
-or future /v1 routes.
+## 2. Route / Pipeline 違反
 
-Do not erase route policy differences in the name of commonization.
+route ごとに core translation logic を重複実装してはいけない。
 
-Do not cover failure with dummy success responses.
+`/translate`、`/list`、future `/v1` のために、別々の hidden translation behavior を作ってはいけない。
 
-Do not let /list update dictionary, cache, committed dictionary authority,
-or input analysis.
+commonization の名目で route policy differences を消してはいけない。
 
-Do not let List output directory creation modify committed dictionary authority.
+dummy success response で failure を隠してはいけない。
 
-Do not mix request/response shape handling with core translation logic.
+`/list` に dictionary、cache、committed dictionary authority、input analysis を更新させてはいけない。
 
-## 3. File and Output Violations
+List output directory creation に committed dictionary authority を変更させてはいけない。
 
-Do not treat partial writes as completed output.
+request / response shape handling と core translation logic を混ぜてはいけない。
 
-Do not truncate or delete output files in a way that breaks continuation or resume assumptions.
+## 3. File / Output 違反
 
-Do not add hardcoded authority paths.
+partial write を completed output として扱ってはいけない。
 
-Do not treat derived artifacts as authority.
+continuation / resume assumptions を壊す形で output file を truncate / delete してはいけない。
 
-Do not treat dict.bin as dictionary authority.
+hardcoded authority path を追加してはいけない。
 
-Do not reuse dict.bin across slot or language changes unless it is regenerated
-from the current dict.txt authority.
+derived artifact を authority として扱ってはいけない。
 
-Do not let output placement become dictionary authority.
+dict.bin を dictionary authority として扱ってはいけない。
 
-## 4. Legacy and Migration Violations
+dict.bin は、current dict.txt authority から再生成されない限り、slot / language changes を跨いで再利用してはいけない。
 
-Do not copy legacy or mid-layer style into new code.
+output placement を dictionary authority にしてはいけない。
 
-Do not treat old slot names such as S_0001 or s_0001 as current naming rules.
+## 4. Legacy / Migration 違反
 
-Do not place legacy compatibility and current specification at the same level
-in comments or tests.
+legacy style や mid-layer style を、新コードへそのままコピーしてはいけない。
 
-Do not let old handoff MD, old active plans, old comments, or old memories
-outrank current source code and current user instruction.
+old slot names such as `S_0001` or `s_0001` を current naming rules として扱ってはいけない。
 
-Do not keep obsolete plan text in stable instruction files.
+legacy compatibility と current specification を、comments や tests で同じ階層に置いてはいけない。
 
-Do not mix current principles with temporary project status.
+old handoff MD、old active plans、old comments、old memories を、current source code と current user instruction より上位にしてはいけない。
 
-Do not remove legacy detection merely because legacy is not current.
-Legacy may be observed, normalized, or migrated when the current authority layer
-explicitly adopts that action.
+obsolete plan text を stable instruction files に残してはいけない。
 
-## 5. UI and Worker Violations
+current principles と temporary project status を混ぜてはいけない。
 
-Do not run size-proportional I/O, parse, or render work on the UI thread.
+legacy detection を、legacy が current ではないという理由だけで削除してはいけない。
 
-Do not add user-facing strings directly where localized text helpers already exist.
+legacy は observation として検出してよい。
 
-Do not let UI decide authority because it is convenient for rendering.
+legacy input は、current authority layer が明示的に adopt する場合だけ、current rules へ normalize / migrate してよい。
 
-Do not let preview state become execution authority without an explicit readiness
-or plan step.
+## 5. UI / Worker 違反
 
-Do not apply worker results unless they still match the current target,
-source, generation, or session.
+size-proportional I/O、parse、render work を UI thread で実行してはいけない。
 
-Do not split files only to reduce line count while leaving responsibility
-boundaries unclear.
+localized text helpers が既にある場所で、user-facing strings を直接書いてはいけない。
 
-## 6. Comment and Naming Violations
+rendering convenience を理由に UI に authority を決めさせてはいけない。
 
-Do not write comments as history.
+preview state を、explicit readiness または plan step なしに execution authority にしてはいけない。
 
-Do not preserve comments that describe old behavior as if it were current.
+worker results は、current target / source / generation / session と一致する場合だけ反映する。
 
-Do not use broad words such as “dictionary” when the code means one of:
-- dict.txt authority
-- dict.bin derived artifact
-- TranslationCache
-- NewEntriesCache
-- committed dict_slot
-- list output directory
+responsibility boundaries が不明確なまま、file size 削減だけを目的に split してはいけない。
 
-Do not use “read only” if the code also materializes a committed path.
-Use wording like:
-“does not infer or commit authority; may materialize committed path.”
+## 6. Comment / Naming 違反
 
-Do not use “pattern dictionary” unless that exact current component exists.
+history として comment を書いてはいけない。
 
-Do not mix encoding repair, text protection, model transport, and output restoration
-in one comment.
+old behavior を current behavior のように説明する comment を残してはいけない。
 
-Do not name tests so that legacy behavior looks equal to current specification.
+code が次のどれかを意味しているとき、広い意味の “dictionary” で曖昧にしてはいけない。
 
-## 7. Operational Violations
+* dict.txt authority
+* dict.bin derived artifact
+* TranslationCache
+* NewEntriesCache
+* committed dict_slot
+* list output directory
 
-Do not skip the alignment step after implementation.
+code が committed path を materialize する場合、“read only” と書いてはいけない。
 
-Do not stop at “tests pass” if naming, comments, side effects, or entry flow
-still contradict the current design.
+必要なら、次のように書く。
 
-Do not use old phase plans as task authority.
+`does not infer or commit authority; may materialize committed path.`
 
-Do not let a temporary implementation note become a stable instruction.
+現在その exact component が存在しない場合、“pattern dictionary” と呼んではいけない。
 
-If rescue is needed, state:
-- what observation was found
-- why it is adopted
-- who commits it
-- what happens on failure
+encoding repair、text protection、model transport、output restoration を、1つの comment に混ぜてはいけない。
 
-## 8. Not Forbidden
+legacy behavior が current specification と同格に見える test name を付けてはいけない。
 
-The following are not forbidden when the authority boundary is already fixed:
+分かりやすそうな名前の派生入れ物を、存在しているという理由だけで保護対象にしてはいけない。
 
-- materializing a committed path
-- validating a committed path
-- regenerating a derived artifact from current authority
-- detecting legacy paths as observation
-- normalizing legacy input into current rules
-- creating output paths from an accepted RunPlan
-- keeping route policy differences
-- making a small local fix that moves the code toward the final responsibility boundary
-- delaying file splitting until the responsibility boundary is clear
+ただし、名前だけで禁止してはいけない。
 
-Do not block these actions merely because they resemble a forbidden pattern by name.
-Check whether they actually change authority, hide failure, or move responsibility
-to the wrong layer.
+禁止対象は、派生入れ物そのものではなく、その派生入れ物を根拠なく source / TXT / fragment の代替判断材料にすることである。
+
+## 7. 派生入れ物による責務逃れ
+
+ここでいう派生入れ物とは、元の source / text / request / TXT / fragment などから作られた中間変数、派生値、内部 index、一時構造、別名の値を指す。
+
+例:
+
+* key
+* value
+* normalized_key
+* source_norm
+* model_input
+* cleaned
+* restored_output
+* source_span
+* pattern
+* replacement
+* index
+* cache entry
+* persist entry
+
+処理が入っていることを、派生入れ物の正当性の根拠にしてはいけない。
+
+派生入れ物があることを、その処理の正当性の根拠にしてはいけない。
+
+処理の分離を理由に作った派生入れ物を、全体 flow からの根拠なしに後段判断へ使ってはいけない。
+
+撤去対象の派生入れ物を、既存構造・既存仕様として保護対象に昇格させてはいけない。
+
+全体 flow が持つ責務を、局所の派生入れ物で再実装してはいけない。
+
+未指定の normalize / trim / sanitize / canonicalize 結果を、source / TXT / fragment の代替として lookup / register / persist / covered / conflict 判定に使ってはいけない。
+
+辞書編集面に見えている source/value と runtime lookup 対象を、明示理由なしに別の派生値へすり替えてはいけない。
+
+model transport、display cleanup、render/wrap 用の派生入れ物を、dictionary key / cache key / persist source に戻してはいけない。
+
+## 8. Operational 違反
+
+implementation 後の alignment step を skip してはいけない。
+
+tests pass で止めてはいけない。
+
+naming、comments、side effects、entry flow、派生入れ物の扱いが current design と矛盾している場合、tests pass でも完了扱いしてはいけない。
+
+old phase plans を task authority として使ってはいけない。
+
+temporary implementation note を stable instruction にしてはいけない。
+
+rescue が必要な場合は、以下を明記する。
+
+* どの observation が見つかったか
+* なぜ adopt するか
+* 誰が commit するか
+* failure 時にどうなるか
+
+大きめの変更では、処理だけでなく、追加 / 削除 / 残存した派生入れ物も報告する。
+
+## 9. 禁止ではないもの
+
+authority boundary が既に固定されている場合、以下は禁止ではない。
+
+* committed path を materialize すること
+* committed path を validate すること
+* current authority から derived artifact を regenerate すること
+* legacy paths を observation として detect すること
+* current authority layer が明示的に adopt した legacy input normalization
+* accepted RunPlan から output path を作ること
+* route policy differences を保つこと
+* final responsibility boundary へ近づける small local fix
+* responsibility boundary が明確になるまで file splitting を遅らせること
+* 必要な中間変数、内部 index、一時構造、cache、pattern、span を作ること
+
+これらを、禁止パターンに名前が似ているという理由だけで止めてはいけない。
+
+実際に確認するべきことは、それが authority を変えているか、failure を隠しているか、responsibility を wrong layer へ移しているか、派生入れ物を元 source / TXT / fragment の代替 authority にしているかである。

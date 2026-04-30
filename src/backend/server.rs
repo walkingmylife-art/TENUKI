@@ -474,15 +474,16 @@ fn extract_translate_post_text(content_type: Option<&str>, body: &[u8]) -> Optio
         return None;
     }
 
-    let body_text = std::str::from_utf8(body).ok()?.trim().to_string();
-    if body_text.is_empty() {
+    let body_text = std::str::from_utf8(body).ok()?;
+    let body_view = body_text.trim();
+    if body_view.is_empty() {
         return None;
     }
 
     let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
 
-    if content_type.contains("application/json") || body_text.starts_with('{') {
-        if let Ok(request) = serde_json::from_str::<TranslateRequest>(&body_text) {
+    if content_type.contains("application/json") || body_view.starts_with('{') {
+        if let Ok(request) = serde_json::from_str::<TranslateRequest>(body_view) {
             if let Some(text) = request.text.or(request.content) {
                 return Some(text);
             }
@@ -490,17 +491,17 @@ fn extract_translate_post_text(content_type: Option<&str>, body: &[u8]) -> Optio
     }
 
     if content_type.contains("application/x-www-form-urlencoded")
-        || body_text.starts_with("text=")
-        || body_text.starts_with("content=")
-        || body_text.contains("&text=")
-        || body_text.contains("&content=")
+        || body_view.starts_with("text=")
+        || body_view.starts_with("content=")
+        || body_view.contains("&text=")
+        || body_view.contains("&content=")
     {
-        if let Some(text) = parse_form_text(&body_text) {
+        if let Some(text) = parse_form_text(body_view) {
             return Some(text);
         }
     }
 
-    Some(body_text)
+    Some(body_text.to_string())
 }
 
 fn translate_texts_batch(
@@ -578,6 +579,7 @@ fn translate_texts_batch(
                     message: serde_json::json!({
                         "stage": "after_lookup",
                         "result": "hit_cache_value",
+                        "hit_kind": "value_observation",
                         "key": preview_text(key),
                         "key_len": key.len(),
                         "hit_value": crate::backend::server::preview_text(&value),
@@ -593,6 +595,7 @@ fn translate_texts_batch(
                     message: serde_json::json!({
                         "stage": "after_lookup",
                         "result": "hit_dictionary_value",
+                        "hit_kind": "value_observation",
                         "key": preview_text(key),
                         "key_len": key.len(),
                         "hit_value": crate::backend::server::preview_text(&value),
@@ -1443,6 +1446,41 @@ mod tests {
         test_app_state_with_llm(Arc::new(MockLlmClient::default()))
     }
 
+    fn test_app_state_with_dictionary_lines(
+        tag: &str,
+        llm_client: Arc<dyn translator::LlmClient>,
+        lines: &[&str],
+    ) -> (Arc<AppState>, PathBuf) {
+        let dict_dir = test_dictionary_dir(tag);
+        let root = dict_dir.join("txt_root");
+        std::fs::write(root.join("root.txt"), lines.join("\n")).unwrap();
+
+        let (dict_tx, _) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            root,
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        let state = Arc::new(AppState {
+            dictionary,
+            src_lang: Arc::new(RwLock::new("ja".to_string())),
+            tgt_lang: Arc::new(RwLock::new("en".to_string())),
+            custom_lang_name: Arc::new(RwLock::new(String::new())),
+            prompt_template: String::new(),
+            translation_settings: test_settings(),
+            llm_client,
+            event_tx,
+            t_cache: Arc::new(TranslationCache::default()),
+            n_cache: Arc::new(NewEntriesCache::default()),
+            input_replay: Arc::new(Mutex::new(InputReplayState::default())),
+            llm_slots: 1,
+        });
+        (state, dict_dir)
+    }
+
     fn test_settings() -> TranslationSettings {
         TranslationSettings {
             enable_model_wrap: true,
@@ -1811,6 +1849,130 @@ mod tests {
         assert_eq!(snapshot.model_calls, 1);
     }
 
+    #[test]
+    fn cache_value_hit_is_terminal_observation_not_new_entry() {
+        let llm = Arc::new(MockLlmClient::with_responses(&["model result"]));
+        let llm_client: Arc<dyn translator::LlmClient> = llm.clone();
+        let dict_dir = test_dictionary_dir("cache_value_terminal");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+        let t_cache = Arc::new(TranslationCache::default());
+        t_cache.insert("source".to_string(), " Value ".to_string());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        let batch = translate_texts_batch(
+            dictionary,
+            llm_client,
+            Arc::clone(&t_cache),
+            event_tx,
+            "prefix".to_string(),
+            1,
+            "en".to_string(),
+            test_settings(),
+            PipelineBehavior::normal_translate(),
+            vec![" Value ".to_string()],
+        );
+
+        assert_eq!(batch.texts, vec![" Value ".to_string()]);
+        assert_eq!(batch.stats.dict_hits, 1);
+        assert_eq!(batch.stats.model_calls, 0);
+        assert!(batch.new_entries.is_empty());
+        assert!(llm.calls().is_empty());
+        assert!(t_cache.get(" Value ").is_none());
+        assert!(batch.logs.iter().any(|log| matches!(
+            log,
+            LogEvent::Trace { message }
+                if message.contains(r#""result":"hit_cache_value""#)
+                    && message.contains(r#""hit_kind":"value_observation""#)
+        )));
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
+    #[tokio::test]
+    async fn dictionary_value_hit_does_not_commit_or_register() {
+        let llm = Arc::new(MockLlmClient::with_responses(&["model result"]));
+        let llm_client: Arc<dyn translator::LlmClient> = llm.clone();
+        let (state, dict_dir) = test_app_state_with_dictionary_lines(
+            "dictionary_value_terminal",
+            llm_client,
+            &["source= Value "],
+        );
+
+        let result = run_pipeline(
+            &state,
+            "translate",
+            PipelineBehavior::normal_translate(),
+            vec![" Value ".to_string()],
+        )
+        .await
+        .expect("pipeline should succeed");
+
+        assert_eq!(result.translated_text, " Value ");
+        assert!(llm.calls().is_empty());
+        assert!(state.n_cache.drain().is_empty());
+        assert!(state.t_cache.get(" Value ").is_none());
+        assert_eq!(state.dictionary.read().await.lookup_source(" Value "), None);
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
+    #[test]
+    fn source_hit_precedes_value_observation_hit_for_same_text() {
+        let llm = Arc::new(MockLlmClient::with_responses(&["model result"]));
+        let llm_client: Arc<dyn translator::LlmClient> = llm.clone();
+        let dict_dir = test_dictionary_dir("source_before_value");
+        let (dict_tx, _dict_rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let dictionary = Arc::new(RwLock::new(Dictionary::new(
+            dict_dir.join("txt_root"),
+            dict_dir.join("Tenuki.dict.txt"),
+            dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("dict.bin"),
+            dict_tx,
+        )));
+        let t_cache = Arc::new(TranslationCache::default());
+        t_cache.insert("same".to_string(), "source hit".to_string());
+        t_cache.insert("other".to_string(), "same".to_string());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        let batch = translate_texts_batch(
+            dictionary,
+            llm_client,
+            Arc::clone(&t_cache),
+            event_tx,
+            "prefix".to_string(),
+            1,
+            "en".to_string(),
+            test_settings(),
+            PipelineBehavior::normal_translate(),
+            vec!["same".to_string()],
+        );
+
+        assert_eq!(batch.texts, vec!["source hit".to_string()]);
+        assert_eq!(batch.stats.dict_hits, 1);
+        assert_eq!(batch.stats.model_calls, 0);
+        assert!(batch.new_entries.is_empty());
+        assert!(llm.calls().is_empty());
+        assert!(batch.logs.iter().any(|log| matches!(
+            log,
+            LogEvent::Trace { message }
+                if message.contains(r#""result":"hit_cache_source""#)
+        )));
+        assert!(!batch.logs.iter().any(|log| matches!(
+            log,
+            LogEvent::Trace { message }
+                if message.contains(r#""result":"hit_cache_value""#)
+        )));
+
+        let _ = std::fs::remove_dir_all(dict_dir);
+    }
+
     #[tokio::test]
     async fn zm_regex_request_returns_200_and_commits_live_regex() {
         let llm_client: Arc<dyn translator::LlmClient> =
@@ -1916,6 +2078,15 @@ mod tests {
         assert_eq!(
             extract_translate_post_text(Some("text/plain"), body),
             Some("plain text body".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_text_fallback_preserves_raw_body_edges() {
+        let body = b"  plain text body\r\n";
+        assert_eq!(
+            extract_translate_post_text(Some("text/plain"), body),
+            Some("  plain text body\r\n".to_string())
         );
     }
 
