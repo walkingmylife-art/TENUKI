@@ -1,6 +1,6 @@
 # TENUKI
 
-TENUKI is a XUnity Auto Translator tool built in Rust and powered by a local LLM.
+TENUKI translates game text on the GPU using the HY-MT1.5 local LLM through llama.cpp and the XUnity Auto Translator endpoint.
 
 ## Quick Start
 
