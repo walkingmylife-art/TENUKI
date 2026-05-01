@@ -73,6 +73,16 @@ fn sanitize_ui_lang(lang: &str) -> String {
     }
 }
 
+fn create_new_dict_slot_command_for_target(
+    tgt_lang: &str,
+    base_dir: &PathBuf,
+) -> (String, FrontendCommand) {
+    let slot = backend::manager::create_new_slot(tgt_lang, base_dir)
+        .to_string_lossy()
+        .to_string();
+    (slot.clone(), FrontendCommand::SetDictSlot(slot))
+}
+
 fn build_initial_launcher_state(
     launcher_config_path: &Path,
     config_ready_for_normal: bool,
@@ -1269,6 +1279,14 @@ impl eframe::App for TenukiApp {
                         })
                         .ok();
                 }
+                if commands.create_new_dict_slot {
+                    let tgt = self.ui.display.tgt_lang.clone();
+                    let (slot, command) =
+                        create_new_dict_slot_command_for_target(&tgt, &self.base_dir);
+                    self.ui.update_dict_slot(Some(slot));
+                    self.load_input_records_or_log();
+                    self.command_tx.send(command).ok();
+                }
                 if let Some(slot) = commands.set_dict_slot.take() {
                     self.ui.update_dict_slot(Some(slot.clone()));
                     self.load_input_records_or_log();
@@ -1373,7 +1391,8 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         build_initial_launcher_state, complete_backend_handoff,
-        provision_launcher_config_from_misplaced, reset_backend_runtime,
+        create_new_dict_slot_command_for_target, provision_launcher_config_from_misplaced,
+        reset_backend_runtime,
     };
     use crate::launcher::{CheckReadyReason, LauncherEntryIntent, LauncherStep};
     use std::fs;
@@ -1543,6 +1562,34 @@ mod tests {
             rx.try_recv(),
             Ok(crate::messages::FrontendCommand::Start)
         ));
+    }
+
+    #[test]
+    fn create_new_dict_slot_command_uses_current_target_and_set_dict_slot_path() {
+        let base_dir = unique_test_dir();
+        let text_dir = base_dir.join("dicts").join("ja").join("text");
+        fs::create_dir_all(text_dir.join("ja_001")).expect("create existing ja slot");
+
+        let (slot, command) = create_new_dict_slot_command_for_target("ja", &base_dir);
+        let expected = text_dir.join("ja_002").to_string_lossy().to_string();
+
+        assert_eq!(slot, expected);
+        assert!(text_dir.join("ja_002").is_dir());
+        match command {
+            crate::messages::FrontendCommand::SetDictSlot(path) => {
+                assert_eq!(path, expected);
+                assert_ne!(
+                    path,
+                    "\u{ff0b} \u{65b0}\u{3057}\u{3044}\u{8f9e}\u{66f8}\u{3092}\u{4f5c}\u{6210}"
+                );
+            }
+            crate::messages::FrontendCommand::SetLanguagePair { .. } => {
+                panic!("new dict slot action must not call SetLanguagePair");
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

@@ -1,830 +1,280 @@
+# TRANSLATOR_RECONSTRUCTION.md
+
 # TENUKI Translator Reconstruction
 
-この文書は、`src/backend/translator.rs` / `src/backend/translator/` の現在作業用設計である。
+この文書は、`src/backend/translator/` の責務境界を整理するための translator 専用文書である。
 
 これは一般原則ではない。
 
 現在のソースコードと現在のユーザー指示が、この文書より優先される。
 
+この文書は、過去事故の一覧ではなく、translator を見るための処理境界を置く。
+
 ## 0. 目的
 
-局所修正を積み上げず、translator core を以下の責務へ分ける。
+translator core を、局所修正の積み上げではなく、次の責務へ分けて見る。
 
 ```text
-REQUEST
--> source parse
--> plan document
--> resolve document
--> render document
--> final display wrap
+request text
+-> source structure
+-> planned document
+-> resolved document
+-> rendered document
+-> final display text
 -> TranslationResult
-```
 
-目的は、翻訳結果を作ることではなく、次を守りながら翻訳結果を作ること。
+目的は、翻訳結果を作ることだけではない。
 
-* Fragment is not response.
-* child.text is not response.
-* model transport is not authority.
-* rendered text is not authority.
-* Only render_document may build the final response String.
+目的は、以下を混ぜずに翻訳結果を作ること。
 
-処理が入ったこと、型が分かれたこと、テストが通ったことだけでは完了ではない。
+source authority
+model transport
+model return
+resolved child text
+rendered response
+display wrap
+persist candidate
+1. 最優先の境界
 
-translator 内で作る派生入れ物は、何から作られ、どの stage でだけ使ってよいかを確認する。
+FragmentAuthority.source が、fragment の source authority である。
 
-ここでいう派生入れ物とは、`source` から作られる `model_input`、`restored_output`、`ResolvedFragmentNode.text`、`PersistCandidate`、render atom などの中間値・一時構造を指す。
+FragmentAuthority.source は、次の基準になる。
 
-派生入れ物は、存在しているだけでは正しさの根拠にならない。
+dictionary lookup source
+register source
+exact persist source
+regex persist source basis
+logs / stats / diagnostics source basis
 
-## 1. 現在の最重要方針
+model_input は authority ではない。
 
-旧 signed-ZM key split を復活させない。
+restored_output は authority ではない。
 
-以下のような辞書前 key 加工を復活させない。
+ResolvedFragmentNode.text は response ではない。
 
-```text
-HP-ZMDZ% -> HP
-ATK+ZMCZ% -> ATK
-+ZMDZ%压制 -> 压制
-```
+rendered String は source authority ではない。
 
-現在の authority はこれ。
+TranslationResult.text だけが、render 後の最終出力である。
 
-```text
-FragmentAuthority.source
-```
+2. 正規フロー
 
-`FragmentAuthority.source` は以下の基準になる。
+public path は次の形を基本にする。
 
-* dictionary lookup key
-* dictionary register source
-* exact persist source
-* regex persist source basis
-* logs / stats / diagnostics source basis
-
-`ZM -> number` は model transport 専用である。
-
-```text
-FragmentAuthority.source     = 原文 fragment authority
-ModelTransport.model_input   = model に渡す一時文字列
-ModelReturn.restored_output  = model 出力を表示・persist 候補へ戻した文字列
-RenderedDocument.text        = response 文字列
-```
-
-これらを混ぜない。
-
-`model_input`、`restored_output`、`rendered String` を lookup / register / persist source に戻さない。
-
-## 2. 正規フロー
-
-最終的な public path は以下。
-
-```text
 translate_chunk
--> parse_source_document
 -> plan_document
 -> resolve_document
 -> render_document
--> wrap_final_display_text
 -> TranslationResult
-```
 
-`resolve_document` の内部で、必要な fragment ごとに以下を行う。
+現在の実装上、source parse が plan_document 内部に含まれていてもよい。
 
-```text
-FragmentAuthority.source
--> lookup
--> miss の場合 model transport 作成
--> model call
--> restore model output
--> clean display output
--> PersistCandidate 作成
--> ResolvedFragmentNode.text に格納
-```
+重要なのは、責務が混ざらないこと。
 
-`resolve_document` は final response String を作らない。
+plan
 
-## 3. 目標ファイル構成
+plan_document は、翻訳対象と surface を分ける。
 
-最終形。
+許可すること。
 
-```text
-src/backend/translator/
-  mod.rs        public API / coordinator
-  types.rs      Source / Planned / Resolved / Outcome types
-  tokenize.rs   source parse only
-  plan.rs       SourceDocument -> PlannedDocument
-  zm.rs         model transport ZM helpers
-  resolve.rs    lookup / model / clean / persist candidate / stats / logs
-  persist.rs    Exact / Regex candidate helpers
-  render.rs     ResolvedDocument -> String and final wrap
-  normalize.rs  display cleanup and wrap helpers
-  tests/
-```
+source text を構造として読む
+line / segment / separator / newline を保持する
+tag / protected angle / bracket / punctuation などを surface として保持する
+翻訳対象 core を FragmentAuthority.source として確定する
 
-既存の `client.rs`、`lang.rs`、`cache.rs`、`helpers.rs`、`normalize.rs` がある場合は、無理に作り直さない。
+しないこと。
 
-まず責務境界を合わせる。
+dictionary lookup
+model call
+ZM transport
+persist candidate 作成
+final response String 作成
+translated text の再 tokenize
+resolve
 
-ファイル名は最終形に合わせてよいが、分割だけを目的にしない。
+resolve_document は、planned fragment を解決する。
 
-## 4. 目標型
+許可すること。
 
-### 4.1 Source
+FragmentAuthority.source で lookup する
+lookup miss の場合だけ model transport を作る
+model input にだけ ZM -> number を使う
+model output を restore / cleanup する
+ResolvedFragmentNode.text に child text を入れる
+persist candidate を作る
+logs / stats を集める
+surface をそのまま通す
 
-```rust
-struct SourceDocument {
-    lines: Vec<SourceLine>,
+しないこと。
+
+final response String を作る
+render する
+wrap する
+render 済み String を lookup / register / persist に戻す
+model_input を lookup / register / persist source にする
+restored_output を lookup / register source にする
+render
+
+render_document は、resolved document から final response String を作る。
+
+許可すること。
+
+ResolvedDocument の親構造をたどる
+surface を元位置へ戻す
+ResolvedFragmentNode.text を元の fragment 位置へ戻す
+line / segment / separator / newline を復元する
+final response String を作る
+display wrap を適用する
+
+しないこと。
+
+dictionary lookup
+model call
+persist candidate 作成
+source parse
+FragmentAuthority 作成
+render 後 String を lookup / register / persist に戻す
+3. 型の責任
+FragmentAuthority
+struct FragmentAuthority {
+    source: String,
 }
 
-struct SourceLine {
-    segments: Vec<SourceSegment>,
-    separators: Vec<SurfaceNode>,
-    newline: Option<SurfaceNode>,
-}
+責任。
 
-struct SourceSegment {
-    tokens: Vec<StructureToken>,
-}
+fragment の source authority を持つ
+lookup / register / persist の source basis になる
 
-enum StructureToken {
-    Text(String),
-    Surface(SurfaceNode),
-    Bracket {
-        open: SurfaceNode,
-        inner: Vec<StructureToken>,
-        close: SurfaceNode,
-    },
-}
-```
+責任ではないこと。
 
-### 4.2 Planned
-
-```rust
+model_input を持つ
+rendered output を持つ
+prefix / suffix を後から削る
+表示用の加工値を authority 化する
+PlannedDocument
 struct PlannedDocument {
     lines: Vec<PlannedLine>,
 }
 
-struct PlannedLine {
-    segments: Vec<PlannedSegment>,
-    separators: Vec<SurfaceNode>,
-    newline: Option<SurfaceNode>,
-}
+責任。
 
-struct PlannedSegment {
-    nodes: Vec<PlannedNode>,
-}
+source structure を保持したまま、surface と fragment を分ける
 
-enum PlannedNode {
-    Surface(SurfaceNode),
-    Fragment(FragmentNode),
-}
+責任ではないこと。
 
-struct SurfaceNode {
-    text: String,
-}
-
-struct FragmentNode {
-    authority: FragmentAuthority,
-}
-
-struct FragmentAuthority {
-    source: String,
-}
-```
-
-`FragmentNode` に `dict_key`、`prefix`、`suffix` を持たせない。
-
-旧 signed-ZM split を実装する場所を作らない。
-
-### 4.3 Model Transport
-
-```rust
-struct ModelTransport {
-    authority: FragmentAuthority,
-    model_input: String,
-    zm_map: ZmTransportMap,
-}
-
-struct ModelReturn {
-    raw_output: String,
-    restored_output: String,
-}
-```
-
-`model_input` は authority ではない。
-
-`restored_output` も authority ではない。
-
-### 4.4 Resolved
-
-```rust
+翻訳する
+辞書登録する
+最終文字列を作る
+ResolvedDocument
 struct ResolvedDocument {
     lines: Vec<ResolvedLine>,
 }
 
-struct ResolvedLine {
-    segments: Vec<ResolvedSegment>,
-    separators: Vec<SurfaceNode>,
-    newline: Option<SurfaceNode>,
-}
+責任。
 
-struct ResolvedSegment {
-    nodes: Vec<ResolvedNode>,
-}
+planned structure を保持したまま、fragment の child text を持つ
 
-enum ResolvedNode {
-    Surface(SurfaceNode),
-    Fragment(ResolvedFragmentNode),
-}
+責任ではないこと。
 
-struct ResolvedFragmentNode {
-    authority: FragmentAuthority,
-    text: String,
-    origin: ResolveOrigin,
-}
-
-enum ResolveOrigin {
-    Dictionary,
-    CacheSource,
-    CacheValueObservation,
-    Model,
-}
-```
-
-`ResolvedFragmentNode.text` は child.text である。
-
-response ではない。
-
-### 4.5 Persist Candidate
-
-```rust
-enum PersistCandidate {
-    Exact {
-        authority: FragmentAuthority,
-        value: String,
-    },
-    Regex {
-        authority: FragmentAuthority,
-        pattern: String,
-        replacement: String,
-    },
-}
-```
-
-Regex persist は raw exact cache と同じ扱いにしない。
-
-`PersistCandidate::Regex` は「この source を exact cache に入れる」意味ではない。
-
-### 4.6 TranslationResult
-
-```rust
+response String そのものになる
+source authority を作り直す
+TranslationResult
 struct TranslationResult {
     text: String,
-    stats: TranslationStats,
     new_entries: Vec<NewTranslationEntry>,
+    stats: TranslationStats,
     logs: Vec<LogEvent>,
-    diagnostics: TranslationDiagnostics,
 }
-```
 
-`TranslationResult.text` は必ず `render_document` 後の final output である。
+責任。
 
-## 5. Stage Contracts
+外部へ返す final text
+new entries
+stats
+logs
 
-### 5.1 Source Parse
+TranslationResult.text は render 後の final output である。
 
-Input:
+4. ZM の責任
 
-```text
-request text
-```
+ZM 処理は、次の2つに分けて見る。
 
-Output:
+model transport
 
-```text
-SourceDocument
-```
+model が placeholder を壊さないように、一時的に ZM を数字へ置き換える。
 
-Allowed:
+これは model input 専用である。
 
-* newline を line boundary として保持
-* separator を parent line に surface として保持
-* bracket open / close を surface として保持
-* text token を保持
-* protected tag / placeholder / escaped sequence を surface として保持
+source authority -> model_input
+model_input -> model
+model output -> restored_output
 
-Forbidden:
+model_input は dictionary key ではない。
 
-* FragmentNode を作る
-* dictionary lookup
-* model call
-* ZM -> number transport
-* persist candidate 作成
-* render String 作成
+model_input は register key ではない。
 
-### 5.2 Plan
+model_input は exact persist source ではない。
 
-Input:
+regex persist candidate
 
-```text
-SourceDocument
-```
+ZM を含む source を、必要なら regex persist candidate にする。
 
-Output:
+regex persist candidate は exact persist と同じ意味ではない。
 
-```text
-PlannedDocument
-```
+regex persist candidate は、raw exact cache insert の代替名ではない。
 
-Allowed:
+regex と exact は、commit 側でも意味を分ける。
 
-* 翻訳対象 text core を `FragmentAuthority.source` として確定
-* protected surface を Surface として通す
-* bracket open / close を Surface として通す
-* bracket inner core を同じ親構造内で再帰 plan
-* separator / newline を元の line / segment 位置へ保持
-* edge punctuation / visible surface を Surface として保持
+5. cache / dictionary / persist
 
-Forbidden:
+lookup source は FragmentAuthority.source を基準にする。
 
-* dictionary lookup
-* model call
-* ZM -> number transport
-* persist candidate 作成
-* render String 作成
-* translated text の tokenize
-* mixed bracket whole Fragment shortcut
-* Fragment 同士の後結合
-* `dict_key` / `prefix` / `suffix` の再導入
+cache source hit と value observation は意味を分ける。
 
-### 5.3 Resolve
+value observation は source authority ではない。
 
-Input:
+persist candidate は、resolve 中に作ってよい。
 
-```text
-PlannedDocument
-```
+commit は backend/server 側の責任である。
 
-Output:
+translator は、commit 済み dictionary authority を直接変更する場所ではない。
 
-```text
-ResolvedDocument + TranslationAccumulation
-```
+6. render / wrap
 
-Allowed:
+render は、ResolvedDocument から final response String を作る責任を持つ。
 
-* `FragmentAuthority.source` で lookup
-* lookup miss の場合だけ model transport を作る
-* model input にだけ ZM -> number を使う
-* model output を restore して `ResolvedFragmentNode.text` に格納
-* PersistCandidate を作る
-* logs / stats / diagnostics 材料を集める
-* Surface をそのまま通す
+wrap は final display text に対する処理である。
 
-Forbidden:
+wrap は source parse ではない。
 
-* final response String を作る
-* line / segment 構造を flatten する
-* child.text を response 扱いする
-* render 済み文字列を source parser に戻す
-* render 済み文字列を lookup / register key に戻す
-* wrap する
-* source parser を呼ぶ
-* `model_input` を lookup / register / persist source にする
-* `restored_output` を lookup / register source に戻す
+wrap は lookup / register / persist source を作らない。
 
-### 5.4 Render
+protected angle / newline / visible surface は、render stage で元位置へ戻す。
 
-Input:
+7. /translate と /list
 
-```text
-ResolvedDocument
-```
+normal /translate と /list は side effect policy が違う。
 
-Output:
+translator core は再利用してよい。
 
-```text
-String
-```
+ただし、route policy は混ぜない。
 
-Allowed:
+/list は dictionary / cache / input analysis を更新しない。
 
-* line by line で render
-* segment by segment で render
-* Surface.text を出力
-* ResolvedFragmentNode.text を元の座席へ戻す
-* separator / newline を元位置へ戻す
+normal translation の side effect を /list に漏らさない。
 
-Forbidden:
+8. 確認すること
 
-* dictionary lookup
-* model call
-* FragmentAuthority 作成
-* ModelTransport 作成
-* PersistCandidate 作成
-* source tokenize
-* translated tokenize
-* lookup / register / persist source を作る
+translator 変更時は、まず以下を見る。
 
-### 5.5 Final Display Wrap
+今回の変更は plan / resolve / render / persist / route policy のどこか
+その関数の責任は何か
+source authority はどこか
+model transport を authority にしていないか
+rendered String を source 側へ戻していないか
+child text を response として扱っていないか
+/list と /translate の side effect を混ぜていないか
+9. One-line Summary
 
-Input:
+translator は、source authority、model transport、resolved child text、rendered response を混ぜない。
 
-```text
-final response String
-```
-
-Output:
-
-```text
-display response String
-```
-
-Allowed:
-
-* final output surface にだけ wrap を適用
-* 既存の wrap 候補仕様を維持する
-
-Forbidden:
-
-* source parse
-* FragmentNode 作成
-* FragmentAuthority 作成
-* dictionary lookup
-* model call
-* ZM transport
-* persist candidate 作成
-* render 後 String を lookup / register / persist に戻す
-
-## 6. ZM Policy
-
-ZM 処理は2種類に分ける。
-
-### 6.1 Model Transport ZM
-
-model が ZM を壊さないように、一時的に ZM を数字へ置き換える。
-
-これは model input 専用。
-
-```text
-source: 攻撃+ZMCZ%
-model_input: 攻撃+2%
-```
-
-この `2` は authority ではない。
-
-`攻撃+2%` を dictionary key / register key / exact persist source にしない。
-
-### 6.2 Regex Persist ZM
-
-ZM 付き fragment を長期的に育てるため、model output restore 後に regex persist candidate を作る。
-
-例:
-
-```text
-authority.source: 攻撃+ZMCZ%
-value: 攻撃+ZMCZ%
-candidate: Regex { pattern, replacement }
-```
-
-Regex candidate は raw exact cache と同じではない。
-
-Regex persist を作ったからといって、無条件に `TranslationCache.source_index` へ raw exact を入れない。
-
-## 7. Cache / Persist Boundary
-
-translator core は cache / dictionary を直接 commit しない。
-
-translator core は以下を返す。
-
-* TranslationResult.text
-* PersistCandidate
-* logs
-* stats
-* diagnostics
-
-server 側が route policy に従って commit する。
-
-### 7.1 `/translate`
-
-Allowed side effects:
-
-* dictionary lookup
-* session cache lookup
-* dictionary event
-* statistics update
-* input analysis update
-* exact persist commit
-* regex persist commit
-
-### 7.2 `/list`
-
-Forbidden side effects:
-
-* dictionary authority update
-* TranslationCache update
-* NewEntriesCache update
-* input analysis update
-* committed dict_slot update
-
-`/list` は translation transport を使ってよい。
-
-ただし normal translation の side effect を共有しない。
-
-## 8. Whole Fragment Policy
-
-mixed bracket segment は暗黙に whole Fragment にしない。
-
-標準処理は以下。
-
-```text
-outer text       -> Fragment
-bracket open     -> Surface
-bracket inner    -> recursively planned nodes
-bracket close    -> Surface
-separator        -> Surface at parent line
-punctuation edge -> Surface
-```
-
-whole Fragment が必要な場合だけ、専用関数に隔離する。
-
-```rust
-fn maybe_plan_segment_as_whole_fragment(
-    segment: &SourceSegment,
-    context: WholeFragmentContext,
-) -> Option<PlannedSegment>
-```
-
-初期実装では `None` を返してよい。
-
-whole Fragment を有効化する条件は、次を全部説明できる場合だけ。
-
-* dictionary key authority として妥当
-* model input として妥当
-* register key として妥当
-* resolved child.text が戻る座席が1つに定まる
-* old tests のためではない
-* model call 削減のためだけではない
-
-## 9. 派生入れ物の確認
-
-translator 内の派生入れ物は、処理の正しさの根拠ではなく確認対象である。
-
-特に以下を確認する。
-
-* その派生入れ物は何から作られたか
-* 何を捨てたか
-* どの stage でだけ使うか
-* 後段判断に使ってよいか
-* `FragmentAuthority.source` の代役になっていないか
-* 撤去対象の旧中間値が保護対象に変わっていないか
-
-translator で特に危険な派生入れ物。
-
-* dict_key
-* prefix
-* suffix
-* model_input
-* cleaned
-* restored_output
-* rendered String
-* child.text
-* source_span
-* pattern
-* replacement
-* render atom
-
-必要な派生入れ物は作ってよい。
-
-ただし、使える stage と責務を超えてはいけない。
-
-## 10. Implementation Phases
-
-### Phase A: Type Boundary
-
-追加または整理する。
-
-* SourceDocument
-* PlannedDocument
-* ResolvedDocument
-* FragmentAuthority
-* ModelTransport
-* PersistCandidate
-* TranslationAccumulation
-
-Done when:
-
-* 型が compile する
-* `dict_key` / `prefix` / `suffix` を新しい FragmentNode に持ち込んでいない
-* public `translate_chunk` の外形はまだ維持してよい
-
-### Phase B: Source Parse / Plan
-
-追加する。
-
-```rust
-fn parse_source_document(text: &str, options: &GameTextOptions) -> SourceDocument
-fn plan_document(source: SourceDocument) -> PlannedDocument
-```
-
-Done when:
-
-* line / segment / separator / newline shape が保持される
-* `FragmentAuthority.source` が fragment 単位で確定する
-* mixed bracket segment が暗黙 whole Fragment にならない
-
-### Phase C: Resolve Document
-
-追加する。
-
-```rust
-fn resolve_document(...) -> (ResolvedDocument, TranslationAccumulation)
-```
-
-Done when:
-
-* lookup は `FragmentAuthority.source` を基準にする
-* model transport は miss の時だけ作る
-* ZM -> number は model_input にだけ使われる
-* PersistCandidate が Exact / Regex に分かれる
-* resolve は final String を作らない
-
-### Phase D: Render Document
-
-追加する。
-
-```rust
-fn render_document(document: &ResolvedDocument) -> String
-```
-
-Done when:
-
-* `TranslationResult.text` が `render_document` 由来になる
-* child.text は response として扱われない
-* separator / newline が元位置へ戻る
-
-### Phase E: Final Wrap
-
-追加または移動する。
-
-```rust
-fn wrap_final_display_text(text: String, settings: &TranslationSettings) -> String
-```
-
-Done when:
-
-* wrap は final String にだけかかる
-* wrap から source parse / lookup / model / persist へ戻れない
-
-### Phase F: Remove Old Paths
-
-削除または隔離する。
-
-* flat final `Vec<PlannedNode>` response path
-* old `resolve_plan(nodes: &[PlannedNode]) -> String` path
-* old mixed bracket whole Fragment tests
-* old signed-ZM key split tests
-* trace のためだけの `dict_key` / `prefix` / `suffix` 分岐
-
-Done when:
-
-* `translate_chunk` が新順序のみを通る
-* compatibility wrapper が残る場合、最終 response path では使われない
-* 残存経路が完了報告に明記されている
-
-## 11. Required Tests
-
-### 11.1 Fragment Is Not Response
-
-Input:
-
-```text
-的招式(消耗足部架势ZMCZ点)。
-```
-
-Assert:
-
-* PlannedDocument has one line
-* line has one segment
-* segment nodes keep Fragment / Surface / Fragment / Surface / Surface shape
-* ResolvedDocument still has line / segment shape
-* final String appears only after render_document
-
-### 11.2 child.text Is Not Response
-
-Mock:
-
-```text
-的招式 -> その技
-消耗足部架势ZMCZ点 -> 足の構えをZMCZポイント消費する
-```
-
-Assert:
-
-```text
-result.text == "その技(足の構えをZMCZポイント消費する)。"
-```
-
-Also assert:
-
-* each translated fragment text remains child.text until render
-* resolve_document does not create final response String
-
-### 11.3 ZM Transport Is Not Authority
-
-Input:
-
-```text
-攻撃+ZMCZ%
-```
-
-Assert:
-
-* `FragmentAuthority.source` remains `攻撃+ZMCZ%`
-* `model_input` may become `攻撃+2%`
-* lookup / register / persist source does not become `攻撃+2%`
-* lookup / register / persist source does not become `攻撃`
-
-### 11.4 Regex Persist Does Not Create Raw Exact Cache
-
-Input:
-
-```text
-負面抗性+ZMCZ%
-```
-
-Assert:
-
-* Regex PersistCandidate may be produced
-* raw source exact cache is not inserted through generic exact insert path
-* next request can still test regex behavior instead of being masked by raw exact cache
-
-### 11.5 Wrap Does Not Reparse
-
-Assert or review that `wrap_final_display_text()` does not call:
-
-* source parse
-* tokenize_structure
-* FragmentAuthority creation
-* lookup
-* model
-* persist candidate creation
-
-### 11.6 `/list` Side Effects Stay Off
-
-Assert:
-
-* `/list` does not update dictionary authority
-* `/list` does not update TranslationCache
-* `/list` does not update NewEntriesCache
-* `/list` does not emit InputAnalysisUpdated
-
-### 11.7 派生入れ物が authority にならない
-
-Assert:
-
-* `model_input` is not used as lookup / register / persist source
-* `restored_output` is not used as lookup / register source
-* `rendered String` is not passed back to source parse / lookup / register
-* old `dict_key` / `prefix` / `suffix` containers do not exist in current FragmentNode
-* tests do not protect removed containers as current specification
-
-## 12. Tests To Replace, Not Preserve
-
-Do not preserve tests whose only purpose is old behavior.
-
-Replace or delete tests expecting:
-
-* `mixed_bracket_segment_passes_as_single_fragment`
-* `multi_bracket_mixed_sentence_with_outer_text_is_whole_fragment`
-* `ATK+ZMCZ% -> ATK key`
-* `HP-ZMDZ% -> HP key`
-* `+ZMDZ%压制 -> 压制 key`
-* `dict_key/prefix/suffix trace`
-* `after_apply_zm_key_plan trace`
-
-Replacement tests must prove current boundaries.
-
-## 13. Completion Report Requirements
-
-Report all of the following.
-
-* Changed files
-* Removed paths
-* Remaining paths
-* Changed tests
-* Deleted / replaced tests
-* New invariant tests
-* Added derived containers
-* Removed derived containers
-* Remaining derived containers
-* Unverified risks
-* Not touched
-
-Do not report only:
-
-* cargo fmt
-* cargo test passed
-
-Passing tests are evidence, not completion.
+FragmentAuthority.source で解決し、render_document でだけ final response String を作る。

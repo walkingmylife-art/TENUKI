@@ -7,12 +7,14 @@ use crate::ui::list_text::{self, ListText};
 use crate::ui::normal_text::{self, NormalText, TopModeText};
 use eframe::egui;
 use regex;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const LANGS: &[&str] = crate::config::TARGET_LANGUAGE_PRESETS;
 const UI_LANGS: &[&str] = &["ja", "en", "zh-CN"];
 const STATUS_LAMP_CELL_WIDTH: f32 = 18.0;
 const STATUS_LAMP_AFTER_SPACE: f32 = 0.0;
+const CREATE_NEW_DICT_SLOT_LABEL: &str =
+    "\u{ff0b} \u{65b0}\u{3057}\u{3044}\u{8f9e}\u{66f8}\u{3092}\u{4f5c}\u{6210}";
 
 fn is_preset_lang(code: &str) -> bool {
     crate::config::is_target_language_preset(code)
@@ -107,6 +109,34 @@ fn dict_slot_for_target_commit(
     }
 }
 
+fn current_dict_slot_label(data: &UiDisplayData) -> String {
+    match &data.dict_slot {
+        Some(p) => Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| normal_text::text(&data.ui_lang, NormalText::Dict).into()),
+        None => normal_text::text(&data.ui_lang, NormalText::DictNone).to_string(),
+    }
+}
+
+fn available_dict_slots_for_target(base_dir: &Path, target_lang: &str) -> Vec<PathBuf> {
+    let text_dir = base_dir.join("dicts").join(target_lang).join("text");
+    let mut slots = std::fs::read_dir(text_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+
+    slots.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    slots
+}
+
+fn request_create_new_dict_slot(commands: &mut UiCommands) {
+    commands.create_new_dict_slot = true;
+}
+
 fn render_status_lamp(
     ui: &mut egui::Ui,
     l: &str,
@@ -164,35 +194,33 @@ fn render_mode_combo(
         });
 }
 
-fn render_dict_slot_button(ui: &mut egui::Ui, data: &UiDisplayData, state: &mut UiState) {
-    let l = &data.ui_lang;
-    let dict_btn_text_row = match &data.dict_slot {
-        Some(p) => std::path::Path::new(p)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| normal_text::text(l, NormalText::Dict).into()),
-        None => normal_text::text(l, NormalText::DictNone).to_string(),
-    };
-    if ui
-        .button(egui::RichText::new(dict_btn_text_row).size(14.0))
-        .clicked()
-        && state.dict_slot_rx.is_none()
-    {
-        let (tx, rx) = std::sync::mpsc::channel();
-        state.dict_slot_rx = Some(rx);
-        let default_dir = data
-            .base_dir
-            .join("dicts")
-            .join(&data.tgt_lang)
-            .join("text");
-        std::thread::spawn(move || {
-            let _ = tx.send(
-                rfd::FileDialog::new()
-                    .set_directory(&default_dir)
-                    .pick_folder(),
-            );
+fn render_dict_slot_combo(ui: &mut egui::Ui, data: &UiDisplayData, commands: &mut UiCommands) {
+    egui::ComboBox::from_id_salt("dict_slot_combo")
+        .selected_text(egui::RichText::new(current_dict_slot_label(data)).size(14.0))
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(false, CREATE_NEW_DICT_SLOT_LABEL)
+                .clicked()
+            {
+                request_create_new_dict_slot(commands);
+                ui.close_menu();
+            }
+
+            ui.separator();
+
+            for slot in available_dict_slots_for_target(&data.base_dir, &data.tgt_lang) {
+                let slot_value = slot.to_string_lossy().to_string();
+                let label = slot
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| slot_value.clone());
+                let selected = data.dict_slot.as_deref() == Some(slot_value.as_str());
+                if ui.selectable_label(selected, label).clicked() {
+                    commands.set_dict_slot = Some(slot_value);
+                    ui.close_menu();
+                }
+            }
         });
-    }
 }
 
 fn draw_log_entries(ui: &mut egui::Ui, logs: &std::collections::VecDeque<LogEntry>, empty: &str) {
@@ -337,7 +365,7 @@ pub fn show_normal_ui(
                     };
                 }
             }
-            render_dict_slot_button(ui, data, state);
+            render_dict_slot_combo(ui, data, commands);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(normal_text::text(l, NormalText::Exit)).clicked() {
@@ -370,14 +398,6 @@ pub fn show_normal_ui(
                     }
                 }
                 ui.add_space(4.0);
-                if let Some(rx) = &state.dict_slot_rx {
-                    if let Ok(result) = rx.try_recv() {
-                        if let Some(path) = result {
-                            commands.set_dict_slot = Some(path.to_string_lossy().to_string());
-                        }
-                        state.dict_slot_rx = None;
-                    }
-                }
             });
         });
 
@@ -894,10 +914,26 @@ pub fn show_normal_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        dict_slot_for_target_commit, next_log_panel_tab, select_top_mode, selected_top_mode,
-        TopModeChoice,
+        available_dict_slots_for_target, dict_slot_for_target_commit, next_log_panel_tab,
+        request_create_new_dict_slot, select_top_mode, selected_top_mode, TopModeChoice,
+        CREATE_NEW_DICT_SLOT_LABEL,
     };
     use crate::ui::container::{LeftPanelTab, UiCommands, UiDisplayData, UiState};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tenuki-ui-normal-test-{}-{}",
+            std::process::id(),
+            unique
+        ))
+    }
 
     fn display_with_profile(profile: &str) -> UiDisplayData {
         UiDisplayData {
@@ -994,5 +1030,55 @@ mod tests {
     #[test]
     fn empty_dict_slot_is_not_forwarded() {
         assert_eq!(dict_slot_for_target_commit("ja", "ja", Some("")), None);
+    }
+
+    #[test]
+    fn dict_slot_create_action_sets_flag_without_slot_value() {
+        let mut commands = UiCommands::default();
+
+        request_create_new_dict_slot(&mut commands);
+
+        assert!(commands.create_new_dict_slot);
+        assert_eq!(commands.set_dict_slot, None);
+        assert_ne!(
+            commands.set_dict_slot.as_deref(),
+            Some(CREATE_NEW_DICT_SLOT_LABEL)
+        );
+    }
+
+    #[test]
+    fn available_dict_slots_lists_all_directories_under_current_target_text_dir() {
+        let base_dir = unique_test_dir();
+        let ja_text_dir = base_dir.join("dicts").join("ja").join("text");
+        let en_text_dir = base_dir.join("dicts").join("en").join("text");
+        fs::create_dir_all(ja_text_dir.join("ja_002")).expect("create ja_002");
+        fs::create_dir_all(ja_text_dir.join("ja_001")).expect("create ja_001");
+        fs::create_dir_all(ja_text_dir.join("LongYinLiZhiZhuan"))
+            .expect("create game-name dictionary folder");
+        fs::create_dir_all(ja_text_dir.join("UserGameDictionary"))
+            .expect("create arbitrary dictionary folder");
+        fs::create_dir_all(ja_text_dir.join("S_0001")).expect("create legacy slot folder");
+        fs::create_dir_all(en_text_dir.join("en_001")).expect("create en_001");
+        fs::write(ja_text_dir.join("note.txt"), "not a slot").expect("write non-slot file");
+
+        let slots = available_dict_slots_for_target(&base_dir, "ja");
+        let names = slots
+            .iter()
+            .filter_map(|slot| slot.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "LongYinLiZhiZhuan".to_string(),
+                "S_0001".to_string(),
+                "UserGameDictionary".to_string(),
+                "ja_001".to_string(),
+                "ja_002".to_string()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 }

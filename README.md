@@ -2,9 +2,15 @@
 
 TENUKI translates game text on the GPU using the HY-MT1.5 local LLM through llama.cpp and the XUnity Auto Translator endpoint.
 
+## Contents
+
+- [Quick Start](#quick-start)
+- [XUnity Auto Translator Configuration](#xunity-auto-translator-configuration)
+- [Translation Flow](#translation-flow)
+
 ## Quick Start
 
-## English
+### English
 
 1. Download the latest release.
 2. Run `TENUKI.exe`.  
@@ -12,7 +18,7 @@ TENUKI translates game text on the GPU using the HY-MT1.5 local LLM through llam
    Windows SmartScreen may show a warning.
 3. When setup is finished, select the language you want to translate into. TENUKI will then automatically translate your game text.
 
-## 日本語
+### 日本語
 
 1. 最新版をダウンロードします。
 2. `TENUKI.exe` を起動します。  
@@ -20,7 +26,7 @@ TENUKI translates game text on the GPU using the HY-MT1.5 local LLM through llam
    （Windows の SmartScreen が反応する場合があります。）
 3. セットアップが終わったら、翻訳したい言語を選択します。以後、ゲームのテキストを自動で翻訳します。
 
-## 简体中文
+### 简体中文
 
 1. 下载最新版本。
 2. 运行 `TENUKI.exe`。  
@@ -28,8 +34,8 @@ TENUKI translates game text on the GPU using the HY-MT1.5 local LLM through llam
    Windows SmartScreen 可能会显示警告。
 3. 设置完成后，选择想要翻译成的语言。之后，TENUKI 会自动翻译游戏文本。
 
+## XUnity Auto Translator Configuration
 
-   
 ```ini
 [Service]
 Endpoint=CustomTranslate
@@ -42,3 +48,10 @@ TemplateAllNumberAway=True
 Url=http://127.0.0.1:14371
 EnableShortDelay=False
 DisableSpamChecks=True
+```
+
+## Translation Flow
+
+TENUKI receives translation requests from XUnity Auto Translator, checks the session cache and local dictionary, sends only unresolved text fragments to llama.cpp, restores protected game-text structures, and returns the final translated text to the game.
+
+![TENUKI Translation Flow](docs/images/tenuki-translation-flow.png)

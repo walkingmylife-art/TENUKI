@@ -1,71 +1,225 @@
-# Backend Authority Contracts
+BACKEND_AUTHORITY_CONTRACTS.md
+Backend Authority Contracts
 
-This file records the Phase 6/7 state of backend processor removal, input analysis, and public authority boundaries.
+この文書は、backend の public authority boundary を記録する。
 
-## Processor Decision
+これは active plan ではない。
 
-- `src/backend/processor.rs` has been removed.
-- `backend.rs` no longer exposes `pub mod processor`.
-- `ProcessorFactory`, `TextProcessor`, `TranslationContext`, `NormalTextProcessor`, and `GameTextProcessor` are not part of the backend live path.
-- No processor abstraction remains for input analysis.
+これは過去フェーズの作業ログではない。
 
-## Mode Boundary
+現在のソースコードと現在のユーザー指示が、この文書より優先される。
 
-- `Config.mode` remains a public runtime/config contract.
-- `normalize_mode_value()` still normalizes legacy `structural` to `game` and `passthrough` to `normal`.
-- Removing `processor.rs` does not remove the `game` / `normal` mode concept.
-- Mode handling belongs to config/runtime policy and caller behavior, not to a shared backend processor module.
+0. 目的
 
-## Authority Boundary
+backend がどの authority を読むか、どの authority を作らないかを明確にする。
 
-- `FrontendCommand::SetLanguagePair.dict_slot` is already resolved by the UI/preflight path.
-- The backend adopts `dict_slot` into `config.toml`, reloads, and restarts as needed.
-- The backend must not infer a different slot, repair missing slot authority, or treat discovery as authority.
-- Backend startup reads committed `config.toml` / `launcher_config.toml` authority; it does not create a new authority path for input analysis.
+特に、以下を混ぜない。
 
-## Input Analysis Snapshot Contract
+config authority
+launcher authority
+dict_slot authority
+input analysis authority payload
+stale replay
+list mode output placement
+normal translation side effect
+1. Processor Boundary
 
-- Fresh snapshot: built from `CompletedAnalysisPayload` recorded at successful normal `/translate` completion.
-- Stale snapshot: cloned from `InputReplayState.latest_snapshot` and marked with `result_stale = true`.
-- Stale replay is not recomputed from current mode, game-text options, language settings, or a processor.
-- `raw_text`: normalized original request text from the completed translation payload.
-- `extracted_text`: analysis source selected by the completed translation payload.
-- `visible_text`: human-readable source view recorded by the completed translation payload.
-- `model_inputs`: model call inputs observed during the completed translation.
-- `final_output`: final translated output for fresh snapshots; retained during stale replay.
-- `result_stale`: `false` for fresh snapshots, `true` for replay after mode/language/game-text changes.
-- `dict_hits`: dictionary hit count from the completed translation.
-- `model_calls`: model call count from the completed translation.
+src/backend/processor.rs は backend live path に存在しない。
 
-## Module Shape
+backend は、input analysis のために processor abstraction を持たない。
 
-### `backend/analysis.rs`
+次のものは backend live path の authority ではない。
 
-- Builds fresh `InputAnalysisSnapshot` from `CompletedAnalysisPayload`.
-- Stores the latest completed snapshot in `InputReplayState`.
-- Replays the saved snapshot for stale display by toggling `result_stale`.
-- Does not depend on processor code or `InputAnalysisProjector`.
+ProcessorFactory
+TextProcessor
+TranslationContext
+NormalTextProcessor
+GameTextProcessor
+InputAnalysisProjector
 
-### `backend/manager.rs`
+input analysis は processor から再計算しない。
 
-- Does not hold an input-analysis projector or processor.
-- `mode`, `game_text`, and language changes emit a stale replay of the last authority snapshot.
-- Dictionary reload is real work; input analysis replay is only saved snapshot replay.
+2. Mode Boundary
 
-### `backend/server.rs`
+Config.mode は runtime/config contract として残る。
 
-- `AppState` does not hold an input-analysis projector or processor.
-- `/translate` builds an authority payload from translation diagnostics and records it.
-- `/list` uses `PipelineBehavior::list_mode()` and does not update dictionary/cache/input analysis.
+game / normal の mode concept は残る。
 
-### `main.rs`
+mode は config/runtime policy と caller behavior の責任で扱う。
 
-- Reads `InputAnalysisSnapshot` for pickup/work-result display.
-- Does not reconstruct input analysis.
+mode handling を shared backend processor module へ戻さない。
 
-## List Mode Boundary
+legacy mode value の normalize は config 層の責任である。
 
-- `/list` is a separate backend entry from normal `/translate`.
-- `/list` does not commit dictionary authority, update translation caches, emit statistics, or update input analysis.
-- File Translate/List output directories are execution locations for that run, not committed authority changes.
-- Continuation/resume state for List mode is independent from normal input analysis snapshot replay.
+3. Config Authority
+
+backend startup は、committed config.toml と launcher_config.toml を読む。
+
+backend startup は、それらを observation から勝手に作り直さない。
+
+backend は、launcher authority を推測し直さない。
+
+backend は、model authority を filename だけから再構築しない。
+
+backend は、committed config を読む側である。
+
+必要な adopt / save command がある場合だけ、その command の責任範囲で保存する。
+
+4. dict_slot Authority
+
+FrontendCommand::SetLanguagePair.dict_slot は、UI/preflight 側で解決済みの authority として backend へ渡される。
+
+backend はそれを adopt して config.toml に保存し、reload / restart する。
+
+backend は SetLanguagePair 内で別の dict_slot を infer しない。
+
+backend は missing slot authority を discovery から repair しない。
+
+backend は discovery を authority として扱わない。
+
+SetDictSlot は、dict_slot だけを変更する command である。
+
+SetLanguagePair と SetDictSlot を同じ意味にしない。
+
+5. Input Analysis Snapshot Contract
+
+fresh snapshot は、successful normal /translate completion で記録された authority payload から作る。
+
+stale snapshot は、保存済み latest snapshot を clone し、result_stale = true にした replay である。
+
+stale replay は、現在の mode / game-text options / language settings / processor から再計算しない。
+
+InputAnalysisSnapshot の意味。
+
+raw_text:
+normal /translate 完了 payload の original request text
+
+extracted_text:
+translation pipeline が analysis source として記録した text
+
+visible_text:
+authority payload に記録された human-readable source view
+
+model_inputs:
+完了した翻訳で観測された model call inputs
+
+final_output:
+fresh snapshot の final translated output
+stale replay では保存済み値を保持する
+
+result_stale:
+fresh では false
+mode / language / game-text 変更後の replay では true
+
+dict_hits:
+完了した翻訳で記録された dictionary hit count
+
+model_calls:
+完了した翻訳で記録された model call count
+6. Module Contracts
+backend/analysis.rs
+
+責任。
+
+CompletedAnalysisPayload から fresh InputAnalysisSnapshot を作る
+latest completed snapshot を InputReplayState に保存する
+stale display 用に保存 snapshot を replay する
+
+責任ではないこと。
+
+processor に依存する
+mode / game_text / language から再計算する
+backend/manager.rs
+
+責任。
+
+backend runtime を管理する
+config reload / restart を扱う
+mode / game_text / language change 時に stale replay を出す
+dictionary reload を実行する
+
+責任ではないこと。
+
+input-analysis projector を持つ
+processor を持つ
+input analysis を再計算する
+
+dictionary reload は real work である。
+
+input analysis replay は saved snapshot replay である。
+
+この2つを混ぜない。
+
+backend/server.rs
+
+責任。
+
+/translate request を処理する
+/list request を処理する
+route ごとの PipelineBehavior を選ぶ
+/translate 完了時に analysis authority payload を作る
+/list side effect を抑制する
+
+責任ではないこと。
+
+/list で dictionary/cache/input analysis を更新する
+processor で analysis を再計算する
+main.rs
+
+責任。
+
+InputAnalysisSnapshot を UI 表示に使う
+pickup / work-result display に snapshot を読む
+
+責任ではないこと。
+
+input analysis を再構築する
+processor を使って snapshot を作る
+7. Normal / List Boundary
+
+normal /translate は、通常翻訳の entry である。
+
+/list は、normal /translate とは別の backend entry である。
+
+/list は以下をしない。
+
+dictionary authority commit
+translation cache update
+input analysis update
+normal statistics update
+normal dict_slot authority update
+
+File Translate / List output directory は、その run の execution location である。
+
+File Translate / List output directory は、committed dict_slot authority ではない。
+
+Continuation / resume state for List mode は、normal input analysis snapshot replay とは独立して扱う。
+
+8. Restart / Reload Boundary
+
+config change に対する reload / restart は backend manager の責任である。
+
+translator-only restart と full restart は意味を分ける。
+
+engine が必要な場合は backend manager が runtime 状態を見て決める。
+
+UI command は、backend 内部の restart 実装詳細を直接所有しない。
+
+9. 確認すること
+
+backend authority 周りを変更した場合は、以下を見る。
+
+その command は何を commit するのか
+backend は read しているだけか、adopt/save しているのか
+discovery を authority にしていないか
+stale replay を fresh analysis として扱っていないか
+/list side effect が normal に近づいていないか
+dict_slot と output placement を混ぜていないか
+processor / projector 的な再計算経路を戻していないか
+10. One-line Summary
+
+backend は committed authority を読み、必要な command の範囲で adopt / save する。
+
+input analysis は completed translation payload から作り、stale は replay する。
+
+/list は normal translation の side effect を持たない。

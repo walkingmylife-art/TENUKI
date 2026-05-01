@@ -1,120 +1,165 @@
-# File Translate Feature Positioning
+File Translate Feature Positioning.md
+File Translate Feature Positioning
 
-## 0. Purpose
+この文書は、File Translate の位置づけを記録する steering document である。
 
-This is a steering document, not an active plan and not a current task list.
+これは active plan ではない。
 
-It defines how File Translate should be positioned inside TENUKI:
-an independent feature that borrows the existing UI stage and existing translation transport
-without reshaping the whole application or weakening authority boundaries.
+これは current task list ではない。
 
-Current source code and current user instruction decide the active implementation state.
+現在のソースコードと現在のユーザー指示が、現在の実装状態を決める。
 
-## 1. Core Position
+0. 目的
 
-File Translate is not a simple extension of normal translation.
+File Translate を、normal translation の単純な拡張として扱わない。
 
-It is an independent feature lane that borrows the existing TENUKI stage.
+File Translate は、TENUKI の既存 UI stage と translation transport を借りる独立した feature lane である。
 
-Meaning:
-- separate processing lane
-- existing UI frame may be borrowed
-- existing components may be reused
-- the stage itself must not be broken
+目的は、File Translate をアプリ全体の再設計理由にせず、既存 stage を壊さずに独立機能として置くこと。
 
-## 2. Relationship to list
+1. 基本位置
 
-File Translate may use the existing `/list` transport.
+File Translate は normal translation ではない。
 
-That does not mean File Translate and `/list` have the same feature meaning.
+File Translate は /list そのものでもない。
 
-Use `/list` as a transport component when useful.
-Do not force File Translate into the normal translation core just to make the architecture look unified.
+File Translate は、必要に応じて /list transport を使う独立した workflow である。
 
-## 3. What File Translate is
+File Translate:
+独立した feature lane
 
-File Translate is:
-- an independent feature
-- an independent processing lane
-- a workflow staged inside the existing TENUKI UI
-- allowed to borrow existing UI/result/log/transport components
+/list:
+複数 text を処理する transport / backend entry
 
-File Translate is not:
-- normal translation
-- a reason to reshape the whole UI
-- a reason to weaken authority boundaries
-- a reason to create project-wide abstractions too early
+normal /translate:
+通常翻訳の runtime entry
 
-## 4. Borrowed components
+これらを同じ意味にしない。
 
-File Translate may borrow:
-- existing UI frame
-- existing center result area
-- existing log layer
-- existing translation transport
-- existing helper functions when their meaning still fits
+2. File Translate が借りてよいもの
 
-Borrowing is not redefinition.
+File Translate は、既存の部品を借りてよい。
 
-Do not treat borrowed parts as proof that File Translate has the same meaning as normal translation.
+既存 UI frame
+center result / work area
+log layer
+translation transport
+helper functions
+dictionary format output
 
-## 5. Wrong reasons to change UI or authority
+ただし、借りることは再定義ではない。
 
-Do not change the feature shape merely because:
-- it makes authority easier to express
-- it makes a commit point easier to add
-- it moves logic closer to backend
-- it makes commonization look cleaner
-- it avoids writing a feature-local controller
+借りた部品があることは、File Translate と normal translation が同じ意味である根拠にならない。
 
-The feature shape comes first.
-Then the internal implementation must satisfy that shape without breaking authority boundaries.
+3. File Translate がしてはいけないこと
 
-## 6. UI Position
+File Translate のために、TENUKI 全体の stage を壊さない。
 
-File Translate uses the existing UI as its stage.
+File Translate のために、normal translation の UI contract を弱めない。
 
-Correct direction:
-- borrow existing layout
-- keep the existing center result/work area
-- put feature-specific navigation and preview in side panels
-- use existing log structure without replacing the whole center UI
+File Translate のために、authority boundary を弱めない。
 
-Wrong direction:
-- replace the center with a File Translate-only screen
-- add unrelated operation systems
-- change normal translation UI contracts because File Translate exists
+File Translate のために、project-wide abstraction を早く作りすぎない。
 
-## 7. Authority Position
+File Translate のために、normal translation core へ無理に押し込まない。
 
-File Translate may be independent, but it must still respect TENUKI authority rules.
+4. UI 位置
 
-Do not:
-- turn preview into authority
-- let UI convenience create hidden commit points
-- let `/list` update dictionary/cache/input analysis
-- treat run-only output placement as committed dictionary authority
-- weaken normal translation boundaries
+File Translate は、既存 UI を stage として使う。
 
-Do:
-- keep preview as observation
-- fix execution inputs through readiness or RunPlan
-- treat List output directory as output placement
-- keep committed dict_slot separate from File Translate List output directory
+正しい方向。
 
-## 8. Current State
+既存 layout を借りる
+center result / work area を使う
+feature-specific navigation は side panel に置く
+preview は side panel / work area へ出す
+log は既存 log structure を借りる
 
-This file does not define current state.
+避ける方向。
 
-For current behavior, inspect source code and tests.
+center を File Translate 専用画面に作り替える
+normal translation UI contract を変更する
+File Translate のために unrelated operation system を足す
+5. /list との関係
 
-Especially verify:
-- whether Run/Stop is currently implemented
-- how readiness is evaluated
-- what output schema runner currently writes
-- how dict_slot and List output directory are separated
-- whether `/list` side effects remain disabled
+File Translate は /list transport を使ってよい。
 
-## 9. One-line Summary
+ただし、File Translate と /list は同じ意味ではない。
 
-File Translate is an independent feature that borrows the existing TENUKI UI stage and translation transport. Borrow components when useful, but do not break the stage, blur feature meaning, or weaken authority boundaries.
+/list は backend transport のひとつである。
+
+File Translate は UI workflow と実行管理を含む feature lane である。
+
+/list を使うために、File Translate を normal translation core へ押し込まない。
+
+6. authority 位置
+
+File Translate は独立機能だが、TENUKI の authority boundary は守る。
+
+preview は observation である。
+
+preview は authority ではない。
+
+scan result は observation である。
+
+run readiness / run config / run plan は、実行時に使う固定入力である。
+
+List output directory は、その run の output placement である。
+
+List output directory は、committed dict_slot authority ではない。
+
+committed dict_slot と File Translate output placement を混ぜない。
+
+7. side effect 境界
+
+File Translate / /list は、normal translation と side effect が違う。
+
+/list は以下をしない。
+
+dictionary authority commit
+translation cache update
+input analysis update
+normal statistics update
+normal dict_slot commit
+
+File Translate の実行結果を、normal translation の authority として扱わない。
+
+File Translate の output placement を、通常辞書の committed slot に昇格させない。
+
+8. 変更判断
+
+File Translate の形は feature shape から決める。
+
+次の理由だけで UI や authority を変えない。
+
+authority を表現しやすい
+commit point を置きやすい
+backend に寄せやすい
+commonization がきれいに見える
+feature-local controller を避けたい
+
+feature shape が先。
+
+その後で、内部実装を authority boundary に合わせる。
+
+9. 現在状態の確認
+
+この文書は current state を定義しない。
+
+現在の挙動は、ソースコードとテストを見る。
+
+特に確認すること。
+
+Run / Stop が現在どう実装されているか
+readiness がどこで評価されているか
+runner が現在どの output schema を書くか
+dict_slot と List output directory が分かれているか
+/list side effects が無効のままか
+preview / scan / run の状態が混ざっていないか
+10. One-line Summary
+
+File Translate は、既存 UI stage と translation transport を借りる独立 feature lane である。
+
+借りることと同一化を混同しない。
+
+preview は observation、run output は output placement、committed dict_slot は別 authority として扱う。
