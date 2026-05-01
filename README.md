@@ -54,4 +54,4 @@ DisableSpamChecks=True
 
 TENUKI receives translation requests from XUnity Auto Translator, checks the session cache and local dictionary, sends only unresolved text fragments to llama.cpp, restores protected game-text structures, and returns the final translated text to the game.
 
-![TENUKI Translation Flow](docs/images/tenuki-translation-flow.png)
+![TENUKI Translation Flow](tenuki-translation-flow.png)
