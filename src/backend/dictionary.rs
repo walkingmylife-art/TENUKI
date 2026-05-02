@@ -1074,6 +1074,12 @@ mod tests {
 
         assert!(tmp.join("Tenuki.dict.txt").exists());
         assert!(tmp.join("Tenuki.regex.txt").exists());
+        assert!(std::fs::read(tmp.join("Tenuki.dict.txt"))
+            .unwrap()
+            .starts_with(b"\xEF\xBB\xBF"));
+        assert!(std::fs::read(tmp.join("Tenuki.regex.txt"))
+            .unwrap()
+            .starts_with(b"\xEF\xBB\xBF"));
         assert!(!tmp.join("dict.txt").exists());
 
         let _ = std::fs::remove_dir_all(tmp);

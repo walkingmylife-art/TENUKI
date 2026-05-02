@@ -1,4 +1,4 @@
-BACKEND_AUTHORITY_CONTRACTS.md
+﻿BACKEND_AUTHORITY_CONTRACTS.md
 Backend Authority Contracts
 
 この文書は、backend の public authority boundary を記録する。

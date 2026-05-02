@@ -1,4 +1,4 @@
-File Translate Feature Positioning.md
+﻿File Translate Feature Positioning.md
 File Translate Feature Positioning
 
 この文書は、File Translate の位置づけを記録する steering document である。

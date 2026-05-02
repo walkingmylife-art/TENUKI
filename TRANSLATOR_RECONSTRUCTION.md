@@ -1,4 +1,4 @@
-# TRANSLATOR_RECONSTRUCTION.md
+﻿# TRANSLATOR_RECONSTRUCTION.md
 
 # TENUKI Translator Reconstruction
 

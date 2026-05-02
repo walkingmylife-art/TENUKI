@@ -1,4 +1,4 @@
-AGENTS.md
+﻿AGENTS.md
 
 PRINCIPLES.md と FORBID.md を読むこと。
 

@@ -690,6 +690,27 @@ mod tests {
     }
 
     #[test]
+    fn render_atom_wrap_preserves_simplified_chinese_fullwidth_comma_candidate() {
+        let input = "这是一个很长的简体字句子，后续内容继续保持足够长度";
+        let atoms = vec![RenderAtom::Text(input.to_string())];
+
+        let wrapped = wrap_render_atoms(
+            atoms,
+            TranslationSettings {
+                enable_model_wrap: true,
+                model_wrap_min_chars: 1,
+                model_wrap_min_tail_chars: 1,
+                enable_model_symbol_cleanup: true,
+            },
+        );
+
+        assert_eq!(
+            render_atoms(&wrapped),
+            "这是一个很长的简体字句子，\n后续内容继续保持足够长度"
+        );
+    }
+
+    #[test]
     fn render_atom_wrap_splits_long_english_at_dot_space() {
         let atoms = vec![RenderAtom::Text(
             "The hero defeated the ancient dragon. The kingdom was saved.".to_string(),

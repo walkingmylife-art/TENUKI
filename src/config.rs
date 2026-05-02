@@ -354,7 +354,7 @@ fn default_src_lang() -> String {
 }
 
 fn default_tgt_lang() -> String {
-    "ja".to_string()
+    "en".to_string()
 }
 
 fn default_mode() -> String {

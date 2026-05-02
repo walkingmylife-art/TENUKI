@@ -299,6 +299,18 @@ pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, min_tail_length:
     result
 }
 
+fn collapse_duplicate_terminal_punctuation(mut text: String) -> String {
+    for punct in ['。', '、'] {
+        let terminal_count = text.chars().rev().take_while(|&ch| ch == punct).count();
+        if terminal_count == 2 {
+            let new_len = text.len() - punct.len_utf8();
+            text.truncate(new_len);
+            text = text.trim_end().to_string();
+        }
+    }
+    text
+}
+
 pub fn clean_model_output(
     src: &str,
     translated: &str,
@@ -313,17 +325,7 @@ pub fn clean_model_output(
         result = normalize_plus_minus_spacing(&result);
     }
 
-    for punct in &['。', '，', '．'] {
-        if !src.ends_with(*punct) {
-            while result.ends_with(*punct) {
-                let new_len = result.len() - punct.len_utf8();
-                result.truncate(new_len);
-                result = result.trim_end().to_string();
-            }
-        }
-    }
-
-    result
+    collapse_duplicate_terminal_punctuation(result)
 }
 
 #[cfg(test)]
@@ -341,7 +343,7 @@ mod tests {
     #[test]
     fn removes_extra_internal_spaces_for_japanese_target() {
         assert_eq!(
-            clean_model_output("攻撃力10", "攻撃 力 10。", "ja", true),
+            clean_model_output("攻撃力10", "攻撃 力 10", "ja", true),
             "攻撃力10"
         );
     }
@@ -470,10 +472,74 @@ mod tests {
     }
 
     #[test]
-    fn clean_model_output_leaves_cjk_text_unchanged_when_no_apostrophe_pattern() {
+    fn clean_model_output_removes_cjk_internal_spaces_without_punctuation() {
         assert_eq!(
-            clean_model_output("攻撃力10", "攻撃 力 10。", "ja", true),
+            clean_model_output("攻撃力10", "攻撃 力 10", "ja", true),
             "攻撃力10"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_keeps_single_terminal_period_even_if_source_has_none() {
+        assert_eq!(
+            clean_model_output("Hello", "こんにちは。", "ja", true),
+            "こんにちは。"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_keeps_single_terminal_period_when_source_has_ascii_period() {
+        assert_eq!(
+            clean_model_output("Hello.", "こんにちは。", "ja", true),
+            "こんにちは。"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_collapses_duplicate_terminal_period() {
+        assert_eq!(
+            clean_model_output("Hello", "こんにちは。。", "ja", true),
+            "こんにちは。"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_keeps_three_terminal_periods() {
+        assert_eq!(
+            clean_model_output("Hello", "こんにちは。。。", "ja", true),
+            "こんにちは。。。"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_collapses_duplicate_terminal_japanese_comma() {
+        assert_eq!(
+            clean_model_output("Hello", "こんにちは、、", "ja", true),
+            "こんにちは、"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_keeps_single_terminal_japanese_comma() {
+        assert_eq!(
+            clean_model_output("Hello", "こんにちは、", "ja", true),
+            "こんにちは、"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_keeps_three_terminal_japanese_commas() {
+        assert_eq!(
+            clean_model_output("Hello", "こんにちは、、、", "ja", true),
+            "こんにちは、、、"
+        );
+    }
+
+    #[test]
+    fn clean_model_output_leaves_fullwidth_comma_pair_unchanged() {
+        assert_eq!(
+            clean_model_output("Hello", "你好，，", "zh-CN", true),
+            "你好，，"
         );
     }
 

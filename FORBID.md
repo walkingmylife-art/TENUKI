@@ -1,4 +1,4 @@
-FORBID.md
+﻿FORBID.md
 TENUKI Forbid
 
 この文書は、破ると責任境界が壊れる禁止事項だけを置く。

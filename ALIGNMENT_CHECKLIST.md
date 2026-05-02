@@ -1,4 +1,4 @@
-ALIGNMENT_CHECKLIST.md
+﻿ALIGNMENT_CHECKLIST.md
 TENUKI Alignment Checklist
 
 新実装後に通す、短い揃え工程。

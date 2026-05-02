@@ -1,4 +1,4 @@
-PRINCIPLES.md
+﻿PRINCIPLES.md
 TENUKI Principles
 
 この文書は、TENUKI の判断原則を置くための文書である。

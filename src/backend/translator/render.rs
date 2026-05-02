@@ -22,7 +22,7 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
     if ch == '\u{3002}' {
         return Some(1);
     }
-    if ch == '\u{3001}' {
+    if ch == '\u{3001}' || ch == '\u{FF0C}' {
         return Some(1);
     }
     if (ch == '.' || ch == ',') && next == Some(' ') {
@@ -39,7 +39,7 @@ fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
 fn wrap_candidate_score(chars: &[char], index: usize, candidate_width: usize) -> i32 {
     match (chars[index], candidate_width) {
         ('\u{3002}', 1) => 20,
-        ('\u{3001}', 1) => 8,
+        ('\u{3001}', 1) | ('\u{FF0C}', 1) => 8,
         ('.', 2) => 20,
         (',', 2) => 8,
         (' ', 3) => 20,
@@ -322,4 +322,21 @@ pub(super) fn render_document(
     let atoms = build_document_render_atoms(document);
     let atoms = wrap_render_atoms(atoms, settings);
     render_atoms(&atoms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_wrap_candidate, wrap_candidate_score};
+
+    #[test]
+    fn fullwidth_comma_is_weak_wrap_candidate() {
+        let chars: Vec<char> = "很长的简体字文，后续文".chars().collect();
+        let index = chars
+            .iter()
+            .position(|&ch| ch == '\u{FF0C}')
+            .expect("test text should contain fullwidth comma");
+
+        assert_eq!(is_wrap_candidate(&chars, index), Some(1));
+        assert_eq!(wrap_candidate_score(&chars, index, 1), 8);
+    }
 }
