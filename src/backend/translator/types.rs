@@ -85,7 +85,7 @@ impl TranslationStats {
 pub struct TranslationSettings {
     pub enable_model_wrap: bool,
     pub model_wrap_min_chars: usize,
-    pub model_wrap_min_tail_chars: usize,
+    pub model_wrap_space_fallback_min_chars: usize,
     pub enable_model_symbol_cleanup: bool,
 }
 

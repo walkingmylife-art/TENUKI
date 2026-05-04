@@ -85,7 +85,6 @@ pub fn target_language_label(ui_lang: &str, code: &str) -> &'static str {
             "zh-CN" => "中国語（簡体字）",
             "zh-TW" => "中国語（繁体字）",
             "ko" => "韓国語",
-            "ar" => "アラビア語",
             _ => "不明",
         },
         "zh-CN" => match code {
@@ -94,7 +93,6 @@ pub fn target_language_label(ui_lang: &str, code: &str) -> &'static str {
             "zh-CN" => "中文（简体）",
             "zh-TW" => "中文（繁体）",
             "ko" => "韩语",
-            "ar" => "阿拉伯语",
             _ => "未知",
         },
         _ => match code {
@@ -103,7 +101,6 @@ pub fn target_language_label(ui_lang: &str, code: &str) -> &'static str {
             "zh-CN" => "Chinese (Simplified)",
             "zh-TW" => "Chinese (Traditional)",
             "ko" => "Korean",
-            "ar" => "Arabic",
             _ => "Unknown",
         },
     }
@@ -237,7 +234,7 @@ fn ja(key: NormalText) -> &'static str {
         NormalText::HostPlaceholder => "127.0.0.1",
         NormalText::PortPlaceholder => "14371",
         NormalText::CustomLanguageCodePlaceholder => "pt-BR",
-        NormalText::CustomLanguageNamePlaceholder => "ブラジルポルトガル語",
+        NormalText::CustomLanguageNamePlaceholder => "Brazilian Portuguese",
         NormalText::MetricVram => "VRAM",
         NormalText::MetricShared => "共有",
         NormalText::MetricTokens => "トークン",
@@ -279,7 +276,7 @@ fn zh_cn(key: NormalText) -> &'static str {
         NormalText::HostPlaceholder => "127.0.0.1",
         NormalText::PortPlaceholder => "14371",
         NormalText::CustomLanguageCodePlaceholder => "pt-BR",
-        NormalText::CustomLanguageNamePlaceholder => "巴西葡萄牙语",
+        NormalText::CustomLanguageNamePlaceholder => "Brazilian Portuguese",
         NormalText::MetricVram => "VRAM",
         NormalText::MetricShared => "共享",
         NormalText::MetricTokens => "Token",

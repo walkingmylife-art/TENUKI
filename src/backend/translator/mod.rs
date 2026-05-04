@@ -92,8 +92,8 @@ mod tests {
     fn test_settings() -> TranslationSettings {
         TranslationSettings {
             enable_model_wrap: true,
-            model_wrap_min_chars: 60,
-            model_wrap_min_tail_chars: 10,
+            model_wrap_min_chars: 80,
+            model_wrap_space_fallback_min_chars: 100,
             enable_model_symbol_cleanup: true,
         }
     }
@@ -649,7 +649,15 @@ mod tests {
         let input = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ใน bbb";
         let atoms = vec![RenderAtom::Text(input.to_string())];
 
-        let wrapped = wrap_render_atoms(atoms, test_settings());
+        let wrapped = wrap_render_atoms(
+            atoms,
+            TranslationSettings {
+                enable_model_wrap: true,
+                model_wrap_min_chars: 1,
+                model_wrap_space_fallback_min_chars: 100,
+                enable_model_symbol_cleanup: true,
+            },
+        );
         let rendered = render_atoms(&wrapped);
 
         assert_eq!(
@@ -678,7 +686,7 @@ mod tests {
             TranslationSettings {
                 enable_model_wrap: true,
                 model_wrap_min_chars: 1,
-                model_wrap_min_tail_chars: 1,
+                model_wrap_space_fallback_min_chars: 100,
                 enable_model_symbol_cleanup: true,
             },
         );
@@ -699,7 +707,7 @@ mod tests {
             TranslationSettings {
                 enable_model_wrap: true,
                 model_wrap_min_chars: 1,
-                model_wrap_min_tail_chars: 1,
+                model_wrap_space_fallback_min_chars: 100,
                 enable_model_symbol_cleanup: true,
             },
         );
@@ -713,13 +721,13 @@ mod tests {
     #[test]
     fn render_atom_wrap_splits_long_english_at_dot_space() {
         let atoms = vec![RenderAtom::Text(
-            "The hero defeated the ancient dragon. The kingdom was saved.".to_string(),
+            "The hero defeated the ancient dragon in a fierce battle. The kingdom was saved at last.".to_string(),
         )];
 
         let wrapped = wrap_render_atoms(atoms, test_settings());
         assert_eq!(
             render_atoms(&wrapped),
-            "The hero defeated the ancient dragon.\nThe kingdom was saved."
+            "The hero defeated the ancient dragon in a fierce battle.\nThe kingdom was saved at last."
         );
     }
 
@@ -734,7 +742,7 @@ mod tests {
             TranslationSettings {
                 enable_model_wrap: true,
                 model_wrap_min_chars: 1,
-                model_wrap_min_tail_chars: 10,
+                model_wrap_space_fallback_min_chars: 100,
                 enable_model_symbol_cleanup: true,
             },
         );
@@ -865,7 +873,7 @@ mod tests {
             TranslationSettings {
                 enable_model_wrap: true,
                 model_wrap_min_chars: 1,
-                model_wrap_min_tail_chars: 1,
+                model_wrap_space_fallback_min_chars: 100,
                 enable_model_symbol_cleanup: true,
             },
         );

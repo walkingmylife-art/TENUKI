@@ -1511,7 +1511,7 @@ impl ProcessManager {
         let prompt_template = self.config.prompt_template.clone();
         let enable_model_wrap = self.config.effective_model_wrap();
         let model_wrap_min_chars = self.config.model_wrap_min_chars;
-        let model_wrap_min_tail_chars = self.config.model_wrap_min_tail_chars;
+        let model_wrap_space_fallback_min_chars = self.config.model_wrap_space_fallback_min_chars;
         let enable_model_symbol_cleanup = self.config.enable_model_symbol_cleanup;
         let llm_client = self.llm_client.clone();
         let server_event_tx = self.server_event_tx.clone();
@@ -1528,7 +1528,7 @@ impl ProcessManager {
         let translation_settings = TranslationSettings {
             enable_model_wrap,
             model_wrap_min_chars: model_wrap_min_chars as usize,
-            model_wrap_min_tail_chars: model_wrap_min_tail_chars as usize,
+            model_wrap_space_fallback_min_chars: model_wrap_space_fallback_min_chars as usize,
             enable_model_symbol_cleanup,
         };
 

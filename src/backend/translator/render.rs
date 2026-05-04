@@ -13,8 +13,6 @@ struct WrapPlan {
     next_start: usize,
 }
 
-const WRAP_SPACE_FALLBACK_MIN_CHARS: usize = 100;
-
 fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
     let ch = chars.get(index).copied()?;
     let next = chars.get(index + 1).copied();
@@ -71,24 +69,6 @@ fn surface_to_render_atom(surface: &SurfaceNode) -> RenderAtom {
     }
 }
 
-fn build_document_render_atoms(document: &ResolvedDocument) -> Vec<RenderAtom> {
-    let mut atoms = Vec::new();
-
-    for line in &document.lines {
-        for segment in &line.segments {
-            atoms.extend(build_render_atoms(&segment.nodes));
-            if let Some(separator) = &segment.trailing_separator {
-                atoms.push(surface_to_render_atom(separator));
-            }
-        }
-
-        if let Some(newline) = &line.trailing_newline {
-            atoms.push(surface_to_render_atom(newline));
-        }
-    }
-
-    atoms
-}
 
 pub(super) fn build_render_atoms(nodes: &[ResolvedNode]) -> Vec<RenderAtom> {
     let mut atoms = Vec::new();
@@ -193,7 +173,7 @@ fn find_wrap_plan(
     visible_text: &str,
     enabled: bool,
     min_length: usize,
-    min_tail_length: usize,
+    space_fallback_min_length: usize,
 ) -> Option<WrapPlan> {
     if !enabled || visible_text.contains('\n') || visible_text.chars().count() < min_length {
         return None;
@@ -209,17 +189,6 @@ fn find_wrap_plan(
         let Some(candidate_width) = is_wrap_candidate(&chars, index) else {
             continue;
         };
-
-        let next_start = match candidate_width {
-            1 => index + 1,
-            2 => index + 2,
-            3 => index + 1,
-            _ => continue,
-        };
-
-        if candidate_width != 3 && len.saturating_sub(next_start) < min_tail_length {
-            continue;
-        }
 
         let base = wrap_candidate_score(&chars, index, candidate_width);
         if base == 0 {
@@ -256,12 +225,8 @@ fn find_wrap_plan(
         });
     }
 
-    if len >= WRAP_SPACE_FALLBACK_MIN_CHARS {
+    if len >= space_fallback_min_length {
         if let Some(index) = find_center_ascii_space(&chars) {
-            if len.saturating_sub(index + 1) < min_tail_length {
-                return None;
-            }
-
             return Some(WrapPlan {
                 emit_end: index,
                 next_start: index + 1,
@@ -294,7 +259,7 @@ pub(super) fn wrap_render_atoms(
             &visible,
             settings.enable_model_wrap,
             settings.model_wrap_min_chars,
-            settings.model_wrap_min_tail_chars,
+            settings.model_wrap_space_fallback_min_chars,
         );
 
         result.extend(insert_wrap_plan_into_atoms(segment, plan));
@@ -319,8 +284,24 @@ pub(super) fn render_document(
     document: &ResolvedDocument,
     settings: TranslationSettings,
 ) -> String {
-    let atoms = build_document_render_atoms(document);
-    let atoms = wrap_render_atoms(atoms, settings);
+    let mut atoms = Vec::new();
+
+    for line in &document.lines {
+        for segment in &line.segments {
+            let segment_atoms = build_render_atoms(&segment.nodes);
+            let segment_atoms = wrap_render_atoms(segment_atoms, settings);
+            atoms.extend(segment_atoms);
+
+            if let Some(separator) = &segment.trailing_separator {
+                atoms.push(surface_to_render_atom(separator));
+            }
+        }
+
+        if let Some(newline) = &line.trailing_newline {
+            atoms.push(surface_to_render_atom(newline));
+        }
+    }
+
     render_atoms(&atoms)
 }
 

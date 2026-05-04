@@ -384,7 +384,7 @@ fn build_translation_profile(legacy: &LegacyConfig, profile_name: &str) -> Trans
     };
     profile.model_processing.enable_model_wrap = legacy.enable_model_wrap;
     profile.model_processing.model_wrap_min_chars = legacy.model_wrap_min_chars as usize;
-    profile.model_processing.model_wrap_min_tail_chars = legacy.model_wrap_min_tail_chars as usize;
+    profile.model_processing.model_wrap_space_fallback_min_chars = legacy.model_wrap_space_fallback_min_chars as usize;
     profile.model_processing.enable_model_symbol_cleanup = legacy.enable_model_symbol_cleanup;
 
     profile

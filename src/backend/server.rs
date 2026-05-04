@@ -1485,7 +1485,7 @@ mod tests {
         TranslationSettings {
             enable_model_wrap: true,
             model_wrap_min_chars: 60,
-            model_wrap_min_tail_chars: 10,
+            model_wrap_space_fallback_min_chars: 100,
             enable_model_symbol_cleanup: true,
         }
     }

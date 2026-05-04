@@ -176,129 +176,6 @@ fn normalize_plus_minus_spacing(text: &str) -> String {
     result
 }
 
-fn is_wrap_candidate(chars: &[char], index: usize) -> Option<usize> {
-    let ch = chars.get(index).copied()?;
-    let next = chars.get(index + 1).copied();
-
-    if ch == '、' {
-        return Some(1);
-    }
-    if ch == '。' {
-        return Some(1);
-    }
-    if (ch == '.' || ch == ',') && next == Some(' ') {
-        return Some(2);
-    }
-
-    // Thai: detect " ใน" and break at the leading space
-    if ch == ' ' && chars.get(index + 1) == Some(&'ใ') && chars.get(index + 2) == Some(&'น') {
-        return Some(3);
-    }
-
-    None
-}
-
-fn wrap_candidate_score(chars: &[char], index: usize, candidate_width: usize) -> i32 {
-    match (chars[index], candidate_width) {
-        ('。', 1) => 20,
-        ('、', 1) => 8,
-        ('.', 2) => 20,
-        (',', 2) => 8,
-        (' ', 3) => 20,
-        _ => 0,
-    }
-}
-
-const SPACE_FALLBACK_MIN_CHARS: usize = 100;
-
-fn find_center_ascii_space(chars: &[char]) -> Option<usize> {
-    let center = chars.len() / 2;
-    let mut best: Option<(usize, usize)> = None; // (distance, index)
-    for (i, &ch) in chars.iter().enumerate() {
-        if ch == ' ' {
-            let dist = center.abs_diff(i);
-            if best.map_or(true, |(d, _)| dist < d) {
-                best = Some((dist, i));
-            }
-        }
-    }
-    best.map(|(_, i)| i)
-}
-
-pub fn apply_wrap(text: &str, enabled: bool, min_length: usize, min_tail_length: usize) -> String {
-    if !enabled || text.contains('\n') || text.chars().count() < min_length {
-        return text.to_string();
-    }
-
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let center = len / 2;
-
-    let mut best: Option<(i32, usize, usize, usize)> = None;
-
-    for index in 0..len {
-        let Some(candidate_width) = is_wrap_candidate(&chars, index) else {
-            continue;
-        };
-
-        let next_start = match candidate_width {
-            1 => index + 1,
-            2 => index + 2,
-            3 => index + 1,
-            _ => continue,
-        };
-        if candidate_width != 3 && len.saturating_sub(next_start) < min_tail_length {
-            continue;
-        }
-
-        let base = wrap_candidate_score(&chars, index, candidate_width);
-        if base == 0 {
-            continue;
-        }
-
-        let distance = center.abs_diff(index);
-        let score = base - distance as i32;
-
-        match best {
-            None => best = Some((score, distance, index, candidate_width)),
-            Some((best_score, best_distance, best_index, _)) => {
-                if score > best_score
-                    || (score == best_score && distance < best_distance)
-                    || (score == best_score && distance == best_distance && index > best_index)
-                {
-                    best = Some((score, distance, index, candidate_width));
-                }
-            }
-        }
-    }
-
-    let (emit_end, next_start) = if let Some((_, _, index, candidate_width)) = best {
-        match candidate_width {
-            1 => (index + 1, index + 1),
-            2 => (index + 1, index + 2),
-            3 => (index, index + 1),
-            _ => return text.to_string(),
-        }
-    } else if len >= SPACE_FALLBACK_MIN_CHARS {
-        if let Some(index) = find_center_ascii_space(&chars) {
-            if len.saturating_sub(index + 1) < min_tail_length {
-                return text.to_string();
-            }
-            (index, index + 1)
-        } else {
-            return text.to_string();
-        }
-    } else {
-        return text.to_string();
-    };
-
-    let mut result = String::with_capacity(text.len() + 1);
-    result.extend(chars[..emit_end].iter());
-    result.push('\n');
-    result.extend(chars[next_start..].iter());
-    result
-}
-
 fn collapse_duplicate_terminal_punctuation(mut text: String) -> String {
     for punct in ['。', '、'] {
         let terminal_count = text.chars().rev().take_while(|&ch| ch == punct).count();
@@ -330,7 +207,7 @@ pub fn clean_model_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_wrap, clean_model_output};
+    use super::clean_model_output;
 
     #[test]
     fn trims_only_edges_for_english_target() {
@@ -354,58 +231,6 @@ mod tests {
             clean_model_output("Kinh nghiem", "  Kinh  nghiem  ", "vi", true),
             "Kinh  nghiem"
         );
-    }
-
-    #[test]
-    fn wrap_splits_long_english_at_dot_space() {
-        let text = "The hero defeated the ancient dragon in battle. The kingdom was saved.";
-        assert_eq!(
-            apply_wrap(text, true, 60, 10),
-            "The hero defeated the ancient dragon in battle.\nThe kingdom was saved."
-        );
-    }
-
-    #[test]
-    fn wrap_does_not_split_short_text() {
-        assert_eq!(apply_wrap("Hello. World.", true, 60, 10), "Hello. World.");
-    }
-
-    #[test]
-    fn wrap_picks_one_best_candidate() {
-        let text = "Alpha beta gamma delta epsilon zeta eta, Theta iota kappa lambda mu nu xi omicron. Pi rho sigma tau upsilon phi chi psi omega, Final section stays.";
-        assert_eq!(
-            apply_wrap(text, true, 60, 10),
-            "Alpha beta gamma delta epsilon zeta eta, Theta iota kappa lambda mu nu xi omicron.\nPi rho sigma tau upsilon phi chi psi omega, Final section stays."
-        );
-    }
-
-    #[test]
-    fn wrap_respects_min_tail_length() {
-        let text = "123456789012345678901234567890. short";
-        assert_eq!(
-            apply_wrap(text, true, 31, 10),
-            "123456789012345678901234567890. short"
-        );
-        assert_eq!(
-            apply_wrap(text, true, 31, 5),
-            "123456789012345678901234567890.\nshort"
-        );
-    }
-
-    #[test]
-    fn wrap_splits_thai_at_leading_space_before_nai() {
-        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ใน bbb";
-        assert_eq!(
-            apply_wrap(text, true, 60, 10),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nใน bbb"
-        );
-    }
-
-    #[test]
-    fn wrap_does_not_use_fullwidth_period_as_candidate_below_fallback_threshold() {
-        let text = format!("{} ver．1 {}", "a".repeat(40), "b".repeat(46));
-        assert_eq!(text.chars().count(), 93);
-        assert_eq!(apply_wrap(&text, true, 60, 10), text);
     }
 
     #[test]
@@ -543,42 +368,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wrap_space_fallback_splits_long_plain_english_at_center_space() {
-        // 100 chars (49 a + space + 50 b), no punctuation candidate → space fallback kicks in
-        let text =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        assert_eq!(text.chars().count(), 100);
-        assert_eq!(
-            apply_wrap(text, true, 60, 10),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        );
-    }
-
-    #[test]
-    fn wrap_space_fallback_does_not_split_below_100_chars() {
-        // 99 chars — below fallback threshold, no punctuation → no split
-        let text =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        assert_eq!(text.chars().count(), 99);
-        assert_eq!(apply_wrap(text, true, 60, 10), text);
-    }
-
-    #[test]
-    fn wrap_space_fallback_picks_space_nearest_center() {
-        // Two spaces in a 100-char string → center=50, space at 60 is closer
-        let text = format!(
-            "{}{}{}{}",
-            "a".repeat(20),
-            " ",
-            "b".repeat(39),
-            " ccccccccccccccccccccccccccccccccccccccc"
-        );
-        assert_eq!(text.chars().count(), 100);
-        let result = apply_wrap(&text, true, 60, 10);
-        assert!(result.contains('\n'));
-        // The split must be at the space closest to center (index 60 vs 20)
-        let lines: Vec<&str> = result.splitn(2, '\n').collect();
-        assert_eq!(lines[0].len(), 60);
-    }
 }

@@ -11,11 +11,19 @@ fn default_true() -> bool {
 }
 
 fn default_wrap_min_chars() -> u32 {
-    60
+    80
 }
 
-fn default_wrap_min_tail_chars() -> u32 {
-    10
+fn default_wrap_space_fallback_min_chars() -> u32 {
+    100
+}
+
+fn default_profile_wrap_min_chars() -> usize {
+    80
+}
+
+fn default_profile_wrap_space_fallback_min_chars() -> usize {
+    100
 }
 
 fn default_prompt_template() -> String {
@@ -30,7 +38,7 @@ fn default_profile_mode() -> String {
     "game".to_string()
 }
 
-pub const TARGET_LANGUAGE_PRESETS: &[&str] = &["ja", "en", "zh-CN", "zh-TW", "ko", "ar"];
+pub const TARGET_LANGUAGE_PRESETS: &[&str] = &["ja", "en", "zh-CN", "zh-TW", "ko"];
 
 pub fn is_target_language_preset(code: &str) -> bool {
     TARGET_LANGUAGE_PRESETS.contains(&code)
@@ -109,10 +117,13 @@ impl Default for ProfileGameTextOptions {
 pub struct ProfileModelProcessingOptions {
     #[serde(default)]
     pub enable_model_wrap: bool,
-    #[serde(default)]
+    #[serde(default = "default_profile_wrap_min_chars")]
     pub model_wrap_min_chars: usize,
-    #[serde(default)]
-    pub model_wrap_min_tail_chars: usize,
+    #[serde(
+        default = "default_profile_wrap_space_fallback_min_chars",
+        alias = "model_wrap_min_tail_chars"
+    )]
+    pub model_wrap_space_fallback_min_chars: usize,
     #[serde(default)]
     pub enable_model_symbol_cleanup: bool,
 }
@@ -121,8 +132,8 @@ impl Default for ProfileModelProcessingOptions {
     fn default() -> Self {
         Self {
             enable_model_wrap: false,
-            model_wrap_min_chars: 60,
-            model_wrap_min_tail_chars: 10,
+            model_wrap_min_chars: 80,
+            model_wrap_space_fallback_min_chars: 100,
             enable_model_symbol_cleanup: false,
         }
     }
@@ -170,8 +181,8 @@ impl TranslationProfile {
             },
             model_processing: ProfileModelProcessingOptions {
                 enable_model_wrap: true,
-                model_wrap_min_chars: 60,
-                model_wrap_min_tail_chars: 10,
+                model_wrap_min_chars: 80,
+                model_wrap_space_fallback_min_chars: 100,
                 enable_model_symbol_cleanup: true,
             },
         }
@@ -185,8 +196,8 @@ impl TranslationProfile {
             game_text: ProfileGameTextOptions::default(),
             model_processing: ProfileModelProcessingOptions {
                 enable_model_wrap: true,
-                model_wrap_min_chars: 60,
-                model_wrap_min_tail_chars: 10,
+                model_wrap_min_chars: 80,
+                model_wrap_space_fallback_min_chars: 100,
                 enable_model_symbol_cleanup: true,
             },
         }
@@ -232,6 +243,14 @@ impl TranslationProfile {
         self.mode = normalize_mode_value(&self.mode);
         if self.prompt_template.trim().is_empty() {
             self.prompt_template = default_prompt_template();
+        }
+        if self.model_processing.model_wrap_min_chars == 0 {
+            self.model_processing.model_wrap_min_chars = 80;
+        }
+        if self.model_processing.model_wrap_space_fallback_min_chars
+            < self.model_processing.model_wrap_min_chars
+        {
+            self.model_processing.model_wrap_space_fallback_min_chars = 100;
         }
     }
 }
@@ -327,8 +346,8 @@ pub struct Config {
     pub wrap_override: Option<bool>,
     #[serde(default = "default_wrap_min_chars", skip_serializing)]
     pub model_wrap_min_chars: u32,
-    #[serde(default = "default_wrap_min_tail_chars", skip_serializing)]
-    pub model_wrap_min_tail_chars: u32,
+    #[serde(default = "default_wrap_space_fallback_min_chars", alias = "model_wrap_min_tail_chars", skip_serializing)]
+    pub model_wrap_space_fallback_min_chars: u32,
     #[serde(default = "default_true", skip_serializing)]
     pub enable_model_symbol_cleanup: bool,
     #[serde(default = "default_prompt_template", skip_serializing)]
@@ -441,6 +460,13 @@ impl Config {
         if is_target_language_preset(&self.tgt_lang) {
             self.custom_lang_name.clear();
         }
+
+        if self.model_wrap_min_chars == 0 {
+            self.model_wrap_min_chars = 80;
+        }
+        if self.model_wrap_space_fallback_min_chars < self.model_wrap_min_chars {
+            self.model_wrap_space_fallback_min_chars = 100;
+        }
     }
 
     pub fn new() -> Self {
@@ -454,7 +480,7 @@ impl Config {
             enable_model_wrap: profile.model_processing.enable_model_wrap,
             wrap_override: None,
             model_wrap_min_chars: profile.model_processing.model_wrap_min_chars as u32,
-            model_wrap_min_tail_chars: profile.model_processing.model_wrap_min_tail_chars as u32,
+            model_wrap_space_fallback_min_chars: profile.model_processing.model_wrap_space_fallback_min_chars as u32,
             enable_model_symbol_cleanup: profile.model_processing.enable_model_symbol_cleanup,
             prompt_template: profile.prompt_template.clone(),
             server_host: default_server_host(),
@@ -488,18 +514,13 @@ fn apply_translation_profile(config: &mut Config, profile: &TranslationProfile) 
     config.game_text = profile.game_text.into();
     config.enable_model_wrap = profile.model_processing.enable_model_wrap;
     config.model_wrap_min_chars = profile.model_processing.model_wrap_min_chars as u32;
-    config.model_wrap_min_tail_chars = profile.model_processing.model_wrap_min_tail_chars as u32;
+    config.model_wrap_space_fallback_min_chars = profile.model_processing.model_wrap_space_fallback_min_chars as u32;
     config.enable_model_symbol_cleanup = profile.model_processing.enable_model_symbol_cleanup;
 }
 
 /// Applies a small runtime overlay derived from the current target language.
 fn apply_target_language_policy(config: &mut Config) {
-    match config.tgt_lang.as_str() {
-        "ar" => {
-            config.wrap_override = Some(false);
-        }
-        _ => config.wrap_override = None,
-    }
+    config.wrap_override = None;
 }
 
 /// Saves game-text protection options into the active profile, not the root config.
@@ -570,7 +591,7 @@ custom_lang_name = "Brazilian Portuguese"
         config.normalize();
 
         assert_eq!(config.src_lang, "en");
-        assert_eq!(config.tgt_lang, "ja");
+        assert_eq!(config.tgt_lang, "en");
         assert_eq!(config.dict_slot, None);
         assert_eq!(config.game_text, GameTextOptions::default());
         assert_eq!(config.server_port, 14371);
@@ -592,8 +613,8 @@ tgt_lang = "ja"
 
         assert_eq!(config.game_text, GameTextOptions::default());
         assert_eq!(config.enable_model_wrap, true);
-        assert_eq!(config.model_wrap_min_chars, 60);
-        assert_eq!(config.model_wrap_min_tail_chars, 10);
+        assert_eq!(config.model_wrap_min_chars, 80);
+        assert_eq!(config.model_wrap_space_fallback_min_chars, 100);
         assert_eq!(config.enable_model_symbol_cleanup, true);
         assert_eq!(config.mode, "game");
     }
@@ -634,7 +655,7 @@ split_symbolic_segments = true
 [model_processing]
 enable_model_wrap = true
 model_wrap_min_chars = 40
-model_wrap_min_tail_chars = 12
+model_wrap_space_fallback_min_chars = 120
 enable_model_symbol_cleanup = true
 "#,
         )
@@ -648,7 +669,7 @@ enable_model_symbol_cleanup = true
         assert!(config.game_text.protect_tags);
         assert!(!config.game_text.protect_brackets);
         assert_eq!(config.model_wrap_min_chars, 40);
-        assert_eq!(config.model_wrap_min_tail_chars, 12);
+        assert_eq!(config.model_wrap_space_fallback_min_chars, 120);
         assert!(config.enable_model_symbol_cleanup);
         assert_eq!(config.wrap_override, None);
 
@@ -698,58 +719,6 @@ split_symbolic_segments = true
         let saved_profile =
             std::fs::read_to_string(base_dir.join("profiles").join("custom.toml")).unwrap();
         assert!(saved_profile.contains("translation_mode"));
-
-        let _ = std::fs::remove_dir_all(&base_dir);
-    }
-
-    #[test]
-    fn arabic_target_applies_runtime_wrap_override() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
-        let base_dir = std::env::temp_dir().join(format!("tenuki_config_ar_test_{}", unique));
-        std::fs::create_dir_all(base_dir.join("profiles")).unwrap();
-
-        std::fs::write(
-            base_dir.join("config.toml"),
-            r#"
-src_lang = "en"
-tgt_lang = "ar"
-profile = "custom"
-"#,
-        )
-        .unwrap();
-
-        std::fs::write(
-            base_dir.join("profiles").join("custom.toml"),
-            r#"
-version = 1
-mode = "game"
-prompt_template = "Profile prompt"
-
-[game_text]
-protect_tags = true
-protect_brackets = true
-protect_escaped_sequences = true
-protect_placeholders = true
-split_symbolic_segments = true
-
-[model_processing]
-enable_model_wrap = true
-model_wrap_min_chars = 40
-model_wrap_min_tail_chars = 12
-enable_model_symbol_cleanup = true
-"#,
-        )
-        .unwrap();
-
-        let config = load(&base_dir.join("config.toml")).unwrap();
-
-        assert_eq!(config.profile, "custom");
-        assert!(config.enable_model_wrap);
-        assert_eq!(config.wrap_override, Some(false));
-        assert!(!config.effective_model_wrap());
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }
@@ -860,5 +829,35 @@ custom_lang_name = "Brazilian Portuguese"
         assert_eq!(normalize_mode_value("passthrough"), "normal");
         assert_eq!(normalize_mode_value("game"), "game");
         assert_eq!(normalize_mode_value("normal"), "normal");
+    }
+
+    #[test]
+    fn legacy_profile_model_wrap_min_tail_chars_is_normalized() {
+        let tmp = std::env::temp_dir().join(format!("tenuki_test_profile_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("profiles")).unwrap();
+
+        let config_path = tmp.join("config.toml");
+        let profile_toml = r#"
+[model_processing]
+enable_model_wrap = true
+model_wrap_min_chars = 80
+model_wrap_min_tail_chars = 10
+enable_model_symbol_cleanup = true
+"#;
+        std::fs::write(tmp.join("profiles").join("game.toml"), profile_toml).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "profile = \"game\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\nserver_port = {}\n",
+                18000 + (std::process::id() % 10000) as u16
+            ),
+        )
+        .unwrap();
+
+        let config = load(&config_path).unwrap();
+        assert_eq!(config.model_wrap_space_fallback_min_chars, 100);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
