@@ -1,6 +1,6 @@
 # TENUKI
 
-TENUKI translates game text on the GPU using the HY-MT1.5 local LLM through llama.cpp and the XUnity Auto Translator endpoint.
+TENUKI translates game text on the GPU using the HY-MT2 local LLM through llama.cpp and the XUnity Auto Translator endpoint.
 
 ## Contents
 
