@@ -14,8 +14,9 @@ mod zm;
 
 pub use cache::{NewEntriesCache, TranslationCache};
 pub use client::{HttpLlmClient, LlmClient};
+use crate::backend::dictionary::SplitResult;
 pub use helpers::clean_model_output;
-pub use lang::build_lang_prefix;
+pub use lang::{build_lang_prefix, fallback_prefix};
 pub use types::{
     LogEvent, NewTranslationEntry, PersistEntry, TranslationResult, TranslationSettings,
     TranslationStats,
@@ -28,9 +29,10 @@ use render::{render_atoms, wrap_render_atoms, RenderAtom};
 #[cfg(test)]
 use zm::{build_zm_number_mapping, restore_zm_number_tokens, ZmNumberMapping, ZmReplacement};
 
-pub fn translate_chunk<F>(
+pub fn translate_chunk<F, S>(
     chunk: &str,
     lookup: F,
+    lookup_split: S,
     prefix: &str,
     tgt_lang: &str,
     llm_client: &dyn LlmClient,
@@ -38,6 +40,7 @@ pub fn translate_chunk<F>(
 ) -> TranslationResult
 where
     F: Fn(&str) -> Option<String> + Clone,
+    S: Fn(&str) -> Option<SplitResult> + Clone,
 {
     if chunk.trim().is_empty() {
         return TranslationResult::empty(chunk.to_string());
@@ -45,7 +48,7 @@ where
 
     let plan = plan::plan_document(chunk);
     let (resolved, mut result) =
-        resolve::resolve_document(&plan, &lookup, prefix, tgt_lang, llm_client, settings);
+        resolve::resolve_document(&plan, &lookup, &lookup_split, prefix, tgt_lang, llm_client, settings);
 
     result.text = render::render_document(&resolved, settings);
     result.new_entries = resolve::dedupe_entries(std::mem::take(&mut result.new_entries));
@@ -57,6 +60,24 @@ mod tests {
     use super::*;
     use regex::Regex;
     use std::sync::Mutex;
+
+    fn no_split(_key: &str) -> Option<SplitResult> {
+        None
+    }
+
+    fn translate_chunk<F>(
+        chunk: &str,
+        lookup: F,
+        prefix: &str,
+        tgt_lang: &str,
+        llm_client: &dyn LlmClient,
+        settings: TranslationSettings,
+    ) -> TranslationResult
+    where
+        F: Fn(&str) -> Option<String> + Clone,
+    {
+        super::translate_chunk(chunk, lookup, no_split, prefix, tgt_lang, llm_client, settings)
+    }
 
     #[derive(Default)]
     struct MockLlmClient {
@@ -879,5 +900,66 @@ mod tests {
         );
 
         assert_eq!(render_atoms(&wrapped), "aa\nbb");
+    }
+
+    #[test]
+    fn split_end_anchor_matches_separator_leaves_left() {
+        let lookup_split = |key: &str| -> Option<SplitResult> {
+            let re = Regex::new("对你的$").unwrap();
+            re.captures(key).map(|caps| {
+                let m = caps.get(0).unwrap();
+                SplitResult {
+                    full_match_start: m.start(),
+                    full_match_end: m.end(),
+                    inner_groups: Vec::new(),
+                    replacement: "$Lがあなたに".to_string(),
+                }
+            })
+        };
+
+        let llm = MockLlmClient::with_responses(&["顧游年"]);
+        let result = super::translate_chunk(
+            "顧游年对你的",
+            |_| None,
+            lookup_split,
+            "prefix",
+            "ja",
+            &llm,
+            test_settings(),
+        );
+
+        assert_eq!(result.text, "顧游年があなたに");
+        assert_eq!(llm.calls(), vec!["顧游年"]);
+    }
+
+    #[test]
+    fn split_left_dict_hit_preserves_translation() {
+        let lookup_split = |key: &str| -> Option<SplitResult> {
+            let re = Regex::new("对你的$").unwrap();
+            re.captures(key).map(|caps| {
+                let m = caps.get(0).unwrap();
+                SplitResult {
+                    full_match_start: m.start(),
+                    full_match_end: m.end(),
+                    inner_groups: Vec::new(),
+                    replacement: "$Lがあなたに".to_string(),
+                }
+            })
+        };
+
+        // left "顧游年" hits dictionary, no model calls needed
+        let llm = MockLlmClient::with_responses(&[]);
+        let result = super::translate_chunk(
+            "顧游年对你的",
+            |key| (key == "顧游年").then(|| "顧游年".to_string()),
+            lookup_split,
+            "prefix",
+            "ja",
+            &llm,
+            test_settings(),
+        );
+
+        assert_eq!(result.text, "顧游年があなたに");
+        assert!(llm.calls().is_empty());
     }
 }

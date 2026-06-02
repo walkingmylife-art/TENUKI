@@ -968,9 +968,6 @@ impl AppLauncher {
             test_port,
             s.ngl,
             s.ctx_size,
-            s.batch_size,
-            s.ubatch_size,
-            s.cont_batching,
             s.parallel_slots,
             &s.extra_args,
         );

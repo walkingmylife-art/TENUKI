@@ -13,13 +13,14 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 
 use crate::backend::analysis::{
     self, CompletedAnalysisPayload, CompletedTranslationRecord, SharedInputReplayState,
 };
-use crate::backend::dictionary::Dictionary;
+use crate::backend::dictionary::{Dictionary, SplitResult};
 use crate::backend::logger::{LogEvent as PersistentLogEvent, LOG_TX};
 use crate::backend::translator::{
     self, LogEvent, NewEntriesCache, NewTranslationEntry, PersistEntry, TranslationCache,
@@ -34,6 +35,7 @@ const MAX_LIST_TOTAL_BYTES: usize = 512 * 1024;
 // before raw request logging or parsing.
 const MAX_TRANSLATE_BODY_BYTES: usize = 96 * 1024;
 const MAX_TRANSLATE_TEXT_BYTES: usize = 64 * 1024;
+const TCP_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 // ============================================================
 // Request types
@@ -66,6 +68,7 @@ pub struct AppState {
     pub tgt_lang: Arc<RwLock<String>>,
     pub custom_lang_name: Arc<RwLock<String>>,
     pub prompt_template: String,
+    pub background_text: String,
     pub translation_settings: TranslationSettings,
     pub llm_client: Arc<dyn translator::LlmClient>,
     pub event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
@@ -81,10 +84,19 @@ pub struct AppState {
 
 impl AppState {
     pub async fn current_prefix(&self) -> String {
-        let src = self.src_lang.read().await;
         let tgt = self.tgt_lang.read().await;
+        if self.background_text.trim().is_empty() {
+            return translator::fallback_prefix(&tgt);
+        }
+        let src = self.src_lang.read().await;
         let custom_name = self.custom_lang_name.read().await;
-        translator::build_lang_prefix(&src, &tgt, &custom_name, &self.prompt_template)
+        translator::build_lang_prefix(
+            &src,
+            &tgt,
+            &custom_name,
+            &self.prompt_template,
+            &self.background_text,
+        )
     }
 
     fn emit_persistent_log(&self, message: String, level: LogLevel) {
@@ -618,9 +630,14 @@ fn translate_texts_batch(
             None
         };
 
+        let lookup_split = move |key: &str| -> Option<SplitResult> {
+            dictionary.blocking_read().lookup_split(key)
+        };
+
         let mut result = translator::translate_chunk(
             text,
             lookup,
+            lookup_split,
             prefix,
             tgt_lang,
             llm_client.as_ref(),
@@ -1180,6 +1197,135 @@ async fn shutdown_handler(State(state): State<Arc<AppState>>) -> &'static str {
     "ok"
 }
 
+async fn serve_tcp_connection(
+    stream: tokio::net::TcpStream,
+    state: Arc<AppState>,
+    event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = TokioBufReader::new(reader);
+    let mut len_buf = [0u8; 4];
+
+    loop {
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+
+        if payload_len > TCP_MAX_PAYLOAD_BYTES {
+            let _ = event_tx.try_send(BackendEvent::Log(
+                LogSource::Tenuki,
+                format!("tcp payload too large: {} (max {})", payload_len, TCP_MAX_PAYLOAD_BYTES),
+                LogLevel::Error,
+                crate::messages::current_timestamp(),
+            ));
+            break;
+        }
+
+        let mut payload = vec![0u8; payload_len];
+        if reader.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+
+        let text = String::from_utf8_lossy(&payload).into_owned();
+
+        let result = run_pipeline(
+            &state,
+            "tcp",
+            PipelineBehavior::normal_translate(),
+            vec![text],
+        )
+        .await;
+
+        let response = match result {
+            Ok(r) => r.translated_text.into_bytes(),
+            Err(e) => {
+                let _ = event_tx.try_send(BackendEvent::Log(
+                    LogSource::Tenuki,
+                    format!("tcp pipeline error: {}", e),
+                    LogLevel::Error,
+                    crate::messages::current_timestamp(),
+                ));
+                continue;
+            }
+        };
+
+        let resp_len = response.len() as u32;
+        if writer.write_all(&resp_len.to_le_bytes()).await.is_err() {
+            break;
+        }
+        if writer.write_all(&response).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn run_tcp_listener(
+    state: Arc<AppState>,
+    host: &str,
+    port: u16,
+    event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
+    shutdown_rx: oneshot::Receiver<()>,
+) {
+    let addr: std::net::SocketAddr = match format!("{}:{}", host, port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = event_tx.try_send(BackendEvent::Log(
+                LogSource::Tenuki,
+                format!("tcp invalid address {}:{} ({})", host, port, e),
+                LogLevel::Error,
+                crate::messages::current_timestamp(),
+            ));
+            return;
+        }
+    };
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = event_tx.try_send(BackendEvent::Log(
+                LogSource::Tenuki,
+                format!("tcp bind failed {}:{} ({})", host, port, e),
+                LogLevel::Error,
+                crate::messages::current_timestamp(),
+            ));
+            return;
+        }
+    };
+
+    let _ = event_tx.try_send(BackendEvent::Log(
+        LogSource::Tenuki,
+        format!("tcp translation listening on {}:{}", host, port),
+        LogLevel::Info,
+        crate::messages::current_timestamp(),
+    ));
+
+    let accept_handle = {
+        let state = state.clone();
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        serve_tcp_connection(stream, state.clone(), event_tx.clone()).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    let _ = shutdown_rx.await;
+    accept_handle.abort();
+
+    let _ = event_tx.try_send(BackendEvent::Log(
+        LogSource::Tenuki,
+        "tcp server stopped".to_string(),
+        LogLevel::Info,
+        crate::messages::current_timestamp(),
+    ));
+}
+
 // ============================================================
 // Server startup
 // Caller owns task spawning and shutdown coordination.
@@ -1188,16 +1334,19 @@ async fn shutdown_handler(State(state): State<Arc<AppState>>) -> &'static str {
 pub async fn run_translation_server(
     host: String,
     port: u16,
+    tcp_port: u16,
     dictionary: Arc<RwLock<Dictionary>>,
     src_lang: String,
     tgt_lang: String,
     custom_lang_name: String,
     prompt_template: String,
+    background_text: String,
     translation_settings: TranslationSettings,
     llm_client: Arc<dyn translator::LlmClient>,
     event_tx: tokio::sync::mpsc::Sender<BackendEvent>,
     startup_tx: oneshot::Sender<Result<(), String>>,
     shutdown_rx: oneshot::Receiver<()>,
+    tcp_shutdown_rx: oneshot::Receiver<()>,
     t_cache: Arc<TranslationCache>,
     n_cache: Arc<NewEntriesCache>,
     input_replay: SharedInputReplayState,
@@ -1217,6 +1366,7 @@ pub async fn run_translation_server(
         tgt_lang: Arc::new(RwLock::new(tgt_lang)),
         custom_lang_name: Arc::new(RwLock::new(custom_lang_name)),
         prompt_template,
+        background_text,
         translation_settings,
         llm_client,
         event_tx: event_tx.clone(),
@@ -1224,6 +1374,13 @@ pub async fn run_translation_server(
         n_cache,
         input_replay,
         llm_slots: llm_slots.max(1),
+    });
+
+    let tcp_state = state.clone();
+    let tcp_event_tx = event_tx.clone();
+    let tcp_host = host.clone();
+    tokio::spawn(async move {
+        run_tcp_listener(tcp_state, &tcp_host, tcp_port, tcp_event_tx, tcp_shutdown_rx).await;
     });
 
     let app = Router::new()
@@ -1320,7 +1477,7 @@ mod tests {
         MAX_LIST_ITEMS, MAX_LIST_TOTAL_BYTES, MAX_TRANSLATE_BODY_BYTES, MAX_TRANSLATE_TEXT_BYTES,
     };
     use crate::backend::analysis::InputReplayState;
-    use crate::backend::dictionary::Dictionary;
+    use crate::backend::dictionary::{Dictionary, SplitResult};
     use crate::backend::translator::{
         self, LogEvent, NewEntriesCache, NewTranslationEntry, PersistEntry, TranslationCache,
         TranslationSettings, TranslationStats,
@@ -1417,6 +1574,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -1427,6 +1585,7 @@ mod tests {
             tgt_lang: Arc::new(RwLock::new("en".to_string())),
             custom_lang_name: Arc::new(RwLock::new(String::new())),
             prompt_template: String::new(),
+            background_text: String::new(),
             translation_settings: test_settings(),
             llm_client,
             event_tx,
@@ -1460,6 +1619,7 @@ mod tests {
             root,
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -1470,6 +1630,7 @@ mod tests {
             tgt_lang: Arc::new(RwLock::new("en".to_string())),
             custom_lang_name: Arc::new(RwLock::new(String::new())),
             prompt_template: String::new(),
+            background_text: String::new(),
             translation_settings: test_settings(),
             llm_client,
             event_tx,
@@ -1859,6 +2020,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -1933,6 +2095,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -2005,6 +2168,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -2022,6 +2186,7 @@ mod tests {
             tgt_lang: Arc::new(RwLock::new("en".to_string())),
             custom_lang_name: Arc::new(RwLock::new(String::new())),
             prompt_template: String::new(),
+            background_text: String::new(),
             translation_settings: test_settings(),
             llm_client,
             event_tx,
@@ -2247,6 +2412,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -2284,6 +2450,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -2321,6 +2488,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));
@@ -2360,6 +2528,7 @@ mod tests {
             dict_dir.join("txt_root"),
             dict_dir.join("Tenuki.dict.txt"),
             dict_dir.join("Tenuki.regex.txt"),
+            dict_dir.join("Tenuki.split.txt"),
             dict_dir.join("dict.bin"),
             dict_tx,
         )));

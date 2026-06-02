@@ -487,6 +487,10 @@ pub fn get_regex_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
     resolve_slot_dir(config, base_dir).join("Tenuki.regex.txt")
 }
 
+pub fn get_split_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
+    resolve_slot_dir(config, base_dir).join("Tenuki.split.txt")
+}
+
 pub fn get_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
     get_exact_dict_path(config, base_dir)
 }
@@ -600,7 +604,7 @@ pub struct ProcessManager {
     dictionary: Arc<RwLock<Dictionary>>,
     llama_process: Option<LlamaProcess>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
-    server_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_shutdown_tx: Option<Vec<tokio::sync::oneshot::Sender<()>>>,
     server_runtime: Runtime,
     llm_client: Arc<dyn LlmClient>,
     event_tx: mpsc::Sender<BackendEvent>,
@@ -824,12 +828,14 @@ impl ProcessManager {
         let new_slot_dir = resolve_slot_dir(&self.config, &self.base_dir);
         let new_exact_dict_path = get_exact_dict_path(&self.config, &self.base_dir);
         let new_regex_dict_path = get_regex_dict_path(&self.config, &self.base_dir);
+        let new_split_dict_path = get_split_dict_path(&self.config, &self.base_dir);
         let new_bin_path = get_bin_path(&self.config, &self.base_dir);
 
         self.dictionary = Arc::new(RwLock::new(Dictionary::new(
             new_slot_dir.clone(),
             new_exact_dict_path,
             new_regex_dict_path,
+            new_split_dict_path,
             new_bin_path,
             self.event_tx.clone(),
         )));
@@ -1082,11 +1088,13 @@ impl ProcessManager {
         let slot_dir = resolve_slot_dir(&config, &base_dir);
         let exact_dict_path = get_exact_dict_path(&config, &base_dir);
         let regex_dict_path = get_regex_dict_path(&config, &base_dir);
+        let split_dict_path = get_split_dict_path(&config, &base_dir);
         let bin_file = get_bin_path(&config, &base_dir);
         let dictionary = Arc::new(RwLock::new(Dictionary::new(
             slot_dir.clone(),
             exact_dict_path,
             regex_dict_path,
+            split_dict_path,
             bin_file,
             event_tx.clone(),
         )));
@@ -1437,9 +1445,6 @@ impl ProcessManager {
             &model,
             self.server_cfg.ngl,
             self.ctx_size,
-            self.server_cfg.batch_size,
-            self.server_cfg.ubatch_size,
-            self.server_cfg.cont_batching,
             self.llm_slots.max(1) as u32,
             self.server_cfg.port,
             &self.server_cfg.extra_args,
@@ -1509,6 +1514,7 @@ impl ProcessManager {
         let tgt_lang = self.config.tgt_lang.clone();
         let custom_lang_name = self.config.custom_lang_name.clone();
         let prompt_template = self.config.prompt_template.clone();
+        let background_text = self.config.background_text.clone();
         let enable_model_wrap = self.config.effective_model_wrap();
         let model_wrap_min_chars = self.config.model_wrap_min_chars;
         let model_wrap_space_fallback_min_chars = self.config.model_wrap_space_fallback_min_chars;
@@ -1523,6 +1529,7 @@ impl ProcessManager {
         let llm_slots = self.llm_slots.max(1);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel();
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
 
         let translation_settings = TranslationSettings {
@@ -1535,16 +1542,19 @@ impl ProcessManager {
         let handle = self.server_runtime.spawn(server::run_translation_server(
             host.clone(),
             port,
+            port + 1,
             dictionary,
             src_lang,
             tgt_lang,
             custom_lang_name,
             prompt_template,
+            background_text,
             translation_settings,
             llm_client,
             server_event_tx,
             startup_tx,
             shutdown_rx,
+            tcp_shutdown_rx,
             t_cache,
             n_cache,
             input_replay,
@@ -1556,7 +1566,7 @@ impl ProcessManager {
             .block_on(async { tokio::time::timeout(Duration::from_secs(15), startup_rx).await })
         {
             Ok(Ok(Ok(()))) => {
-                self.server_shutdown_tx = Some(shutdown_tx);
+                self.server_shutdown_tx = Some(vec![shutdown_tx, tcp_shutdown_tx]);
                 self.server_handle = Some(handle);
                 let _ = self
                     .event_tx
@@ -1641,8 +1651,10 @@ impl ProcessManager {
 
     fn stop_translation_server(&mut self) {
         // 1. シャットダウンシグナル送信（サーバーが新規リクエストを受け付けなくなる）
-        if let Some(tx) = self.server_shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(txs) = self.server_shutdown_tx.take() {
+            for tx in txs {
+                let _ = tx.send(());
+            }
         }
 
         if let Some(mut handle) = self.server_handle.take() {

@@ -74,16 +74,16 @@ impl Default for RuntimeUrls {
     fn default() -> Self {
         Self {
             cuda: RuntimeAssetSet::with_extras(
-                "https://github.com/ggml-org/llama.cpp/releases/download/b8808/llama-b8808-bin-win-cuda-12.4-x64.zip",
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9368/llama-b9368-bin-win-cuda-12.4-x64.zip",
                 vec![
-                    "https://github.com/ggml-org/llama.cpp/releases/download/b8808/cudart-llama-bin-win-cuda-12.4-x64.zip".to_string(),
+                    "https://github.com/ggml-org/llama.cpp/releases/download/b9368/cudart-llama-bin-win-cuda-12.4-x64.zip".to_string(),
                 ],
             ),
             vulkan: RuntimeAssetSet::single(
-                "https://github.com/ggml-org/llama.cpp/releases/download/b8808/llama-b8808-bin-win-vulkan-x64.zip",
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9368/llama-b9368-bin-win-vulkan-x64.zip",
             ),
             rocm: RuntimeAssetSet::single(
-                "https://github.com/ggml-org/llama.cpp/releases/download/b8808/llama-b8808-bin-win-hip-radeon-x64.zip",
+                "https://github.com/ggml-org/llama.cpp/releases/download/b9368/llama-b9368-bin-win-hip-radeon-x64.zip",
             ),
         }
     }
@@ -106,10 +106,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub ctx_size: u32,
     pub ngl: u32,
-    pub batch_size: u32,
-    pub ubatch_size: u32,
     pub parallel_slots: u32,
-    pub cont_batching: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -164,12 +161,9 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8080,
-            ctx_size: 1024,
+            ctx_size: 768,
             ngl: 999,
-            batch_size: 128,
-            ubatch_size: 64,
-            parallel_slots: 2,
-            cont_batching: true,
+            parallel_slots: 1,
             extra_args: vec![],
         }
     }
@@ -178,10 +172,10 @@ impl Default for ServerConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self::Known {
-            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
-            expected_size: 1_474_785_216,
+            filename: "Hy-MT2-1.8B-Q6_K.gguf".to_string(),
+            expected_size: 1_474_785_120,
             urls: UrlPair::single(
-                "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true",
+                "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf?download=true",
             ),
         }
     }
@@ -336,16 +330,12 @@ impl AppConfig {
         let server = match mode {
             "normal" => ServerConfig {
                 ctx_size: 2048,
-                batch_size: 256,
-                ubatch_size: 128,
-                parallel_slots: 4,
+                parallel_slots: 1,
                 ..ServerConfig::default()
             },
             _ => ServerConfig {
-                ctx_size: 1024,
-                batch_size: 128,
-                ubatch_size: 64,
-                parallel_slots: 2,
+                ctx_size: 768,
+                parallel_slots: 1,
                 ..ServerConfig::default()
             },
         };
@@ -470,9 +460,9 @@ pub struct KnownModelTuple {
 
 const KNOWN_MODELS: &[KnownModelTuple] = &[
     KnownModelTuple {
-        filename: "HY-MT1.5-1.8B-Q6_K.gguf",
-        url: "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true",
-        expected_size: 1_474_785_216,
+        filename: "Hy-MT2-1.8B-Q6_K.gguf",
+        url: "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf?download=true",
+        expected_size: 1_474_785_120,
     },
     KnownModelTuple {
         filename: "HY-MT1.5-7B-Q4_K_M.gguf",
@@ -514,16 +504,16 @@ mod tests {
         let path = temp_config_path("repair_known");
         let mut cfg = AppConfig::default();
         cfg.model = ModelConfig::Known {
-            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
+            filename: "Hy-MT2-1.8B-Q6_K.gguf".to_string(),
             expected_size: 1,
             urls: UrlPair::single("https://wrong.example.com/bad.gguf"),
         };
         cfg.save(&path).unwrap();
 
         let loaded = AppConfig::load(&path).unwrap();
-        let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
+        let known = known_model_tuple("Hy-MT2-1.8B-Q6_K.gguf").unwrap();
 
-        assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
+        assert_eq!(loaded.model.filename(), "Hy-MT2-1.8B-Q6_K.gguf");
         assert!(
             matches!(&loaded.model, ModelConfig::Known { urls, expected_size, .. }
             if urls.primary == known.url && *expected_size == known.expected_size)
@@ -537,15 +527,15 @@ mod tests {
         let path = temp_config_path("repair_url_only");
         let mut cfg = AppConfig::default();
         cfg.model = ModelConfig::Known {
-            filename: "HY-MT1.5-1.8B-Q6_K.gguf".to_string(),
-            expected_size: 1_474_785_216,
+            filename: "Hy-MT2-1.8B-Q6_K.gguf".to_string(),
+            expected_size: 1_474_785_120,
             urls: UrlPair::single("https://wrong.example.com/bad.gguf"),
         };
         cfg.save(&path).unwrap();
 
         let loaded = AppConfig::load(&path).unwrap();
-        assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
-        let known = known_model_tuple("HY-MT1.5-1.8B-Q6_K.gguf").unwrap();
+        assert_eq!(loaded.model.filename(), "Hy-MT2-1.8B-Q6_K.gguf");
+        let known = known_model_tuple("Hy-MT2-1.8B-Q6_K.gguf").unwrap();
         assert!(
             matches!(&loaded.model, ModelConfig::Known { urls, .. } if urls.primary == known.url)
         );
@@ -561,7 +551,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.model = ModelConfig::Known {
             filename: "not-a-known-model.gguf".to_string(),
-            expected_size: 1_474_785_216,
+            expected_size: 1_474_785_120,
             urls: UrlPair::single("https://example.com/custom.gguf"),
         };
         cfg.save(&path).unwrap();
@@ -635,23 +625,20 @@ host = "127.0.0.1"
 port = 8080
 ctx_size = 1024
 ngl = 999
-batch_size = 128
-ubatch_size = 64
-parallel_slots = 2
-cont_batching = true
+parallel_slots = 1
 extra_args = []
 
 [model]
-filename = "HY-MT1.5-1.8B-Q6_K.gguf"
-expected_size = 1474785216
+filename = "Hy-MT2-1.8B-Q6_K.gguf"
+expected_size = 1474785120
 
 [model.urls]
-primary = "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true"
+primary = "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf?download=true"
 "#;
         fs::write(&path, toml).unwrap();
         let loaded = AppConfig::load(&path).unwrap();
         assert!(loaded.model.is_known());
-        assert_eq!(loaded.model.filename(), "HY-MT1.5-1.8B-Q6_K.gguf");
+        assert_eq!(loaded.model.filename(), "Hy-MT2-1.8B-Q6_K.gguf");
         let _ = fs::remove_file(&path);
     }
 
@@ -666,10 +653,7 @@ host = "127.0.0.1"
 port = 8080
 ctx_size = 1024
 ngl = 999
-batch_size = 128
-ubatch_size = 64
-parallel_slots = 2
-cont_batching = true
+parallel_slots = 1
 extra_args = []
 
 [model]
@@ -677,7 +661,7 @@ filename = "not-a-known-model.gguf"
 expected_size = 1474785216
 
 [model.urls]
-primary = "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q6_K.gguf?download=true"
+primary = "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q6_K.gguf?download=true"
 "#;
         fs::write(&path, toml).unwrap();
         let result = AppConfig::load(&path);
@@ -699,10 +683,7 @@ host = "127.0.0.1"
 port = 8080
 ctx_size = 1024
 ngl = 999
-batch_size = 128
-ubatch_size = 64
-parallel_slots = 2
-cont_batching = true
+parallel_slots = 1
 extra_args = []
 
 [model]

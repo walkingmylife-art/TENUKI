@@ -27,7 +27,11 @@ fn default_profile_wrap_space_fallback_min_chars() -> usize {
 }
 
 fn default_prompt_template() -> String {
-    "Translate the following segment into {target}, without additional explanation.".to_string()
+    "[Background Information] {background_text}\nPlease translate the following text into {target_lang}, taking the provided background information into consideration.\n[Source Text] {source_text}".to_string()
+}
+
+fn default_background_text() -> String {
+    String::new()
 }
 
 fn default_profile_version() -> u32 {
@@ -147,6 +151,8 @@ pub struct TranslationProfile {
     pub mode: String,
     #[serde(default = "default_prompt_template")]
     pub prompt_template: String,
+    #[serde(default = "default_background_text")]
+    pub background_text: String,
     #[serde(default, alias = "structural")]
     pub game_text: ProfileGameTextOptions,
     #[serde(default)]
@@ -172,6 +178,7 @@ impl TranslationProfile {
             version: default_profile_version(),
             mode: "game".to_string(),
             prompt_template: default_prompt_template(),
+            background_text: default_background_text(),
             game_text: ProfileGameTextOptions {
                 protect_tags: true,
                 protect_brackets: true,
@@ -193,6 +200,7 @@ impl TranslationProfile {
             version: default_profile_version(),
             mode: "normal".to_string(),
             prompt_template: default_prompt_template(),
+            background_text: default_background_text(),
             game_text: ProfileGameTextOptions::default(),
             model_processing: ProfileModelProcessingOptions {
                 enable_model_wrap: true,
@@ -352,6 +360,8 @@ pub struct Config {
     pub enable_model_symbol_cleanup: bool,
     #[serde(default = "default_prompt_template", skip_serializing)]
     pub prompt_template: String,
+    #[serde(default = "default_background_text", skip_serializing_if = "String::is_empty")]
+    pub background_text: String,
     #[serde(default = "default_server_host")]
     pub server_host: String,
     #[serde(default = "default_server_port")]
@@ -483,6 +493,7 @@ impl Config {
             model_wrap_space_fallback_min_chars: profile.model_processing.model_wrap_space_fallback_min_chars as u32,
             enable_model_symbol_cleanup: profile.model_processing.enable_model_symbol_cleanup,
             prompt_template: profile.prompt_template.clone(),
+            background_text: profile.background_text.clone(),
             server_host: default_server_host(),
             server_port: default_server_port(),
             ui_lang: default_ui_lang(),
@@ -511,6 +522,7 @@ impl Config {
 fn apply_translation_profile(config: &mut Config, profile: &TranslationProfile) {
     config.mode = profile.mode.clone();
     config.prompt_template = profile.prompt_template.clone();
+    config.background_text = profile.background_text.clone();
     config.game_text = profile.game_text.into();
     config.enable_model_wrap = profile.model_processing.enable_model_wrap;
     config.model_wrap_min_chars = profile.model_processing.model_wrap_min_chars as u32;
@@ -792,10 +804,7 @@ llama_server_host = "127.0.0.1"
 llama_server_port = 8080
 ctx_size = 2048
 ngl = 999
-batch_size = 128
-ubatch_size = 64
-parallel_slots = 2
-cont_batching = true
+parallel_slots = 1
 selected_model = "model.gguf"
 "#,
         )

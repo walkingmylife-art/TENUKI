@@ -10,7 +10,7 @@ use memmap2::Mmap;
 use regex::Regex;
 use rustc_hash::FxHashMap;
 
-use crate::messages::BackendEvent;
+use crate::messages::{BackendEvent, LogLevel, LogSource, current_timestamp};
 
 const DICT_BIN_MAGIC: &[u8; 8] = b"TENUKI2\0";
 const DICT_BIN_VERSION: u32 = 2;
@@ -23,6 +23,22 @@ struct RegexRule {
     replacement: String,
     #[allow(dead_code)]
     source_pattern: String,
+}
+
+#[derive(Clone)]
+struct SplitRule {
+    pattern: Regex,
+    replacement: String,
+    #[allow(dead_code)]
+    source_pattern: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SplitResult {
+    pub full_match_start: usize,
+    pub full_match_end: usize,
+    pub inner_groups: Vec<Option<(usize, usize)>>,
+    pub replacement: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +93,7 @@ pub struct DictBuildReport {
     pub exact_count: usize,
     pub blob_len: usize,
     pub dict_bin_error: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,8 +135,22 @@ fn is_tenuki_regex_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_tenuki_split_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.to_lowercase().starts_with("tenuki.split")
+                && name.to_lowercase().ends_with(".txt")
+        })
+        .unwrap_or(false)
+}
+
 fn is_readable_normal_txt(path: &Path) -> bool {
-    if !is_txt_file(path) || is_tenuki_dict_file(path) || is_tenuki_regex_file(path) {
+    if !is_txt_file(path)
+        || is_tenuki_dict_file(path)
+        || is_tenuki_regex_file(path)
+        || is_tenuki_split_file(path)
+    {
         return false;
     }
     let file_name = path
@@ -216,6 +247,22 @@ fn try_parse_regex_rule(line: &str) -> Option<(String, String)> {
     Some((pattern, replacement))
 }
 
+fn try_parse_split_rule(line: &str) -> Option<(String, String)> {
+    if !line.starts_with("s:\"") {
+        return None;
+    }
+    let after_prefix = &line[3..];
+    let close_quote = after_prefix.find('"')?;
+    let pattern = after_prefix[..close_quote].to_string();
+    let after_quote = &after_prefix[close_quote + 1..];
+    let replacement = if after_quote.starts_with('=') {
+        after_quote[1..].to_string()
+    } else {
+        String::new()
+    };
+    Some((pattern, replacement))
+}
+
 fn load_txt_files(root_dir: &Path) -> RawTxtData {
     let mut loaded = RawTxtData::default();
     let root_entries = sorted_dir_entries(root_dir);
@@ -248,6 +295,84 @@ fn load_txt_files(root_dir: &Path) -> RawTxtData {
     loaded
 }
 
+fn load_split_rules(root_dir: &Path) -> (Vec<SplitRule>, Vec<String>) {
+    let mut rules = Vec::new();
+    let mut warnings = Vec::new();
+    let root_entries = sorted_dir_entries(root_dir);
+
+    for path in root_entries.iter().filter(|path| path.is_dir()) {
+        for sub_path in sorted_dir_entries(path) {
+            if is_tenuki_split_file(&sub_path) {
+                read_split_file(&sub_path, &mut rules, &mut warnings);
+            }
+        }
+    }
+
+    for path in root_entries.iter().filter(|path| is_tenuki_split_file(path)) {
+        read_split_file(path, &mut rules, &mut warnings);
+    }
+
+    rules.sort_by(|a, b| b.source_pattern.len().cmp(&a.source_pattern.len()));
+    (rules, warnings)
+}
+
+fn read_split_file(path: &Path, rules: &mut Vec<SplitRule>, warnings: &mut Vec<String>) {
+    if let Ok(file) = File::open(path) {
+        let reader = BufReader::new(file);
+        for (line_index, line) in reader.lines().enumerate() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            let line = if line_index == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(&line)
+            } else {
+                &line
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some((pattern, replacement)) = try_parse_split_rule(line) {
+                if replacement.contains('\u{ff04}') {
+                    let msg = format!(
+                        "× [SPLIT] {}:{} fullwidth $ in replacement",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        line_index + 1,
+                    );
+                    warnings.push(msg.clone());
+                    log::warn!("{} — {}", msg, line);
+                }
+                match Regex::new(&pattern) {
+                    Ok(re) => rules.push(SplitRule {
+                        pattern: re,
+                        replacement,
+                        source_pattern: pattern,
+                    }),
+                    Err(e) => {
+                        let msg = format!(
+                            "× [SPLIT] {}:{} regex error — {}",
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                            line_index + 1,
+                            pattern,
+                        );
+                        warnings.push(msg.clone());
+                        log::warn!("{} ({})", msg, e);
+                    }
+                }
+            } else if line.starts_with('s') {
+                let msg = format!(
+                    "× [SPLIT] {}:{} parse error — {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                    line_index + 1,
+                    line
+                );
+                warnings.push(msg.clone());
+                log::warn!("{}", msg);
+            }
+        }
+    }
+}
+
 fn compile_regex_entries(
     raw_regex: &[RawRegexEntry],
     report: &mut DictBuildReport,
@@ -274,8 +399,14 @@ fn compile_regex_entries(
                 source_pattern: entry.pattern,
             }),
             Err(e) => {
-                log::debug!(
-                    "regex compile failed ({}:{}): {} - {}",
+                report.warnings.push(format!(
+                    "× [REGEX] {}:{} regex error — {}",
+                    entry.origin.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                    entry.origin.line_number,
+                    entry.pattern
+                ));
+                log::warn!(
+                    "[REGEX_RULE] compile failed at {}:{} — {} ({})",
                     entry.origin.path.display(),
                     entry.origin.line_number,
                     entry.pattern,
@@ -547,6 +678,7 @@ pub struct Dictionary {
     exact_index: Option<DictBinIndex>,
     value_index: FxHashMap<String, String>,
     regex_rules: Vec<RegexRule>,
+    split_rules: Vec<SplitRule>,
     exact_buffer: Vec<(String, String)>,
     regex_buffer: Vec<(String, String)>,
     txt_root: PathBuf,
@@ -600,13 +732,16 @@ impl Dictionary {
         txt_root: PathBuf,
         exact_txt_file: PathBuf,
         regex_txt_file: PathBuf,
+        split_txt_file: PathBuf,
         bin_file: PathBuf,
         event_tx: mpsc::Sender<BackendEvent>,
     ) -> Self {
         ensure_bom_file(&exact_txt_file);
         ensure_bom_file(&regex_txt_file);
+        ensure_bom_file(&split_txt_file);
 
         let (exact_entries, regex_rules, mut build_report) = build_entry_sets(&txt_root);
+        let (split_rules, split_warnings) = load_split_rules(&txt_root);
         let value_index = collect_value_index(&exact_entries);
         let exact_index = Self::build_exact_index(&bin_file, &exact_entries, &mut build_report);
         let loaded_entries = build_report.exact_count + build_report.accepted_regex;
@@ -614,10 +749,30 @@ impl Dictionary {
         let _ = event_tx.send(BackendEvent::DictionaryLoaded(loaded_entries));
         let _ = event_tx.send(BackendEvent::StatisticsUpdate(0, 0));
 
+        let mut total_warnings = 0;
+        for w in build_report.warnings.iter().chain(split_warnings.iter()) {
+            total_warnings += 1;
+            let _ = event_tx.send(BackendEvent::Log(
+                LogSource::Tenuki,
+                w.clone(),
+                LogLevel::Info,
+                current_timestamp(),
+            ));
+        }
+        if total_warnings == 0 {
+            let _ = event_tx.send(BackendEvent::Log(
+                LogSource::Tenuki,
+                "[Dict] load OK, no errors".to_string(),
+                LogLevel::Success,
+                current_timestamp(),
+            ));
+        }
+
         Self {
             exact_index,
             value_index,
             regex_rules,
+            split_rules,
             exact_buffer: Vec::new(),
             regex_buffer: Vec::new(),
             txt_root,
@@ -638,8 +793,29 @@ impl Dictionary {
 
         self.value_index = collect_value_index(&exact_entries);
         self.regex_rules = regex_rules;
+        let (split_rules, split_warnings) = load_split_rules(&self.txt_root);
+        self.split_rules = split_rules;
         self.loaded_entries = build_report.exact_count + build_report.accepted_regex;
         self.build_report = build_report;
+
+        let mut total_warnings = 0;
+        for w in self.build_report.warnings.iter().chain(split_warnings.iter()) {
+            total_warnings += 1;
+            let _ = self.event_tx.send(BackendEvent::Log(
+                LogSource::Tenuki,
+                w.clone(),
+                LogLevel::Info,
+                current_timestamp(),
+            ));
+        }
+        if total_warnings == 0 {
+            let _ = self.event_tx.send(BackendEvent::Log(
+                LogSource::Tenuki,
+                "[Dict] load OK, no errors".to_string(),
+                LogLevel::Success,
+                current_timestamp(),
+            ));
+        }
     }
 
     pub fn lookup_source(&self, key: &str) -> Option<String> {
@@ -658,6 +834,51 @@ impl Dictionary {
                 return Some(out);
             }
         }
+        None
+    }
+
+    pub fn lookup_split(&self, key: &str) -> Option<SplitResult> {
+        for rule in &self.split_rules {
+            let caps = match rule.pattern.captures(key) {
+                Some(c) => c,
+                None => continue,
+            };
+            let m = match caps.get(0) {
+                Some(m) => m,
+                None => continue,
+            };
+            let full_start = m.start();
+            let full_end = m.end();
+            let inner_groups: Vec<Option<(usize, usize)>> = caps
+                .iter()
+                .skip(1)
+                .map(|g| g.map(|m| (m.start(), m.end())))
+                .collect();
+            let replacement = {
+                let mut tmpl = rule.replacement.clone();
+                tmpl = tmpl.replace("$S", "$$S");
+                tmpl = tmpl.replace("$L", "$$L");
+                tmpl = tmpl.replace("$R", "$$R");
+                let mut expanded = String::new();
+                caps.expand(&tmpl, &mut expanded);
+                expanded
+            };
+
+            let result = SplitResult {
+                full_match_start: full_start,
+                full_match_end: full_end,
+                inner_groups,
+                replacement,
+            };
+
+            log::info!(
+                "[SPLIT_LOOKUP] key=\"{}\" hit=true pattern=\"{}\" match_len={}",
+                key, rule.source_pattern, full_end - full_start
+            );
+            return Some(result);
+        }
+
+        log::info!("[SPLIT_LOOKUP] key=\"{}\" hit=false", key);
         None
     }
 
@@ -838,6 +1059,7 @@ mod tests {
             tmp.to_path_buf(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         )
@@ -872,6 +1094,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             bin_path,
             tx,
         );
@@ -902,6 +1125,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -932,6 +1156,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -964,6 +1189,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -988,6 +1214,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -1014,6 +1241,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -1047,6 +1275,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -1068,12 +1297,14 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
 
         assert!(tmp.join("Tenuki.dict.txt").exists());
         assert!(tmp.join("Tenuki.regex.txt").exists());
+        assert!(tmp.join("Tenuki.split.txt").exists());
         assert!(std::fs::read(tmp.join("Tenuki.dict.txt"))
             .unwrap()
             .starts_with(b"\xEF\xBB\xBF"));
@@ -1095,6 +1326,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -1131,6 +1363,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -1166,6 +1399,7 @@ mod tests {
             tmp.clone(),
             tmp.join("Tenuki.dict.txt"),
             tmp.join("Tenuki.regex.txt"),
+            tmp.join("Tenuki.split.txt"),
             tmp.join("dict.bin"),
             tx,
         );
@@ -1179,6 +1413,44 @@ mod tests {
         let exact = std::fs::read_to_string(tmp.join("Tenuki.dict.txt")).unwrap();
         assert!(exact.contains(" raw = Value "));
         assert!(!exact.contains("raw=Value"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn split_rule_caret_anchor_matches_start_of_fragment() {
+        let tmp = unique_tmp("split_caret");
+        let split_path = tmp.join("Tenuki.split.txt");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut f = std::fs::File::create(&split_path).unwrap();
+        f.write_all(b"\xEF\xBB\xBF").unwrap();
+        writeln!(f, "s:\"^你结识了\"=$Rの人と知り合う").unwrap();
+        drop(f);
+
+        let (tx, _rx) = mpsc::channel();
+        let dict = Dictionary::new(
+            tmp.clone(),
+            tmp.join("Tenuki.dict.txt"),
+            tmp.join("Tenuki.regex.txt"),
+            split_path,
+            tmp.join("dict.bin"),
+            tx,
+        );
+
+        // Fragment that starts with the matched text
+        let sr = dict.lookup_split("你结识了武当派");
+        assert!(sr.is_some(), "should match: 你结识了武当派");
+        let sr = sr.unwrap();
+        assert_eq!(sr.replacement, "$Rの人と知り合う");
+        assert_eq!(sr.full_match_start, 0);
+        assert!(sr.inner_groups.is_empty());
+
+        // Fragment with more text after the match
+        let sr2 = dict.lookup_split("你结识了武当派外门弟子凤藤虚");
+        assert!(sr2.is_some(), "should match longer fragment");
+
+        // Fragment that does NOT start with the match
+        assert!(dict.lookup_split("武当派你结识了").is_none());
 
         let _ = std::fs::remove_dir_all(tmp);
     }

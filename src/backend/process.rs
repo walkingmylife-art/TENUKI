@@ -22,9 +22,6 @@ pub fn build_llama_command(
     port: u16,
     ngl: u32,
     ctx_size: u32,
-    batch_size: u32,
-    ubatch_size: u32,
-    cont_batching: bool,
     parallel: u32,
     extra_args: &[String],
 ) -> Command {
@@ -38,13 +35,6 @@ pub fn build_llama_command(
         .args(["-ngl", &ngl.to_string()])
         .args(["--port", &port.to_string()])
         .args(["--ctx-size", &ctx_size.to_string()])
-        .args(["--batch-size", &batch_size.to_string()])
-        .args(["-ub", &ubatch_size.to_string()])
-        .arg(if cont_batching {
-            "--cont-batching"
-        } else {
-            "--no-cont-batching"
-        })
         .args(["--parallel", &parallel.to_string()])
         .args(["--cache-ram", "0"])
         .args(["--metrics"])
@@ -65,9 +55,6 @@ impl LlamaProcess {
         model: &PathBuf,
         ngl: u32,
         ctx_size: u32,
-        batch_size: u32,
-        ubatch_size: u32,
-        cont_batching: bool,
         parallel: u32,
         port: u16,
         extra_args: &[String],
@@ -79,9 +66,6 @@ impl LlamaProcess {
             port,
             ngl,
             ctx_size,
-            batch_size,
-            ubatch_size,
-            cont_batching,
             parallel,
             extra_args,
         );
@@ -178,9 +162,6 @@ mod tests {
             8080,
             0,
             4096,
-            512,
-            256,
-            true,
             2,
             &["--threads".to_string(), "8".to_string()],
         );

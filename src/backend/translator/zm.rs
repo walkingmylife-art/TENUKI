@@ -58,6 +58,62 @@ fn normalize_digit_char(ch: char) -> Option<char> {
     }
 }
 
+// --- 新関数①: ASCII → CJK ---
+fn ascii_digit_to_cjk(ch: char) -> Option<char> {
+    match ch {
+        '0' => Some('〇'),
+        '1' => Some('一'),
+        '2' => Some('二'),
+        '3' => Some('三'),
+        '4' => Some('四'),
+        '5' => Some('五'),
+        '6' => Some('六'),
+        '7' => Some('七'),
+        '8' => Some('八'),
+        '9' => Some('九'),
+        _ => None,
+    }
+}
+
+// --- 新関数①逆: CJK → ASCII（予防策用） ---
+fn cjk_digit_to_ascii(ch: char) -> Option<char> {
+    match ch {
+        '〇' => Some('0'),
+        '一' => Some('1'),
+        '二' => Some('2'),
+        '三' => Some('3'),
+        '四' => Some('4'),
+        '五' => Some('5'),
+        '六' => Some('6'),
+        '七' => Some('7'),
+        '八' => Some('8'),
+        '九' => Some('9'),
+        _ => None,
+    }
+}
+
+// --- 新関数②: CJK数字フォールバック（ブラケット制限なし） ---
+pub(super) fn apply_cjk_digit_fallback(text: &str, missing: &[&str]) -> String {
+    let mut result = text.to_string();
+    for &num_str in missing {
+        // 単桁ASCII数字でなければスキップ
+        if num_str.chars().count() != 1 {
+            continue;
+        }
+        let ascii_ch = num_str.chars().next().unwrap();
+        if !ascii_ch.is_ascii_digit() {
+            continue;
+        }
+        let Some(cjk) = ascii_digit_to_cjk(ascii_ch) else {
+            continue;
+        };
+
+        // テキスト中のCJK数字をすべてASCII数字に置換
+        result = result.replace(cjk, &ascii_ch.to_string());
+    }
+    result
+}
+
 pub(super) fn collect_numeric_runs(text: &str) -> Vec<NumericRun> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut runs = Vec::new();
@@ -189,7 +245,16 @@ pub(super) fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
     let mut cursor = 0usize;
     let mut replacements: Vec<ZmReplacement> = Vec::new();
     let mut index = 0usize;
-    let existing = collect_existing_number_tokens(text);
+
+    // --- 予防策: 漢数字との衝突を回避 ---
+    let mut existing = collect_existing_number_tokens(text);
+    for ch in text.chars() {
+        if let Some(ascii) = cjk_digit_to_ascii(ch) {
+            existing.insert(ascii.to_string());
+        }
+    }
+    // --- ここまで ---
+
     let mut counter = 2usize;
 
     while index < chars.len() {
@@ -299,6 +364,23 @@ pub(super) fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
 pub(super) fn restore_zm_number_tokens(text: &str, mapping: &ZmNumberMapping) -> String {
     use rustc_hash::FxHashMap;
 
+    // --- 回復策: ブラケット内漢数字フォールバック ---
+    let existing = collect_existing_number_tokens(text);
+    let missing_numbers: Vec<&str> = mapping
+        .replacements
+        .iter()
+        .filter(|repl| !existing.contains(&repl.number))
+        .map(|repl| repl.number.as_str())
+        .collect();
+
+    let text = if !missing_numbers.is_empty() {
+        apply_cjk_digit_fallback(text, &missing_numbers)
+    } else {
+        text.to_string()
+    };
+    let text = text.as_str();
+    // --- ここまで ---
+
     let mut lookup: FxHashMap<&str, (usize, &ZmReplacement)> = FxHashMap::default();
     for (i, repl) in mapping.replacements.iter().enumerate() {
         lookup.insert(repl.number.as_str(), (i, repl));
@@ -359,4 +441,79 @@ pub(super) fn restore_zm_number_tokens(text: &str, mapping: &ZmNumberMapping) ->
     result.push_str(&text[cursor..]);
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ascii_digit_to_cjk() {
+        assert_eq!(ascii_digit_to_cjk('0'), Some('〇'));
+        assert_eq!(ascii_digit_to_cjk('1'), Some('一'));
+        assert_eq!(ascii_digit_to_cjk('2'), Some('二'));
+        assert_eq!(ascii_digit_to_cjk('9'), Some('九'));
+        assert_eq!(ascii_digit_to_cjk('a'), None);
+        assert_eq!(ascii_digit_to_cjk('２'), None);
+    }
+
+    #[test]
+    fn test_cjk_digit_to_ascii() {
+        assert_eq!(cjk_digit_to_ascii('〇'), Some('0'));
+        assert_eq!(cjk_digit_to_ascii('一'), Some('1'));
+        assert_eq!(cjk_digit_to_ascii('二'), Some('2'));
+        assert_eq!(cjk_digit_to_ascii('九'), Some('9'));
+        assert_eq!(cjk_digit_to_ascii('a'), None);
+        assert_eq!(cjk_digit_to_ascii('2'), None);
+    }
+
+    #[test]
+    fn test_apply_cjk_digit_fallback_fullwidth() {
+        assert_eq!(
+            apply_cjk_digit_fallback("「二」です", &["2"]),
+            "「2」です"
+        );
+    }
+
+    #[test]
+    fn test_apply_cjk_digit_fallback_no_bracket() {
+        // ブラケットがなくても置換されるようになった
+        assert_eq!(
+            apply_cjk_digit_fallback("二です", &["2"]),
+            "2です"
+        );
+    }
+
+    #[test]
+    fn test_apply_cjk_digit_fallback_halfwidth() {
+        assert_eq!(
+            apply_cjk_digit_fallback("｢二｣です", &["2"]),
+            "｢2｣です"
+        );
+    }
+
+    #[test]
+    fn test_apply_cjk_digit_fallback_skip_non_ascii_digit() {
+        assert_eq!(
+            apply_cjk_digit_fallback("「十」です", &["10"]),
+            "「十」です"
+        );
+    }
+
+    #[test]
+    fn test_apply_cjk_digit_fallback_all_occurrences() {
+        // ブラケットの内外問わず、すべての該当文字が置換される
+        assert_eq!(
+            apply_cjk_digit_fallback("「二」と二です", &["2"]),
+            "「2」と2です"
+        );
+    }
+
+    #[test]
+    fn test_apply_cjk_digit_fallback_empty_missing() {
+        assert_eq!(
+            apply_cjk_digit_fallback("「二」です", &[]),
+            "「二」です"
+        );
+    }
 }

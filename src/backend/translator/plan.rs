@@ -16,6 +16,10 @@ const EDGE_SUFFIX_BRACKETS: &[char] = &[
 
 const EDGE_PREFIX_ADJACENT_PUNCTUATION: &[char] = &['\u{3001}', '\u{3002}', '\u{FF0C}', '\u{FF0E}'];
 
+fn is_horizontal_space(ch: char) -> bool {
+    ch == ' ' || ch == '\u{3000}'
+}
+
 struct EdgeStructuralParts {
     prefix: String,
     core: String,
@@ -35,6 +39,8 @@ fn split_text_edge_structural_affixes(text: &str) -> EdgeStructuralParts {
             prefix_end += 1;
         } else if has_prefix_bracket && is_edge_prefix_adjacent_punctuation(ch) {
             prefix_end += 1;
+        } else if has_prefix_bracket && is_horizontal_space(ch) {
+            prefix_end += 1;
         } else {
             break;
         }
@@ -47,7 +53,7 @@ fn split_text_edge_structural_affixes(text: &str) -> EdgeStructuralParts {
         if is_edge_suffix_bracket(ch) {
             has_suffix_bracket = true;
             suffix_start -= 1;
-        } else if has_suffix_bracket && ch == ' ' {
+        } else if has_suffix_bracket && is_horizontal_space(ch) {
             suffix_start -= 1;
         } else {
             break;
@@ -201,10 +207,27 @@ pub(super) fn plan_inner_text_to_segment_nodes(text: &str) -> Vec<PlannedNode> {
 struct PlannedLineBuilder {
     segments: Vec<PlannedSegment>,
     current_nodes: Vec<PlannedNode>,
+    last_was_surface: bool,
 }
 
 impl PlannedLineBuilder {
     fn append_text(&mut self, text: &str) {
+        let text = if self.last_was_surface {
+            self.last_was_surface = false;
+            let trimmed = text.trim_start_matches(is_horizontal_space);
+            if trimmed.len() < text.len() {
+                let spaces = text[..text.len() - trimmed.len()].to_string();
+                self.current_nodes
+                    .push(PlannedNode::Surface(SurfaceNode::visible(spaces)));
+            }
+            if trimmed.is_empty() {
+                return;
+            }
+            trimmed
+        } else {
+            text
+        };
+
         let (lines, newline_tokens) = split_lines(tokenize_structure(text));
 
         for (line_index, line) in lines.iter().enumerate() {
@@ -222,7 +245,27 @@ impl PlannedLineBuilder {
     }
 
     fn append_surface(&mut self, surface: SurfaceNode) {
+        self.absorb_trailing_spaces();
         self.current_nodes.push(PlannedNode::Surface(surface));
+        self.last_was_surface = true;
+    }
+
+    fn absorb_trailing_spaces(&mut self) {
+        let Some(last) = self.current_nodes.last_mut() else {
+            return;
+        };
+        let text: &mut String = match last {
+            PlannedNode::Fragment(frag) => &mut frag.authority.source,
+            PlannedNode::Surface(surf) => &mut surf.text,
+        };
+        let trimmed_end = text.trim_end_matches(is_horizontal_space).len();
+        if trimmed_end == text.len() {
+            return;
+        }
+        let spaces = text[trimmed_end..].to_string();
+        text.truncate(trimmed_end);
+        self.current_nodes
+            .push(PlannedNode::Surface(SurfaceNode::visible(spaces)));
     }
 
     fn finish_segment(&mut self, trailing_separator: Option<SurfaceNode>) {

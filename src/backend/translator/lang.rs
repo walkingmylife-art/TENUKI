@@ -23,6 +23,13 @@ fn resolve_lang_name(code: &str, custom_name: &str) -> String {
     }
 }
 
+pub fn fallback_prefix(tgt_lang: &str) -> String {
+    let target = resolve_lang_name(tgt_lang, "");
+    format!(
+        "Translate the following text into {target}. Note that you should only output the translated result without any additional explanation:\n\n{{source_text}}"
+    )
+}
+
 /// 言語ペアから翻訳指令を生成する。
 ///
 /// HY-MT1.5 の推奨テンプレートに合わせて、常に英語の定型文を使う。
@@ -31,12 +38,15 @@ pub fn build_lang_prefix(
     tgt_lang: &str,
     custom_name: &str,
     prompt_template: &str,
+    background_text: &str,
 ) -> String {
     let target = resolve_lang_name(tgt_lang, custom_name);
     prompt_template
         .replace("{target}", &target)
+        .replace("{target_lang}", &target)
         .replace("{language}", &target)
         .replace("{lang}", &target)
+        .replace("{background_text}", background_text)
 }
 
 #[cfg(test)]
@@ -51,6 +61,7 @@ mod tests {
                 "ja",
                 "",
                 "Translate the following segment into {target}, without additional explanation.",
+                "",
             ),
             "Translate the following segment into Japanese, without additional explanation.",
         );
@@ -64,6 +75,7 @@ mod tests {
                 "en",
                 "",
                 "Translate the following segment into {target}, without additional explanation.",
+                "",
             ),
             "Translate the following segment into English, without additional explanation.",
         );
@@ -77,6 +89,7 @@ mod tests {
                 "pt-BR",
                 "Brazilian Portuguese",
                 "Translate the following segment into {target}, without additional explanation.",
+                "",
             ),
             "Translate the following segment into Brazilian Portuguese, without additional explanation.",
         );
@@ -85,8 +98,22 @@ mod tests {
     #[test]
     fn uses_custom_template_placeholders() {
         assert_eq!(
-            build_lang_prefix("ja", "en", "", "Only output {language}."),
+            build_lang_prefix("ja", "en", "", "Only output {language}.", ""),
             "Only output English.",
+        );
+    }
+
+    #[test]
+    fn replaces_background_text_placeholder() {
+        assert_eq!(
+            build_lang_prefix(
+                "ja",
+                "en",
+                "",
+                "Context: {background_text}\nTranslate into {target}.",
+                "This is a fantasy game.",
+            ),
+            "Context: This is a fantasy game.\nTranslate into English.",
         );
     }
 }

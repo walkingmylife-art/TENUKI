@@ -18,7 +18,11 @@ pub struct HttpLlmClient {
 }
 
 fn build_translation_message(prefix: &str, text: &str) -> String {
-    format!("{}\n\n{}", prefix.trim(), text.trim())
+    if prefix.contains("{source_text}") {
+        prefix.replace("{source_text}", text.trim())
+    } else {
+        format!("{}\n\n{}", prefix.trim(), text.trim())
+    }
 }
 
 impl HttpLlmClient {
@@ -48,10 +52,10 @@ impl HttpLlmClient {
             ],
             "max_tokens": 512,
             "temperature": 0.4,
-            "top_k": 30,
+            "top_k": 20,
             "top_p": 0.6,
             "repetition_penalty": 1.05,
-            "cache_prompt": false
+            "cache_prompt": true
         });
 
         match client.post(self.endpoint.as_str()).send_json(payload) {
@@ -90,6 +94,17 @@ mod tests {
                 "Hello world"
             ),
             "Translate the following segment into Japanese, without additional explanation.\n\nHello world",
+        );
+    }
+
+    #[test]
+    fn builds_message_with_source_text_placeholder() {
+        assert_eq!(
+            build_translation_message(
+                "Translate: {source_text}",
+                "Hello world"
+            ),
+            "Translate: Hello world",
         );
     }
 }

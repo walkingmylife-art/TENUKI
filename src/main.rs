@@ -707,7 +707,7 @@ impl TenukiApp {
         let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
         let parallel_slots = launcher::app_config::AppConfig::load(&launcher_config_path)
             .map(|c| c.server.parallel_slots.max(1) as usize)
-            .unwrap_or(2);
+            .unwrap_or(1);
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let run_config = FileTranslateRunConfig {
             source: table_source,

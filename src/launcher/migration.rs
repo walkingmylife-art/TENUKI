@@ -340,16 +340,11 @@ fn build_app_config(legacy: &LegacyConfig, raw: &Value) -> AppConfig {
     }
 
     let ctx = val_u32(raw, "ctx_size");
-    config.server.ctx_size = if ctx > 0 { ctx } else { 1024 };
-    let batch = val_u32(raw, "batch_size");
-    config.server.batch_size = if batch > 0 { batch } else { 128 };
-    let ub = val_u32(raw, "ubatch_size");
-    config.server.ubatch_size = if ub > 0 { ub } else { 64 };
+    config.server.ctx_size = if ctx > 0 { ctx } else { 768 };
     let ngl = val_u32(raw, "ngl");
     config.server.ngl = if ngl > 0 { ngl } else { 999 };
     let par = val_u32(raw, "parallel_slots");
-    config.server.parallel_slots = if par > 0 { par } else { 2 };
-    config.server.cont_batching = val_bool(raw, "cont_batching", true);
+    config.server.parallel_slots = if par > 0 { par } else { 1 };
 
     let _ = legacy;
     config
