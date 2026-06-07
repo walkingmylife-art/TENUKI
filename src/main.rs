@@ -16,22 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
 
-use anyhow::anyhow;
-use file_translate::asset_intake::{load_source_preview, scan_asset_sources_with_progress};
 use file_translate::commands::FileTranslateUiCommand;
-use file_translate::preview::{build_preview_summary, build_run_log_seed};
-use file_translate::runner::run_file_translate;
-use file_translate::state::{
-    evaluate_run_readiness, DictSlotAction, FileTranslatePreviewMessage, FileTranslateScanMessage,
-};
-use file_translate::types::{
-    ColumnMode, FileTranslateRunConfig, HeaderMode, PreviewState, SourceKind, SourcePreview,
-};
+use file_translate::controller::FileTranslateController;
 use launcher::{show_launcher_screen, LaunchProgress, LauncherUiState};
 use messages::{BackendEvent, FrontendCommand, LogLevel};
-use ui::container::{LeftPanelTab, LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
+use ui::container::{LogSource, ProcessType, StatusIcon, StatusKey, UiContainer};
 use ui::list_text::{self, ListText};
 use ui::work_result_text;
 
@@ -45,7 +35,6 @@ struct TenukiApp {
     mode: AppMode,
     base_dir: PathBuf,
     config_path: PathBuf,
-    cached_model_check: Option<(bool, Instant)>,
     ui: UiContainer,
     command_tx: mpsc::Sender<FrontendCommand>,
     event_rx: mpsc::Receiver<BackendEvent>,
@@ -60,8 +49,7 @@ struct TenukiApp {
     launcher_tx: mpsc::Sender<LaunchProgress>,
     launcher_thread: Option<thread::JoinHandle<()>>,
     launcher_cancel: Arc<AtomicBool>,
-    // List mode run cancellation state.
-    file_translate_cancel: Option<Arc<AtomicBool>>,
+    file_translate_ctrl: FileTranslateController,
 }
 
 fn sanitize_ui_lang(lang: &str) -> String {
@@ -260,533 +248,53 @@ impl TenukiApp {
     // File Translate / List mode is a separate entry from normal translation.
     // /list does not update dictionary, cache, or input analysis.
     // Output is {source_stem}.txt in dict.txt format, written incrementally via .partial.txt.
-    fn file_translate_readiness(&self) -> file_translate::state::FileTranslateRunReadiness {
-        evaluate_run_readiness(
-            &self.ui.state.file_translate,
-            self.ui.display.dict_slot.as_deref(),
-            &self.ui.display.tgt_lang,
-            &self.base_dir,
-        )
-    }
-
-    fn refresh_file_translate_summary(&mut self) {
-        let readiness = self.file_translate_readiness();
-        let preview = self.ui.state.file_translate.preview.clone();
-        let column_modes = self.ui.state.file_translate.column_modes.clone();
-        let selected_source = self.ui.state.file_translate.selected_source.clone();
-        let root = self.ui.state.file_translate.root.clone();
-        let sources = self.ui.state.file_translate.sources.clone();
-
-        match &selected_source {
-            Some(file) => {
-                let (text, is_error) = build_preview_summary(
-                    &self.ui.display.ui_lang,
-                    &preview,
-                    &column_modes,
-                    &readiness,
-                );
-                self.ui
-                    .set_work_result(file.display().to_string(), text, is_error);
-            }
-            None => {
-                let lang = &self.ui.display.ui_lang;
-                let root = root
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let summary = [
-                    list_text::field(lang, ListText::Root, root),
-                    list_text::field(lang, ListText::Sources, sources.len()),
-                    list_text::field(
-                        lang,
-                        ListText::Delimited,
-                        sources
-                            .iter()
-                            .filter(|source| source.kind == SourceKind::DelimitedText)
-                            .count(),
-                    ),
-                    list_text::field(
-                        lang,
-                        ListText::Json,
-                        sources
-                            .iter()
-                            .filter(|source| source.kind == SourceKind::JsonText)
-                            .count(),
-                    ),
-                    list_text::field(
-                        lang,
-                        ListText::Markup,
-                        sources
-                            .iter()
-                            .filter(|source| source.kind == SourceKind::MarkupText)
-                            .count(),
-                    ),
-                    list_text::field(
-                        lang,
-                        ListText::PlainLines,
-                        sources
-                            .iter()
-                            .filter(|source| source.kind == SourceKind::PlainLines)
-                            .count(),
-                    ),
-                    list_text::field(
-                        lang,
-                        ListText::UnsupportedBinary,
-                        sources
-                            .iter()
-                            .filter(|source| source.kind == SourceKind::UnsupportedBinary)
-                            .count(),
-                    ),
-                    list_text::text(lang, ListText::SelectSourceToPreview).to_string(),
-                ]
-                .join("\n");
-                self.ui.set_work_result(
-                    list_text::text(lang, ListText::FileTranslateTitle).to_string(),
-                    summary,
-                    false,
-                );
-            }
-        }
-    }
-
-    fn start_file_translate_scan(&mut self, selection: PathBuf) {
-        let root = if selection.is_dir() {
-            selection.clone()
-        } else {
-            selection
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.base_dir.clone())
-        };
-        let (scan_tx, scan_rx) = mpsc::channel();
-        self.ui
-            .state
-            .file_translate
-            .reset_for_root(Some(root.clone()), Vec::new());
-        self.ui.state.file_translate.enter_list_mode();
-        self.ui.state.file_translate.scan_in_progress = true;
-        self.ui.state.file_translate.scan_rx = Some(scan_rx);
-        self.ui.state.log_panel_tab = LeftPanelTab::List;
-        self.ui.set_work_running(false);
-        self.ui.reset_file_translate_progress();
-        self.ui
-            .reset_file_translate_logs(vec![format!("[scan] root: {}", root.display())]);
-        self.ui.set_file_translate_status_text(
-            list_text::text(&self.ui.display.ui_lang, ListText::Scanning).to_string(),
-        );
-        self.refresh_file_translate_summary();
-
-        thread::spawn(move || {
-            let sources = scan_asset_sources_with_progress(&root, |index, candidate| {
-                let _ = scan_tx.send(FileTranslateScanMessage::Scanned {
-                    index,
-                    path: candidate.path.clone(),
-                });
-            });
-            let _ = scan_tx.send(FileTranslateScanMessage::Done { root, sources });
-        });
-    }
-
     fn poll_file_translate_scan(&mut self) {
-        let mut messages = Vec::new();
-        let mut done = None;
-
-        if let Some(rx) = &self.ui.state.file_translate.scan_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(message) => messages.push(message),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        done = Some((
-                            self.ui
-                                .state
-                                .file_translate
-                                .root
-                                .clone()
-                                .unwrap_or_else(|| self.base_dir.clone()),
-                            Vec::new(),
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-
-        for message in messages {
-            match message {
-                FileTranslateScanMessage::Scanned { index, path } => {
-                    self.ui.append_file_translate_log(
-                        format!("[scan][{}] {}", index, path.display()),
-                        LogLevel::Info,
-                    );
-                }
-                FileTranslateScanMessage::Done { root, sources } => {
-                    done = Some((root, sources));
-                }
-            }
-        }
-
-        if let Some((root, sources)) = done {
-            let first_source = sources.first().map(|source| source.path.clone());
-            let file_count = sources.len();
-            self.ui
-                .state
-                .file_translate
-                .reset_for_root(Some(root), sources);
-            self.ui.state.file_translate.scan_rx = None;
-            self.ui.append_file_translate_log(
-                format!(
-                    "[scan] {}",
-                    list_text::scan_done(&self.ui.display.ui_lang, file_count)
-                ),
-                LogLevel::Info,
-            );
-            self.ui.set_file_translate_status_text(list_text::scan_done(
-                &self.ui.display.ui_lang,
-                file_count,
-            ));
-
-            if let Some(file) = first_source {
-                self.select_file_translate_source(file);
-            } else {
-                self.refresh_file_translate_summary();
-            }
-        }
-    }
-
-    fn start_file_translate_preview_load(
-        &mut self,
-        file: PathBuf,
-        header_mode: HeaderMode,
-        reset_columns: bool,
-    ) {
-        let (preview_tx, preview_rx) = mpsc::channel();
-        {
-            let state = &mut self.ui.state.file_translate;
-            state.selected_source = Some(file.clone());
-            state.preview = PreviewState::Empty;
-            state.preview_loading = true;
-            state.preview_target = Some(file.clone());
-            state.preview_header_mode = header_mode;
-            state.table_preview_row_limit = 100;
-            state.text_preview_line_limit =
-                crate::ui::file_translate_panel::TEXT_PREVIEW_INITIAL_LINE_LIMIT;
-            state.preview_rx = Some(preview_rx);
-            if reset_columns {
-                state.column_modes.clear();
-            }
-        }
-        self.ui.set_file_translate_status_text(
-            list_text::text(&self.ui.display.ui_lang, ListText::LoadingPreview).to_string(),
-        );
-        self.refresh_file_translate_summary();
-
-        thread::spawn(move || {
-            let result = load_source_preview(&file, header_mode).map_err(|err| err.to_string());
-            let _ = preview_tx.send(FileTranslatePreviewMessage::Done {
-                file,
-                header_mode,
-                result,
-            });
-        });
+        self.file_translate_ctrl.poll_file_translate_scan(&mut self.ui);
     }
 
     fn poll_file_translate_preview(&mut self) {
-        let mut messages = Vec::new();
-        let mut disconnected = false;
-
-        if let Some(rx) = &self.ui.state.file_translate.preview_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(message) => messages.push(message),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut refresh = false;
-        for message in messages {
-            match message {
-                FileTranslatePreviewMessage::Done {
-                    file,
-                    header_mode,
-                    result,
-                } => {
-                    let state = &mut self.ui.state.file_translate;
-                    let matches_current = state.selected_source.as_ref() == Some(&file)
-                        && state.preview_target.as_ref() == Some(&file)
-                        && state.preview_header_mode == header_mode;
-                    if !matches_current {
-                        continue;
-                    }
-
-                    state.preview_loading = false;
-                    state.preview_target = None;
-                    state.preview_rx = None;
-                    state.preview = match result {
-                        Ok(preview) => {
-                            // Auto-resolve header mode from preview suggestion
-                            // when the current mode is still Unknown.
-                            // Transform the table data in memory (no extra I/O).
-                            let preview = if header_mode == HeaderMode::Unknown {
-                                match preview {
-                                    SourcePreview::Table(table)
-                                        if table.supports_header_toggle() =>
-                                    {
-                                        let resolved_mode = if table.suggested_header {
-                                            HeaderMode::Present
-                                        } else {
-                                            HeaderMode::Absent
-                                        };
-                                        state.preview_header_mode = resolved_mode;
-                                        SourcePreview::Table(
-                                            file_translate::asset_intake::apply_delimited_header_mode_from_unknown(
-                                                table,
-                                                resolved_mode,
-                                            ),
-                                        )
-                                    }
-                                    other => other,
-                                }
-                            } else {
-                                preview
-                            };
-
-                            PreviewState::Ready(preview)
-                        }
-                        Err(err) => PreviewState::Error(err),
-                    };
-                    refresh = true;
-                }
-            }
-        }
-
-        if disconnected && self.ui.state.file_translate.preview_loading {
-            let state = &mut self.ui.state.file_translate;
-            state.preview_loading = false;
-            state.preview_target = None;
-            state.preview_rx = None;
-            state.preview = PreviewState::Error("preview worker disconnected".to_string());
-            refresh = true;
-        }
-
-        if refresh {
-            self.refresh_file_translate_summary();
-        }
-    }
-
-    fn select_file_translate_source(&mut self, file: PathBuf) {
-        self.start_file_translate_preview_load(file, HeaderMode::Unknown, true);
-    }
-
-    fn set_file_translate_column_mode(&mut self, file: PathBuf, column: usize, mode: ColumnMode) {
-        if self.ui.state.file_translate.selected_source.as_ref() != Some(&file) {
-            return;
-        }
-
-        if mode == ColumnMode::None {
-            self.ui.state.file_translate.column_modes.remove(&column);
-        } else {
-            self.ui
-                .state
-                .file_translate
-                .column_modes
-                .insert(column, mode);
-        }
-        self.refresh_file_translate_summary();
-    }
-
-    fn set_file_translate_header_mode(&mut self, file: PathBuf, mode: HeaderMode) {
-        if self.ui.state.file_translate.selected_source.as_ref() != Some(&file) {
-            return;
-        }
-
-        self.start_file_translate_preview_load(file, mode, false);
-    }
-
-    fn resolve_file_translate_slot(&mut self, action: DictSlotAction) -> Result<PathBuf, String> {
-        match action {
-            DictSlotAction::UseCommitted(path) => {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| format!("slot directory create failed: {}", e))?;
-                self.ui.append_file_translate_log(
-                    format!(
-                        "[slot] using committed output directory: {}",
-                        path.display()
-                    ),
-                    LogLevel::Info,
-                );
-                Ok(path)
-            }
-            DictSlotAction::CreateForRun {
-                parent,
-                target_lang,
-            } => {
-                let slot = parent.join("list_output");
-                let committed_mismatch = self
-                    .ui
-                    .display
-                    .dict_slot
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .is_some_and(|path| {
-                        !backend::manager::dict_slot_matches_target(Path::new(path), &target_lang)
-                    });
-                let message = if committed_mismatch {
-                    format!(
-                        "[slot] committed slot does not match target {}; using List output directory: {}",
-                        target_lang,
-                        slot.display()
-                    )
-                } else {
-                    format!("[slot] List output directory: {}", slot.display())
-                };
-                self.ui.append_file_translate_log(message, LogLevel::Info);
-                Ok(slot)
-            }
-        }
-    }
-
-    fn start_file_translate_run(&mut self) {
-        let readiness = self.file_translate_readiness();
-        if !readiness.is_ready() {
-            let message = list_text::readiness(&self.ui.display.ui_lang, &readiness);
-            self.ui.set_work_result(
-                list_text::text(&self.ui.display.ui_lang, ListText::FileTranslateTitle).to_string(),
-                message.clone(),
-                true,
-            );
-            self.ui
-                .append_file_translate_log(format!("[need] {}", message), LogLevel::Error);
-            return;
-        }
-
-        let table_source = readiness
-            .table_source
-            .clone()
-            .expect("ready state must include table source");
-        let selected_file = table_source.file.clone();
-
-        let config = match config::load(&self.config_path) {
-            Ok(config) => config,
-            Err(err) => {
-                self.ui.set_work_result(
-                    list_text::text(&self.ui.display.ui_lang, ListText::FileTranslateTitle)
-                        .to_string(),
-                    format!("config load failed: {}", err),
-                    true,
-                );
-                return;
-            }
-        };
-
-        let dict_slot = match self.resolve_file_translate_slot(
-            readiness
-                .dict_slot_action
-                .clone()
-                .expect("ready state must include dict slot action"),
-        ) {
-            Ok(slot) => slot,
-            Err(err) => {
-                self.ui.set_work_result(
-                    list_text::text(&self.ui.display.ui_lang, ListText::FileTranslateTitle)
-                        .to_string(),
-                    err,
-                    true,
-                );
-                return;
-            }
-        };
-
-        // launcher_config.toml authority lives under install_root.
-        let launcher_config_path = launcher::resolve_install_root().join("launcher_config.toml");
-        let parallel_slots = launcher::app_config::AppConfig::load(&launcher_config_path)
-            .map(|c| c.server.parallel_slots.max(1) as usize)
-            .unwrap_or(1);
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let run_config = FileTranslateRunConfig {
-            source: table_source,
-            dict_slot,
-            column_modes: self.ui.state.file_translate.column_modes.clone(),
-            ui_lang: self.ui.display.ui_lang.clone(),
-            server_host: config.server_host.clone(),
-            server_port: config.server_port,
-            chunk_size: config.list.effective_chunk_size(parallel_slots),
-            request_timeout_secs: config.list.effective_timeout_secs(),
-            cancel_flag: cancel_flag.clone(),
-            event_tx: self.event_tx.clone(),
-        };
-
-        self.file_translate_cancel = Some(cancel_flag);
-        self.ui.state.log_panel_tab = LeftPanelTab::List;
-        self.ui.set_work_running(true);
-        self.ui.reset_file_translate_progress();
-        self.ui.set_file_translate_status_text(
-            list_text::text(&self.ui.display.ui_lang, ListText::Started).to_string(),
-        );
-        self.ui
-            .append_file_translate_log("[run] started".to_string(), LogLevel::Info);
-        for line in build_run_log_seed(
-            &self.ui.display.ui_lang,
-            &self.ui.state.file_translate.preview,
-            &self.ui.state.file_translate.column_modes,
-            &readiness,
-        ) {
-            self.ui.append_file_translate_log(line, LogLevel::Info);
-        }
-        self.ui
-            .set_work_result(selected_file.display().to_string(), "".to_string(), false);
-
-        let event_tx = self.event_tx.clone();
-        thread::spawn(move || {
-            let outcome = run_file_translate(run_config);
-            let _ = event_tx.send(BackendEvent::WorkResult {
-                title: outcome.title,
-                text: outcome.text,
-                is_error: outcome.is_error,
-            });
-        });
-    }
-
-    fn stop_file_translate_run(&mut self) {
-        if let Some(cancel_flag) = &self.file_translate_cancel {
-            cancel_flag.store(true, Ordering::Relaxed);
-            self.ui
-                .append_file_translate_log("[stop] requested".to_string(), LogLevel::Info);
-            self.ui.set_file_translate_status_text(
-                list_text::text(&self.ui.display.ui_lang, ListText::Stopping).to_string(),
-            );
-        }
+        self.file_translate_ctrl.poll_file_translate_preview(&mut self.ui);
     }
 
     fn handle_file_translate_command(&mut self, command: FileTranslateUiCommand) {
-        match command {
-            FileTranslateUiCommand::StartFileTranslateScan(path) => {
-                self.start_file_translate_scan(path);
-            }
-            FileTranslateUiCommand::SelectFileTranslateSource(path) => {
-                self.select_file_translate_source(path);
-            }
-            FileTranslateUiCommand::SetFileTranslateColumnMode { file, column, mode } => {
-                self.set_file_translate_column_mode(file, column, mode);
-            }
-            FileTranslateUiCommand::SetFileTranslateHeaderMode { file, mode } => {
-                self.set_file_translate_header_mode(file, mode);
-            }
-            FileTranslateUiCommand::RunFileTranslate => {
-                self.start_file_translate_run();
-            }
-            FileTranslateUiCommand::StopFileTranslate => {
-                self.stop_file_translate_run();
-            }
-        }
+        self.file_translate_ctrl.handle_file_translate_command(&mut self.ui, command);
     }
+}
 
+struct InitialConfigValues {
+    src_lang: String,
+    tgt_lang: String,
+    dict_slot: Option<String>,
+    profile: String,
+    profile_runtime: config::TranslationProfile,
+    ui_lang: String,
+    custom_lang_name: String,
+}
+
+fn read_initial_config_values(config_path: &Path) -> InitialConfigValues {
+    let config_result = config::load(config_path);
+    let src_lang = config_result.as_ref().map(|c| c.src_lang.clone()).unwrap_or_else(|_| "en".to_string());
+    let tgt_lang = config_result.as_ref().map(|c| c.tgt_lang.clone()).unwrap_or_else(|_| "ja".to_string());
+    let dict_slot = config_result.as_ref().ok().and_then(|c| c.dict_slot.clone());
+    let profile = config_result.as_ref().map(|c| c.profile.clone()).unwrap_or_else(|_| "game".to_string());
+    let profile_runtime = config::load_profile(config_path, &profile).unwrap_or_default();
+    let ui_lang = config_result.as_ref().map(|c| c.ui_lang.clone()).unwrap_or_else(|_| "en".to_string());
+    let ui_lang = sanitize_ui_lang(&ui_lang);
+    let custom_lang_name = config_result.as_ref().map(|c| c.custom_lang_name.clone()).unwrap_or_default();
+    InitialConfigValues { src_lang, tgt_lang, dict_slot, profile, profile_runtime, ui_lang, custom_lang_name }
+}
+
+fn apply_initial_config_to_ui(ui: &mut UiContainer, config: &InitialConfigValues) {
+    ui.update_src_lang(&config.src_lang);
+    ui.update_tgt_lang(&config.tgt_lang, Some(&config.custom_lang_name));
+    ui.update_dict_slot(config.dict_slot.clone());
+    ui.update_profile(&config.profile);
+    ui.update_mode(&config.profile_runtime.mode);
+    ui.update_game_text_options(config.profile_runtime.game_text.into());
+    ui.update_ui_lang(&config.ui_lang);
+}
+
+impl TenukiApp {
     fn new(
         cc: &eframe::CreationContext,
         command_tx: mpsc::Sender<FrontendCommand>,
@@ -824,12 +332,6 @@ impl TenukiApp {
         // Preflight can provision missing config, so always run it before normal mode.
         let config_ready_for_normal = provision_runtime_config_before_normal(&config_path);
 
-        let config_result = if config_ready_for_normal {
-            config::load(&config_path)
-        } else {
-            Err(anyhow!("config.toml is not ready for normal startup"))
-        };
-
         let readiness = launcher::check_ready_detail(&base_dir);
         let mode = if config_ready_for_normal && readiness.is_ok() {
             AppMode::Normal
@@ -837,38 +339,7 @@ impl TenukiApp {
             AppMode::Launcher
         };
 
-        let initial_src_lang = config_result
-            .as_ref()
-            .map(|c| c.src_lang.clone())
-            .unwrap_or_else(|_| "en".to_string());
-
-        let initial_tgt_lang = config_result
-            .as_ref()
-            .map(|c| c.tgt_lang.clone())
-            .unwrap_or_else(|_| "ja".to_string());
-
-        let initial_dict_slot = config_result
-            .as_ref()
-            .ok()
-            .and_then(|c| c.dict_slot.clone());
-
-        let initial_profile = config_result
-            .as_ref()
-            .map(|c| c.profile.clone())
-            .unwrap_or_else(|_| "game".to_string());
-        let initial_profile_runtime =
-            config::load_profile(&config_path, &initial_profile).unwrap_or_default();
-
-        let initial_ui_lang = config_result
-            .as_ref()
-            .map(|c| c.ui_lang.clone())
-            .unwrap_or_else(|_| "en".to_string());
-        let initial_ui_lang = sanitize_ui_lang(&initial_ui_lang);
-
-        let initial_custom_lang_name = config_result
-            .as_ref()
-            .map(|c| c.custom_lang_name.clone())
-            .unwrap_or_default();
+        let cfg = read_initial_config_values(&config_path);
 
         let backend_thread = None;
         let command_rx_opt = Some(command_rx);
@@ -880,11 +351,13 @@ impl TenukiApp {
         );
 
         let ui = UiContainer::with_base_dir(base_dir.clone());
+        let ctrl_base_dir = base_dir.clone();
+        let ctrl_config_path = config_path.clone();
+        let ctrl_event_tx = event_tx.clone();
         let mut app = Self {
             mode,
             base_dir,
             config_path,
-            cached_model_check: None,
             ui,
             command_tx,
             event_rx,
@@ -897,40 +370,21 @@ impl TenukiApp {
             launcher_tx,
             launcher_thread,
             launcher_cancel,
-            file_translate_cancel: None,
+            file_translate_ctrl: FileTranslateController {
+                base_dir: ctrl_base_dir,
+                config_path: ctrl_config_path,
+                event_tx: ctrl_event_tx,
+                file_translate_cancel: None,
+            },
         };
 
-        app.ui.update_src_lang(&initial_src_lang);
-        app.ui
-            .update_tgt_lang(&initial_tgt_lang, Some(&initial_custom_lang_name));
-        app.ui.update_dict_slot(initial_dict_slot);
-        app.ui.update_profile(&initial_profile);
-        app.ui.update_mode(&initial_profile_runtime.mode);
-        app.ui
-            .update_game_text_options(initial_profile_runtime.game_text.into());
-        app.ui.update_ui_lang(&initial_ui_lang);
-        app.ui
-            .refresh_available_profiles(&app.base_dir.join("profiles"));
+        apply_initial_config_to_ui(&mut app.ui, &cfg);
+        app.ui.refresh_available_profiles(&app.base_dir.join("profiles"));
         app.load_input_records_or_log();
 
-        // In normal mode, start the backend immediately.
-        if app.mode == AppMode::Normal {
-            // Ensure the basic runtime directories exist even when bypassing launcher setup.
-            for dir in ["profiles", "logs", "tmp"] {
-                let _ = fs::create_dir_all(app.base_dir.join(dir));
-            }
-            let start_result = app.start_backend_after_setup();
-            let handoff = complete_backend_handoff(&app.command_tx, start_result);
-            if let Err(err) = handoff {
-                app.return_to_launcher_with_cleanup(LauncherUiState::error(err));
-            }
-        }
+        app.try_start_backend_if_normal();
 
         app
-    }
-
-    fn check_models(&mut self) -> bool {
-        logic::check_models(&self.base_dir, &mut self.cached_model_check)
     }
 
     fn start_backend_after_setup(&mut self) -> Result<(), String> {
@@ -996,6 +450,20 @@ impl TenukiApp {
         Ok(())
     }
 
+    fn try_start_backend_if_normal(&mut self) {
+        if self.mode != AppMode::Normal {
+            return;
+        }
+        for dir in ["profiles", "logs", "tmp"] {
+            let _ = fs::create_dir_all(self.base_dir.join(dir));
+        }
+        let start_result = self.start_backend_after_setup();
+        let handoff = complete_backend_handoff(&self.command_tx, start_result);
+        if let Err(err) = handoff {
+            self.return_to_launcher_with_cleanup(LauncherUiState::error(err));
+        }
+    }
+
     fn return_to_launcher_with_cleanup(&mut self, launcher_state: LauncherUiState) {
         reset_backend_runtime(
             &mut self.command_tx,
@@ -1024,13 +492,52 @@ impl eframe::App for TenukiApp {
     }
 
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        let base_dir = self.base_dir.clone();
-        let _config_path = self.config_path.clone();
-        let _has_models = self.check_models();
-        let has_server = logic::check_llama_server(&base_dir);
+        let has_server = logic::check_llama_server(&self.base_dir);
+        let mut needs_repaint = self.handle_backend_events();
 
+        match self.mode {
+            AppMode::Launcher => {
+                let (repaint, switch_to_normal) = show_launcher_screen(
+                    ctx,
+                    &mut self.launcher_state,
+                    &self.launcher_rx,
+                    &self.launcher_tx,
+                    &mut self.launcher_thread,
+                    &self.launcher_cancel,
+                    &self.base_dir,
+                    "en",
+                );
+                if repaint {
+                    needs_repaint = true;
+                }
+                if switch_to_normal {
+                    self.mode = AppMode::Normal;
+                    self.ui
+                        .refresh_available_profiles(&self.base_dir.join("profiles"));
+                    self.ui
+                        .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
+                    let start_result = self.start_backend_after_setup();
+                    let handoff = complete_backend_handoff(&self.command_tx, start_result);
+                    if let Err(err) = handoff {
+                        self.return_to_launcher_with_cleanup(LauncherUiState::error(err));
+                    }
+                }
+            }
+            AppMode::Normal => {
+                self.poll_file_translate_scan();
+                self.poll_file_translate_preview();
+                self.handle_normal_commands(ctx, has_server);
+            }
+        }
+        if needs_repaint {
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl TenukiApp {
+    fn handle_backend_events(&mut self) -> bool {
         let mut needs_repaint = false;
-
         while let Ok(event) = self.event_rx.try_recv() {
             needs_repaint = true;
             match event {
@@ -1076,7 +583,7 @@ impl eframe::App for TenukiApp {
                     text,
                     is_error,
                 } => {
-                    self.file_translate_cancel = None;
+                    self.file_translate_ctrl.file_translate_cancel = None;
                     self.ui.set_work_running(false);
                     self.ui.finish_file_translate_progress(is_error);
                     let done_count = self.ui.display.file_translate_done;
@@ -1165,198 +672,165 @@ impl eframe::App for TenukiApp {
                 }
             }
         }
+        needs_repaint
+    }
 
-        match self.mode {
-            AppMode::Launcher => {
-                let (repaint, switch_to_normal) = show_launcher_screen(
-                    ctx,
-                    &mut self.launcher_state,
-                    &self.launcher_rx,
-                    &self.launcher_tx,
-                    &mut self.launcher_thread,
-                    &self.launcher_cancel,
-                    &self.base_dir,
-                    "en",
+    fn handle_normal_commands(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        has_server: bool,
+    ) {
+        let mut commands = self.ui.show(ctx);
+
+        if commands.exit_app {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+            return;
+        }
+
+        if !has_server && (commands.start_backend || commands.restart_backend) {
+            self.return_to_launcher_with_cleanup(LauncherUiState::error(
+                "llama-server was not found. Run setup again.".to_string(),
+            ));
+            commands.start_backend = false;
+            commands.restart_backend = false;
+        }
+
+        if commands.start_backend {
+            if has_server {
+                self.ui
+                    .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
+                self.command_tx.send(FrontendCommand::Start).ok();
+            } else {
+                self.mode = AppMode::Launcher;
+                self.launcher_state = LauncherUiState::error(
+                    "llama-server was not found. Run setup again.".to_string(),
                 );
-                if repaint {
-                    needs_repaint = true;
-                }
-
-                // When launcher setup completes, switch to normal mode and start backend.
-                if switch_to_normal {
-                    self.mode = AppMode::Normal;
-                    // Refresh profiles for the normal-mode UI.
-                    self.ui
-                        .refresh_available_profiles(&self.base_dir.join("profiles"));
-                    self.ui
-                        .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
-                    let start_result = self.start_backend_after_setup();
-                    let handoff = complete_backend_handoff(&self.command_tx, start_result);
-                    if let Err(err) = handoff {
-                        self.return_to_launcher_with_cleanup(LauncherUiState::error(err));
-                    }
-                }
+                self.launcher_cancel.store(false, Ordering::Relaxed);
+                self.launcher_thread = None;
             }
+        }
+        if commands.stop_backend {
+            self.ui
+                .set_status(StatusKey::Stopping, StatusIcon::Spinner, true);
+            self.command_tx.send(FrontendCommand::Stop).ok();
+        }
+        if commands.restart_backend {
+            if has_server {
+                self.ui
+                    .set_status(StatusKey::Restarting, StatusIcon::Spinner, true);
+                self.command_tx.send(FrontendCommand::Restart).ok();
+            } else {
+                self.mode = AppMode::Launcher;
+                self.launcher_state = LauncherUiState::error(
+                    "llama-server was not found. Run setup again.".to_string(),
+                );
+                self.launcher_cancel.store(false, Ordering::Relaxed);
+                self.launcher_thread = None;
+            }
+        }
+        if let Some(lang) = commands.set_ui_lang.take() {
+            let san = sanitize_ui_lang(&lang);
+            self.ui.update_ui_lang(&san);
+            if let Ok(mut cfg) = config::load(&self.config_path) {
+                cfg.ui_lang = san.clone();
+                let _ = config::save(&self.config_path, &cfg);
+            }
+        }
 
-            AppMode::Normal => {
-                self.poll_file_translate_scan();
-                self.poll_file_translate_preview();
-                let mut commands = self.ui.show(ctx);
+        let pending_lang_pair = commands.set_lang_pair.take();
+        if let Some((src, tgt, tgt_name, dict_slot)) = pending_lang_pair {
+            self.ui.update_src_lang(&src);
+            self.ui.update_tgt_lang(&tgt, tgt_name.as_deref());
+            let resolved_slot = match dict_slot.as_deref() {
+                Some(slot) if !slot.trim().is_empty() => slot.trim().to_string(),
+                _ => backend::manager::resolve_lang_pair_dict_slot(
+                    None,
+                    &tgt,
+                    &self.base_dir,
+                ),
+            };
+            self.command_tx
+                .send(FrontendCommand::SetLanguagePair {
+                    src,
+                    tgt,
+                    tgt_name,
+                    dict_slot: resolved_slot,
+                })
+                .ok();
+        }
+        if commands.create_new_dict_slot {
+            let tgt = self.ui.display.tgt_lang.clone();
+            let (slot, command) =
+                create_new_dict_slot_command_for_target(&tgt, &self.base_dir);
+            self.ui.update_dict_slot(Some(slot));
+            self.load_input_records_or_log();
+            self.command_tx.send(command).ok();
+        }
+        if let Some(slot) = commands.set_dict_slot.take() {
+            self.ui.update_dict_slot(Some(slot.clone()));
+            self.load_input_records_or_log();
+            self.command_tx
+                .send(FrontendCommand::SetDictSlot(slot))
+                .ok();
+        }
 
-                if commands.exit_app {
-                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
-                    return;
-                }
+        if let Some(profile_name) = commands.set_profile.take() {
+            self.ui.update_profile(&profile_name);
+            if let Ok(profile) = config::load_profile(&self.config_path, &profile_name) {
+                self.ui.update_mode(&profile.mode);
+                self.ui.update_game_text_options(profile.game_text.into());
+            }
+            self.command_tx
+                .send(FrontendCommand::SetProfile(profile_name))
+                .ok();
+        }
 
-                if !has_server && (commands.start_backend || commands.restart_backend) {
-                    self.return_to_launcher_with_cleanup(LauncherUiState::error(
-                        "llama-server was not found. Run setup again.".to_string(),
-                    ));
-                    commands.start_backend = false;
-                    commands.restart_backend = false;
-                }
+        if let Some(model_config) = commands.select_model.take() {
+            self.command_tx
+                .send(FrontendCommand::CommitModelSelection(model_config))
+                .ok();
+        }
 
-                if commands.start_backend {
-                    if has_server {
-                        self.ui
-                            .set_status(StatusKey::Starting, StatusIcon::Spinner, true);
-                        self.command_tx.send(FrontendCommand::Start).ok();
-                    } else {
-                        self.mode = AppMode::Launcher;
-                        self.launcher_state = LauncherUiState::error(
-                            "llama-server was not found. Run setup again.".to_string(),
-                        );
-                        self.launcher_cancel.store(false, Ordering::Relaxed);
-                        self.launcher_thread = None;
-                    }
-                }
-                if commands.stop_backend {
-                    self.ui
-                        .set_status(StatusKey::Stopping, StatusIcon::Spinner, true);
-                    self.command_tx.send(FrontendCommand::Stop).ok();
-                }
-                if commands.restart_backend {
-                    if has_server {
-                        self.ui
-                            .set_status(StatusKey::Restarting, StatusIcon::Spinner, true);
-                        self.command_tx.send(FrontendCommand::Restart).ok();
-                    } else {
-                        self.mode = AppMode::Launcher;
-                        self.launcher_state = LauncherUiState::error(
-                            "llama-server was not found. Run setup again.".to_string(),
-                        );
-                        self.launcher_cancel.store(false, Ordering::Relaxed);
-                        self.launcher_thread = None;
-                    }
-                }
-                if let Some(lang) = commands.set_ui_lang.take() {
-                    let san = sanitize_ui_lang(&lang);
-                    self.ui.update_ui_lang(&san);
-                    if let Ok(mut cfg) = config::load(&self.config_path) {
-                        cfg.ui_lang = san.clone();
-                        let _ = config::save(&self.config_path, &cfg);
-                    }
-                }
+        let file_translate_commands = std::mem::take(&mut commands.file_translate_commands);
+        for command in file_translate_commands {
+            self.handle_file_translate_command(command);
+        }
 
-                let pending_lang_pair = commands.set_lang_pair.take();
-                if let Some((src, tgt, tgt_name, dict_slot)) = pending_lang_pair {
-                    self.ui.update_src_lang(&src);
-                    self.ui.update_tgt_lang(&tgt, tgt_name.as_deref());
-                    let resolved_slot = match dict_slot.as_deref() {
-                        Some(slot) if !slot.trim().is_empty() => slot.trim().to_string(),
-                        _ => backend::manager::resolve_lang_pair_dict_slot(
-                            None,
-                            &tgt,
-                            &self.base_dir,
-                        ),
-                    };
-                    self.command_tx
-                        .send(FrontendCommand::SetLanguagePair {
-                            src,
-                            tgt,
-                            tgt_name,
-                            dict_slot: resolved_slot,
-                        })
-                        .ok();
-                }
-                if commands.create_new_dict_slot {
-                    let tgt = self.ui.display.tgt_lang.clone();
-                    let (slot, command) =
-                        create_new_dict_slot_command_for_target(&tgt, &self.base_dir);
-                    self.ui.update_dict_slot(Some(slot));
-                    self.load_input_records_or_log();
-                    self.command_tx.send(command).ok();
-                }
-                if let Some(slot) = commands.set_dict_slot.take() {
-                    self.ui.update_dict_slot(Some(slot.clone()));
-                    self.load_input_records_or_log();
-                    self.command_tx
-                        .send(FrontendCommand::SetDictSlot(slot))
-                        .ok();
-                }
-
-                if let Some(profile_name) = commands.set_profile.take() {
-                    self.ui.update_profile(&profile_name);
-                    if let Ok(profile) = config::load_profile(&self.config_path, &profile_name) {
-                        self.ui.update_mode(&profile.mode);
-                        self.ui.update_game_text_options(profile.game_text.into());
-                    }
-                    self.command_tx
-                        .send(FrontendCommand::SetProfile(profile_name))
-                        .ok();
-                }
-
-                if let Some(model_config) = commands.select_model.take() {
-                    self.command_tx
-                        .send(FrontendCommand::CommitModelSelection(model_config))
-                        .ok();
-                }
-
-                let file_translate_commands = std::mem::take(&mut commands.file_translate_commands);
-                for command in file_translate_commands {
-                    self.handle_file_translate_command(command);
-                }
-
-                if let Some((id, pickup)) = commands.set_input_pickup.take() {
-                    if self.ui.set_input_pickup(id, pickup) {
-                        self.save_input_records_or_log();
-                        if self.ui.state.immediate_apply {
-                            self.refresh_pickup_preview();
-                        }
-                    }
-                }
-
-                if let Some((id, note)) = commands.set_input_pickup_note.take() {
-                    if self.ui.update_input_pickup_note(id, note) {
-                        self.save_input_records_or_log();
-                        if self.ui.state.immediate_apply {
-                            self.refresh_pickup_preview();
-                        }
-                    }
-                }
-
-                let game_text_options = commands.set_game_text_options.take();
-                if let Some(options) = game_text_options.as_ref() {
-                    self.ui.update_game_text_options(*options);
-                }
-
-                if commands.refresh_pickup_preview {
+        if let Some((id, pickup)) = commands.set_input_pickup.take() {
+            if self.ui.set_input_pickup(id, pickup) {
+                self.save_input_records_or_log();
+                if self.ui.state.immediate_apply {
                     self.refresh_pickup_preview();
-                }
-
-                let update_cmd = FrontendCommand::UpdateSettings {
-                    game_text: game_text_options,
-                    server_port: commands.set_server_port.take(),
-                    server_host: commands.set_server_host.take(),
-                };
-
-                if !update_cmd.is_empty_update() {
-                    let _ = self.command_tx.send(update_cmd);
                 }
             }
         }
-        if needs_repaint {
-            ctx.request_repaint();
+
+        if let Some((id, note)) = commands.set_input_pickup_note.take() {
+            if self.ui.update_input_pickup_note(id, note) {
+                self.save_input_records_or_log();
+                if self.ui.state.immediate_apply {
+                    self.refresh_pickup_preview();
+                }
+            }
+        }
+
+        let game_text_options = commands.set_game_text_options.take();
+        if let Some(options) = game_text_options.as_ref() {
+            self.ui.update_game_text_options(*options);
+        }
+
+        if commands.refresh_pickup_preview {
+            self.refresh_pickup_preview();
+        }
+
+        let update_cmd = FrontendCommand::UpdateSettings {
+            game_text: game_text_options,
+            server_port: commands.set_server_port.take(),
+            server_host: commands.set_server_host.take(),
+        };
+
+        if !update_cmd.is_empty_update() {
+            let _ = self.command_tx.send(update_cmd);
         }
     }
 }
@@ -1628,3 +1102,4 @@ mod tests {
         ));
     }
 }
+

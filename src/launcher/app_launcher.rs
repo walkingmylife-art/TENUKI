@@ -10,40 +10,24 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use super::download;
 
 /// 診断メッセージを SubStatus で流し、launcher_debug.log にも追記する。
+#[allow(dead_code)]
 fn diag(progress_tx: &Sender<LaunchProgress>, base_dir: &Path, msg: &str) {
-    progress_tx
-        .send(LaunchProgress::SubStatus(msg.to_string()))
-        .ok();
-    let log_path = base_dir.join("launcher_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{}] {}", ts, msg);
-    }
+    download::diag(progress_tx, base_dir, msg)
 }
 
 use super::app_config::AppConfig;
 use super::backend_detector::BackendDetector;
 use super::progress::LaunchProgress;
-use super::runtime_downloader::{find_llama_server_exe, RuntimeDownloader};
-use crate::backend::process::build_llama_command;
+use super::runtime_downloader::find_llama_server_exe;
 
 /// モデルファイルが完成しているか判定する共通関数。
 ///
@@ -52,33 +36,6 @@ use crate::backend::process::build_llama_command;
 /// - sidecar (.sidecar.json) が存在しない
 /// - expected_size > 0 のとき、ファイルサイズが一致する
 /// - expected_size == 0 のときは未完成扱い（サイズ検証不能）
-fn model_is_complete(model_path: &Path, expected_size: u64) -> bool {
-    if expected_size == 0 {
-        return false;
-    }
-    let actual = match std::fs::metadata(model_path) {
-        Ok(m) => m.len(),
-        Err(_) => return false,
-    };
-    if actual != expected_size {
-        return false;
-    }
-    // サイズ一致 = 完成。stale sidecar / .part は掃除する。
-    cleanup_model_resume_artifacts(model_path);
-    true
-}
-
-fn cleanup_model_resume_artifacts(model_path: &Path) {
-    let sidecar = PathBuf::from(format!("{}.sidecar.json", model_path.display()));
-    if sidecar.exists() {
-        let _ = std::fs::remove_file(&sidecar);
-    }
-    let part = model_path.with_extension("part");
-    if part.exists() {
-        let _ = std::fs::remove_file(&part);
-    }
-}
-
 fn push_unique_candidate(out: &mut Vec<BackendCandidate>, candidate: BackendCandidate) {
     if out.iter().all(|existing| existing.name != candidate.name) {
         out.push(candidate);
@@ -166,137 +123,23 @@ impl std::fmt::Display for CheckReadyReason {
 }
 
 /// runtime とモデルが揃っているか確認し、不足の場合は理由を返す。
-/// - launcher_config.toml は install_root から読む（権威位置）
-/// - models/, runtime/ は base_dir から読む
 pub fn check_ready_detail(base_dir: &std::path::Path) -> Result<(), CheckReadyReason> {
-    use crate::launcher::runtime_downloader::runtime_is_complete;
-
-    let install_root = super::resolve_install_root();
-    let config_path = install_root.join("launcher_config.toml");
-    let config = match super::app_config::AppConfig::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let reason = CheckReadyReason::ConfigLoadFail(e.to_string());
-            diag_file(base_dir, &format!("[check_ready] {}", reason));
-            return Err(reason);
-        }
-    };
-
-    let backend = &config.backend;
-    let runtime_dir = base_dir.join("runtime").join(backend);
-    let rt_ok = runtime_is_complete(&runtime_dir, backend);
-    diag_file(
-        base_dir,
-        &format!(
-            "[check_ready] runtime_is_complete backend={} rt_ok={}",
-            backend, rt_ok
-        ),
-    );
-    if !rt_ok {
-        return Err(CheckReadyReason::RuntimeIncomplete {
-            backend: backend.clone(),
-        });
-    }
-
-    let available_models = crate::backend::find_available_models(&base_dir.to_path_buf())
-        .into_iter()
-        .filter(|candidate| candidate.size > 0)
-        .collect::<Vec<_>>();
-    if available_models.is_empty() {
-        return Err(CheckReadyReason::NoModelsAvailable);
-    }
-
-    let filename = config.model.filename().to_string();
-    let expected_size = config.model.expected_size();
-    let is_known = config.model.is_known();
-    let model_path = base_dir.join("models").join(&filename);
-
-    let actual_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
-    diag_file(
-        base_dir,
-        &format!(
-            "[check_ready] model filename={} kind={} expected={} actual={}",
-            filename,
-            if is_known { "Known" } else { "Local" },
-            expected_size,
-            actual_size
-        ),
-    );
-
-    if actual_size == expected_size && expected_size > 0 {
-        cleanup_model_resume_artifacts(&model_path);
-        diag_file(base_dir, "[check_ready] true (authority model matched)");
-        return Ok(());
-    }
-
-    if crate::backend::resolve_startup_model(&config, &available_models).is_some() {
-        diag_file(
-            base_dir,
-            &format!(
-                "[check_ready] authority model unavailable, but startup model resolved from {} candidate(s)",
-                available_models.len()
-            ),
-        );
-        return Ok(());
-    }
-    if available_models.len() > 1 {
-        diag_file(
-            base_dir,
-            &format!(
-                "[check_ready] {} candidates exist but startup model unresolvable",
-                available_models.len()
-            ),
-        );
-        return Err(CheckReadyReason::StartupModelUnresolved);
-    }
-
-    if actual_size == 0 {
-        return if is_known {
-            Err(CheckReadyReason::ModelMissing { filename })
-        } else {
-            Err(CheckReadyReason::LocalModelMissing { filename })
-        };
-    }
-    if actual_size != expected_size || expected_size == 0 {
-        return if is_known {
-            Err(CheckReadyReason::ModelSizeMismatch {
-                filename,
-                expected: expected_size,
-                actual: actual_size,
-            })
-        } else {
-            Err(CheckReadyReason::LocalModelChanged {
-                filename,
-                expected: expected_size,
-                actual: actual_size,
-            })
-        };
-    }
-
-    // サイズ一致 = 完成。stale sidecar / .part は掃除する。
-    cleanup_model_resume_artifacts(&model_path);
-    diag_file(base_dir, "[check_ready] → true");
-    Ok(())
+    download::check_ready_detail(base_dir)
 }
 
-// re-export ModelConfig for use in app_launcher
-use super::app_config::ModelConfig;
-
-/// runtime とモデルが揃っているか確認する（bool 版）。
-/// main.rs でモードを決定するために使用される。
 pub fn check_ready(base_dir: &std::path::Path) -> bool {
-    check_ready_detail(base_dir).is_ok()
+    download::check_ready(base_dir)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendCandidateReason {
+pub(crate) enum BackendCandidateReason {
     AuthorityConfig,
     GpuDetection,
     InstalledRuntime,
 }
 
 impl BackendCandidateReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AuthorityConfig => "authority_config",
             Self::GpuDetection => "gpu_detection",
@@ -306,9 +149,9 @@ impl BackendCandidateReason {
 }
 
 #[derive(Debug, Clone)]
-struct BackendCandidate {
-    name: String,
-    reason: BackendCandidateReason,
+pub(crate) struct BackendCandidate {
+    pub(crate) name: String,
+    pub(crate) reason: BackendCandidateReason,
 }
 
 impl BackendCandidate {
@@ -327,9 +170,9 @@ struct BackendPlan {
 }
 
 #[derive(Debug, Clone)]
-struct VerifiedBackendCandidate {
-    candidate: BackendCandidate,
-    exe_path: PathBuf,
+pub struct VerifiedBackendCandidate {
+    pub candidate: BackendCandidate,
+    pub exe_path: PathBuf,
 }
 
 pub struct AppLauncher {
@@ -628,141 +471,7 @@ impl AppLauncher {
         progress_tx: &Sender<LaunchProgress>,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<PathBuf> {
-        let expected = self.config.model.expected_size();
-        let filename = self.config.model.filename().to_string();
-        if expected == 0 {
-            diag(
-                progress_tx,
-                &self.base_dir,
-                "[ensure_model] ERROR: expected_size == 0 in launcher_config.toml",
-            );
-            anyhow::bail!(
-                "model.expected_size is 0 in launcher_config.toml. \
-                 Set it to the correct file size in bytes."
-            );
-        }
-
-        let model_dir = self.base_dir.join("models");
-        let model_path = model_dir.join(&filename);
-
-        let complete = model_is_complete(&model_path, expected);
-        diag(
-            progress_tx,
-            &self.base_dir,
-            &format!(
-                "[ensure_model] filename={} kind={} exists={} expected_size={} complete={}",
-                filename,
-                if self.config.model.is_known() {
-                    "Known"
-                } else {
-                    "Local"
-                },
-                model_path.exists(),
-                expected,
-                complete
-            ),
-        );
-        if complete {
-            diag(
-                progress_tx,
-                &self.base_dir,
-                "[ensure_model] → reuse existing model",
-            );
-            return Ok(model_path);
-        }
-
-        // authority model が不完全でも、別の完成済み .gguf があればそちらを使う。
-        // ダウンロードを起動する前にチェックする。
-        let alternative = std::fs::read_dir(&model_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let is_gguf = path.extension().map(|e| e == "gguf").unwrap_or(false);
-                let is_other = path.file_name().and_then(|n| n.to_str()) != Some(filename.as_str());
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if is_gguf && is_other && size > 0 {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .next();
-        if let Some(alt_path) = alternative {
-            diag(
-                progress_tx,
-                &self.base_dir,
-                &format!(
-                    "[ensure_model] authority incomplete, using alternative: {}",
-                    alt_path.display()
-                ),
-            );
-            return Ok(alt_path);
-        }
-
-        // Local model: download 不可。ユーザーに再配置/再選択を促す。
-        if let ModelConfig::Local { .. } = &self.config.model {
-            diag(
-                progress_tx,
-                &self.base_dir,
-                &format!(
-                    "[ensure_model] Local model missing, cannot download: {}",
-                    filename
-                ),
-            );
-            anyhow::bail!(
-                "Local model '{}' not found in models/. \
-                 Restore the file or select another model.",
-                filename
-            );
-        }
-
-        // Known model: download パス
-        let ModelConfig::Known { urls, .. } = &self.config.model else {
-            unreachable!()
-        };
-
-        // 不完全なファイルが残っている場合は削除して再取得
-        // (sidecar ありの場合は download_model 側が再開する)
-        if model_path.exists() {
-            let sidecar = PathBuf::from(format!("{}.sidecar.json", model_path.display()));
-            if !sidecar.exists() {
-                diag(
-                    progress_tx,
-                    &self.base_dir,
-                    "[ensure_model] incomplete (no sidecar, bad size) → remove and re-download",
-                );
-                std::fs::remove_file(&model_path)?;
-            }
-        }
-
-        progress_tx
-            .send(LaunchProgress::Status(
-                self.t("Downloading model...", "モデルをダウンロード中..."),
-            ))
-            .ok();
-        progress_tx
-            .send(LaunchProgress::SubStatus(self.t(
-                &format!("Fetching: {}", filename),
-                &format!("取得中: {}", filename),
-            )))
-            .ok();
-
-        let downloader = RuntimeDownloader::with_cancel_flag(cancel_flag.clone())?;
-        let _used_url_opt = downloader.download_model(
-            &urls.primary,
-            urls.fallback.as_deref(),
-            &model_path,
-            expected,
-            |progress, _| {
-                // この progress はモデルダウンロード単体の進捗（0.0～1.0）
-                progress_tx.send(LaunchProgress::Progress(progress)).ok();
-            },
-        )?;
-
-        Ok(model_path)
+        download::ensure_model(&self.base_dir, &self.config.model, &self.ui_lang, progress_tx, cancel_flag)
     }
 
     fn build_backend_plan(&self) -> BackendPlan {
@@ -857,7 +566,7 @@ impl AppLauncher {
                 self.t("Verifying runtime...", "ランタイム検証中..."),
             ))
             .ok();
-        self.test_backend_exe(&exe_path, model_path)?;
+        download::test_backend_exe(&self.http_client, &self.config, &exe_path, model_path, &self.base_dir)?;
         diag(
             progress_tx,
             &self.base_dir,
@@ -881,156 +590,9 @@ impl AppLauncher {
         progress_tx: &Sender<LaunchProgress>,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<VerifiedBackendCandidate> {
-        let name = &candidate.name;
-        let runtime_dir = self.base_dir.join("runtime").join(name);
-
-        self.ensure_runtime(name, &runtime_dir, progress_tx, cancel_flag)?;
-        let exe_path = find_llama_server_exe(&runtime_dir)
-            .ok_or_else(|| anyhow!("llama-server not found in {}", runtime_dir.display()))?;
-
-        progress_tx
-            .send(LaunchProgress::SubStatus(
-                self.t("Verifying runtime...", "ランタイム検証中..."),
-            ))
-            .ok();
-        self.test_backend_exe(&exe_path, model_path)?;
-
-        diag(
-            progress_tx,
-            &self.base_dir,
-            &format!(
-                "[try_backend] verified backend={} reason={} exe={}",
-                name,
-                candidate.reason.as_str(),
-                exe_path.display()
-            ),
-        );
-
-        Ok(VerifiedBackendCandidate {
-            candidate: candidate.clone(),
-            exe_path,
-        })
+        download::try_backend(&self.base_dir, &self.config, &self.http_client, &self.ui_lang, candidate, model_path, progress_tx, cancel_flag)
     }
 
-    fn ensure_runtime(
-        &self,
-        name: &str,
-        dest_dir: &Path,
-        progress_tx: &Sender<LaunchProgress>,
-        cancel_flag: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        let rt_ok = self.has_complete_runtime(name);
-        diag(
-            progress_tx,
-            &self.base_dir,
-            &format!("[ensure_runtime] backend={} rt_ok={}", name, rt_ok),
-        );
-        if rt_ok {
-            return Ok(());
-        }
-
-        progress_tx
-            .send(LaunchProgress::Status(self.t(
-                &format!("Downloading {} runtime...", name),
-                &format!("{} ランタイムをダウンロード中...", name),
-            )))
-            .ok();
-
-        let assets = self
-            .config
-            .runtime_urls
-            .for_backend(name)
-            .ok_or_else(|| anyhow!("Unsupported backend: {}", name))?;
-
-        let downloader = RuntimeDownloader::with_cancel_flag(cancel_flag.clone())?;
-        let _used_url = downloader.download_backend(
-            name,
-            &assets.primary,
-            &assets.extra_assets,
-            assets.fallback.as_deref(),
-            dest_dir,
-            |progress, _| {
-                // ランタイムダウンロード単体の進捗（0.0～1.0）
-                progress_tx.send(LaunchProgress::Progress(progress)).ok();
-            },
-        )?;
-        Ok(())
-    }
-
-    /// バックエンド実行ファイルの検証。
-    /// 必ず動的ポートを使用する。build_llama_command を使い本番起動と引数を完全一致させる。
-    fn test_backend_exe(&self, exe_path: &Path, model_path: &Path) -> Result<()> {
-        let test_port = find_free_port()?;
-        let s = &self.config.server;
-        let mut cmd = build_llama_command(
-            exe_path,
-            model_path,
-            test_port,
-            s.ngl,
-            s.ctx_size,
-            s.parallel_slots,
-            &s.extra_args,
-        );
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let mut child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("Failed to spawn test backend: {}", exe_path.display()))?;
-
-        if let Some(stderr) = child.stderr.take() {
-            thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
-        }
-
-        let result = self.wait_for_healthy_process(&mut child, test_port, Duration::from_secs(120));
-        let _ = child.kill();
-        let _ = child.wait();
-        result
-    }
-
-    fn wait_for_healthy_process(
-        &self,
-        child: &mut Child,
-        port: u16,
-        timeout: Duration,
-    ) -> Result<()> {
-        let start = Instant::now();
-        let interval = Duration::from_millis(500);
-        loop {
-            match child.try_wait()? {
-                Some(status) => anyhow::bail!("llama-server exited early: {}", status),
-                None => {
-                    if self.check_health(port).is_ok() {
-                        return Ok(());
-                    }
-                    if start.elapsed() > timeout {
-                        anyhow::bail!("Health check timeout");
-                    }
-                }
-            }
-            thread::sleep(interval);
-        }
-    }
-
-    fn check_health(&self, port: u16) -> Result<()> {
-        let url = format!("http://127.0.0.1:{}/health", port);
-        let resp = self.http_client.get(&url).send()?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            anyhow::bail!("Health endpoint returned {}", resp.status())
-        }
-    }
-
-    /// profiles/game.toml と profiles/normal.toml を shipped default で生成する。
-    /// game.toml が旧 shipped bad prompt のままの場合は公式文面に修復する。
     fn seed_profiles(&self) -> Result<()> {
         use super::translation_profile::TranslationProfile;
         let profiles_dir = self.base_dir.join("profiles");
@@ -1057,28 +619,6 @@ impl AppLauncher {
 
         Ok(())
     }
-}
-
-/// check_ready 用：progress_tx なしでファイルだけに書く。
-fn diag_file(base_dir: &Path, msg: &str) {
-    let log_path = base_dir.join("launcher_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{}] {}", ts, msg);
-    }
-}
-
-/// 空きポートを動的に取得する（127.0.0.1 固定）
-fn find_free_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
 }
 
 #[cfg(test)]

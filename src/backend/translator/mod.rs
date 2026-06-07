@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn bare_zm_with_spaces_uses_wrapped_transport_number() {
         let mapping = build_zm_number_mapping("foo ZMCZ bar").unwrap();
-        assert_eq!(mapping.sent_text, "foo 「2」 bar");
+        assert_eq!(mapping.sent_text, "foo 「3」 bar");
         assert!(mapping.replacements[0].transport_wrapped);
         assert!(mapping.replacements[0].transport_left_space);
         assert!(mapping.replacements[0].transport_right_space);
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn bare_zm_at_start_uses_wrapped_transport_number() {
         let mapping = build_zm_number_mapping("ZMCZ bar").unwrap();
-        assert_eq!(mapping.sent_text, "「2」 bar");
+        assert_eq!(mapping.sent_text, "「3」 bar");
         assert!(mapping.replacements[0].transport_wrapped);
         assert!(!mapping.replacements[0].transport_left_space);
         assert!(mapping.replacements[0].transport_right_space);
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn bare_zm_at_end_uses_wrapped_transport_number() {
         let mapping = build_zm_number_mapping("foo ZMCZ").unwrap();
-        assert_eq!(mapping.sent_text, "foo 「2」");
+        assert_eq!(mapping.sent_text, "foo 「3」");
         assert!(mapping.replacements[0].transport_wrapped);
         assert!(mapping.replacements[0].transport_left_space);
         assert!(!mapping.replacements[0].transport_right_space);
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn adjacent_text_zm_stays_unwrapped() {
         let mapping = build_zm_number_mapping("fooZMCZbar").unwrap();
-        assert_eq!(mapping.sent_text, "foo2bar");
+        assert_eq!(mapping.sent_text, "foo3bar");
         assert!(!mapping.replacements[0].transport_wrapped);
     }
 

@@ -54,6 +54,16 @@ fn normalize_digit_char(ch: char) -> Option<char> {
     match ch {
         '0'..='9' => Some(ch),
         '\u{FF10}'..='\u{FF19}' => char::from_u32(ch as u32 - 0xFF10 + '0' as u32),
+        '〇' | '零' => Some('0'),
+        '一' | '壹' => Some('1'),
+        '二' | '贰' | '兩' | '两' => Some('2'),
+        '三' | '叁' => Some('3'),
+        '四' | '肆' => Some('4'),
+        '五' | '伍' => Some('5'),
+        '六' | '陆' | '陸' => Some('6'),
+        '七' | '柒' => Some('7'),
+        '八' | '捌' => Some('8'),
+        '九' | '玖' => Some('9'),
         _ => None,
     }
 }
@@ -246,15 +256,7 @@ pub(super) fn build_zm_number_mapping(text: &str) -> Option<ZmNumberMapping> {
     let mut replacements: Vec<ZmReplacement> = Vec::new();
     let mut index = 0usize;
 
-    // --- 予防策: 漢数字との衝突を回避 ---
-    let mut existing = collect_existing_number_tokens(text);
-    for ch in text.chars() {
-        if let Some(ascii) = cjk_digit_to_ascii(ch) {
-            existing.insert(ascii.to_string());
-        }
-    }
-    // --- ここまで ---
-
+    let existing = collect_existing_number_tokens(text);
     let mut counter = 2usize;
 
     while index < chars.len() {

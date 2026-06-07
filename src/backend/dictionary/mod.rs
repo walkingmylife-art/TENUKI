@@ -1,48 +1,22 @@
 //! Translation dictionary loading and persistence.
 
-use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use memmap2::Mmap;
-use regex::Regex;
+use ::regex::Regex;
 use rustc_hash::FxHashMap;
 
 use crate::messages::{BackendEvent, LogLevel, LogSource, current_timestamp};
 
-const DICT_BIN_MAGIC: &[u8; 8] = b"TENUKI2\0";
-const DICT_BIN_VERSION: u32 = 2;
-const DICT_BIN_HEADER_LEN: usize = 40;
-const DICT_BIN_TABLE_ENTRY_LEN: usize = 16;
-
-#[derive(Clone)]
-struct RegexRule {
-    pattern: Regex,
-    replacement: String,
-    #[allow(dead_code)]
-    source_pattern: String,
-}
-
-#[derive(Clone)]
-struct SplitRule {
-    pattern: Regex,
-    replacement: String,
-    #[allow(dead_code)]
-    source_pattern: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct SplitResult {
-    pub full_match_start: usize,
-    pub full_match_end: usize,
-    pub inner_groups: Vec<Option<(usize, usize)>>,
-    pub replacement: String,
-}
+pub(crate) const DICT_BIN_MAGIC: &[u8; 8] = b"TENUKI2\0";
+pub(crate) const DICT_BIN_VERSION: u32 = 2;
+pub(crate) const DICT_BIN_HEADER_LEN: usize = 40;
+pub(crate) const DICT_BIN_TABLE_ENTRY_LEN: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EntryOrigin {
+pub(crate) struct EntryOrigin {
     path: PathBuf,
     line_number: usize,
 }
@@ -55,16 +29,8 @@ struct RawExactEntry {
     order: u64,
 }
 
-#[derive(Clone, Debug)]
-struct RawRegexEntry {
-    pattern: String,
-    replacement: String,
-    origin: EntryOrigin,
-    order: u64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AcceptedExactEntry {
+pub(crate) struct AcceptedExactEntry {
     source: String,
     value: String,
 }
@@ -97,18 +63,20 @@ pub struct DictBuildReport {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ParsedHeader {
-    version: u32,
-    exact_count: u32,
-    exact_table_offset: u64,
-    string_blob_offset: u64,
-    string_blob_len: u64,
+pub(crate) struct ParsedHeader {
+    pub(crate) version: u32,
+    pub(crate) exact_count: u32,
+    pub(crate) exact_table_offset: u64,
+    pub(crate) string_blob_offset: u64,
+    pub(crate) string_blob_len: u64,
 }
 
-struct DictBinIndex {
-    mmap: Mmap,
-    header: ParsedHeader,
-}
+pub(crate) mod bin_format;
+pub(crate) mod regex;
+pub(crate) mod split;
+pub(crate) use bin_format::{save_dict_bin, DictBinIndex};
+pub(crate) use regex::{compile_regex_entries, is_tenuki_regex_file, try_parse_regex_rule, RawRegexEntry, RegexRule};
+pub(crate) use split::{is_tenuki_split_file, load_split_rules, SplitResult, SplitRule};
 
 fn is_excluded(file_name: &str) -> bool {
     file_name == "_Preprocessors.txt"
@@ -128,23 +96,6 @@ fn is_tenuki_dict_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_tenuki_regex_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name.eq_ignore_ascii_case("Tenuki.regex.txt"))
-        .unwrap_or(false)
-}
-
-fn is_tenuki_split_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| {
-            name.to_lowercase().starts_with("tenuki.split")
-                && name.to_lowercase().ends_with(".txt")
-        })
-        .unwrap_or(false)
-}
-
 fn is_readable_normal_txt(path: &Path) -> bool {
     if !is_txt_file(path)
         || is_tenuki_dict_file(path)
@@ -160,7 +111,7 @@ fn is_readable_normal_txt(path: &Path) -> bool {
     !is_excluded(file_name)
 }
 
-fn sorted_dir_entries(root_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn sorted_dir_entries(root_dir: &Path) -> Vec<PathBuf> {
     let mut paths = std::fs::read_dir(root_dir)
         .map(|entries| {
             entries
@@ -230,39 +181,6 @@ fn read_txt_into(path: &Path, loaded: &mut RawTxtData) -> usize {
     count
 }
 
-fn try_parse_regex_rule(line: &str) -> Option<(String, String)> {
-    if !line.starts_with("r:\"") {
-        return None;
-    }
-    let after_prefix = &line[3..];
-
-    let close_quote = after_prefix.find('"')?;
-    let pattern = after_prefix[..close_quote].to_string();
-    let after_quote = &after_prefix[close_quote + 1..];
-
-    if !after_quote.starts_with('=') {
-        return None;
-    }
-    let replacement = after_quote[1..].to_string();
-    Some((pattern, replacement))
-}
-
-fn try_parse_split_rule(line: &str) -> Option<(String, String)> {
-    if !line.starts_with("s:\"") {
-        return None;
-    }
-    let after_prefix = &line[3..];
-    let close_quote = after_prefix.find('"')?;
-    let pattern = after_prefix[..close_quote].to_string();
-    let after_quote = &after_prefix[close_quote + 1..];
-    let replacement = if after_quote.starts_with('=') {
-        after_quote[1..].to_string()
-    } else {
-        String::new()
-    };
-    Some((pattern, replacement))
-}
-
 fn load_txt_files(root_dir: &Path) -> RawTxtData {
     let mut loaded = RawTxtData::default();
     let root_entries = sorted_dir_entries(root_dir);
@@ -293,130 +211,6 @@ fn load_txt_files(root_dir: &Path) -> RawTxtData {
     }
 
     loaded
-}
-
-fn load_split_rules(root_dir: &Path) -> (Vec<SplitRule>, Vec<String>) {
-    let mut rules = Vec::new();
-    let mut warnings = Vec::new();
-    let root_entries = sorted_dir_entries(root_dir);
-
-    for path in root_entries.iter().filter(|path| path.is_dir()) {
-        for sub_path in sorted_dir_entries(path) {
-            if is_tenuki_split_file(&sub_path) {
-                read_split_file(&sub_path, &mut rules, &mut warnings);
-            }
-        }
-    }
-
-    for path in root_entries.iter().filter(|path| is_tenuki_split_file(path)) {
-        read_split_file(path, &mut rules, &mut warnings);
-    }
-
-    rules.sort_by(|a, b| b.source_pattern.len().cmp(&a.source_pattern.len()));
-    (rules, warnings)
-}
-
-fn read_split_file(path: &Path, rules: &mut Vec<SplitRule>, warnings: &mut Vec<String>) {
-    if let Ok(file) = File::open(path) {
-        let reader = BufReader::new(file);
-        for (line_index, line) in reader.lines().enumerate() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => continue,
-            };
-            let line = if line_index == 0 {
-                line.strip_prefix('\u{feff}').unwrap_or(&line)
-            } else {
-                &line
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some((pattern, replacement)) = try_parse_split_rule(line) {
-                if replacement.contains('\u{ff04}') {
-                    let msg = format!(
-                        "× [SPLIT] {}:{} fullwidth $ in replacement",
-                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                        line_index + 1,
-                    );
-                    warnings.push(msg.clone());
-                    log::warn!("{} — {}", msg, line);
-                }
-                match Regex::new(&pattern) {
-                    Ok(re) => rules.push(SplitRule {
-                        pattern: re,
-                        replacement,
-                        source_pattern: pattern,
-                    }),
-                    Err(e) => {
-                        let msg = format!(
-                            "× [SPLIT] {}:{} regex error — {}",
-                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                            line_index + 1,
-                            pattern,
-                        );
-                        warnings.push(msg.clone());
-                        log::warn!("{} ({})", msg, e);
-                    }
-                }
-            } else if line.starts_with('s') {
-                let msg = format!(
-                    "× [SPLIT] {}:{} parse error — {}",
-                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                    line_index + 1,
-                    line
-                );
-                warnings.push(msg.clone());
-                log::warn!("{}", msg);
-            }
-        }
-    }
-}
-
-fn compile_regex_entries(
-    raw_regex: &[RawRegexEntry],
-    report: &mut DictBuildReport,
-) -> Vec<RegexRule> {
-    let mut by_pattern: FxHashMap<String, RawRegexEntry> = FxHashMap::default();
-    for entry in raw_regex {
-        if by_pattern
-            .insert(entry.pattern.clone(), entry.clone())
-            .is_some()
-        {
-            report.duplicate_regex_dropped += 1;
-        }
-    }
-
-    let mut accepted = by_pattern.into_values().collect::<Vec<_>>();
-    accepted.sort_by_key(|entry| entry.order);
-
-    let mut rules = Vec::new();
-    for entry in accepted {
-        match Regex::new(&entry.pattern) {
-            Ok(pattern) => rules.push(RegexRule {
-                pattern,
-                replacement: entry.replacement,
-                source_pattern: entry.pattern,
-            }),
-            Err(e) => {
-                report.warnings.push(format!(
-                    "× [REGEX] {}:{} regex error — {}",
-                    entry.origin.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                    entry.origin.line_number,
-                    entry.pattern
-                ));
-                log::warn!(
-                    "[REGEX_RULE] compile failed at {}:{} — {} ({})",
-                    entry.origin.path.display(),
-                    entry.origin.line_number,
-                    entry.pattern,
-                    e
-                );
-            }
-        }
-    }
-    report.accepted_regex = rules.len();
-    rules
 }
 
 fn collect_value_index(entries: &[AcceptedExactEntry]) -> FxHashMap<String, String> {
@@ -493,173 +287,6 @@ fn build_entry_sets(txt_root: &Path) -> (Vec<AcceptedExactEntry>, Vec<RegexRule>
     let exact_entries = accepted_exact_entries(&raw.exact_entries, &regex_rules, &mut report);
 
     (exact_entries, regex_rules, report)
-}
-
-fn write_u32<W: Write>(writer: &mut W, value: u32) -> io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
-}
-
-fn write_u64<W: Write>(writer: &mut W, value: u64) -> io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let bytes: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
-    Some(u32::from_le_bytes(bytes))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    let bytes: [u8; 8] = bytes.get(offset..end)?.try_into().ok()?;
-    Some(u64::from_le_bytes(bytes))
-}
-
-fn checked_u32(value: usize, field: &'static str) -> io::Result<u32> {
-    u32::try_from(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, field))
-}
-
-fn save_dict_bin(bin_file: &Path, entries: &[AcceptedExactEntry]) -> io::Result<usize> {
-    if let Some(parent) = bin_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut blob = Vec::new();
-    let mut table = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let key_offset = checked_u32(blob.len(), "key offset too large")?;
-        blob.extend_from_slice(entry.source.as_bytes());
-        let key_len = checked_u32(entry.source.len(), "key length too large")?;
-        let value_offset = checked_u32(blob.len(), "value offset too large")?;
-        blob.extend_from_slice(entry.value.as_bytes());
-        let value_len = checked_u32(entry.value.len(), "value length too large")?;
-        table.push((key_offset, key_len, value_offset, value_len));
-    }
-
-    let exact_table_offset = DICT_BIN_HEADER_LEN as u64;
-    let string_blob_offset = exact_table_offset + (table.len() * DICT_BIN_TABLE_ENTRY_LEN) as u64;
-    let tmp_file = bin_file.with_extension("bin.tmp");
-
-    {
-        let mut file = File::create(&tmp_file)?;
-        file.write_all(DICT_BIN_MAGIC)?;
-        write_u32(&mut file, DICT_BIN_VERSION)?;
-        write_u32(
-            &mut file,
-            checked_u32(entries.len(), "exact count too large")?,
-        )?;
-        write_u64(&mut file, exact_table_offset)?;
-        write_u64(&mut file, string_blob_offset)?;
-        write_u64(&mut file, blob.len() as u64)?;
-
-        for (key_offset, key_len, value_offset, value_len) in table {
-            write_u32(&mut file, key_offset)?;
-            write_u32(&mut file, key_len)?;
-            write_u32(&mut file, value_offset)?;
-            write_u32(&mut file, value_len)?;
-        }
-        file.write_all(&blob)?;
-        file.sync_all()?;
-    }
-
-    if bin_file.exists() {
-        std::fs::remove_file(bin_file)?;
-    }
-    std::fs::rename(&tmp_file, bin_file)?;
-    Ok(blob.len())
-}
-
-fn parse_dict_bin_header(bytes: &[u8]) -> Option<ParsedHeader> {
-    if bytes.len() < DICT_BIN_HEADER_LEN || bytes.get(0..8)? != DICT_BIN_MAGIC {
-        return None;
-    }
-    let header = ParsedHeader {
-        version: read_u32(bytes, 8)?,
-        exact_count: read_u32(bytes, 12)?,
-        exact_table_offset: read_u64(bytes, 16)?,
-        string_blob_offset: read_u64(bytes, 24)?,
-        string_blob_len: read_u64(bytes, 32)?,
-    };
-    if header.version != DICT_BIN_VERSION {
-        return None;
-    }
-
-    let table_len = (header.exact_count as usize).checked_mul(DICT_BIN_TABLE_ENTRY_LEN)?;
-    let table_end = (header.exact_table_offset as usize).checked_add(table_len)?;
-    let blob_end =
-        (header.string_blob_offset as usize).checked_add(header.string_blob_len as usize)?;
-    if header.exact_table_offset as usize != DICT_BIN_HEADER_LEN
-        || table_end > bytes.len()
-        || blob_end > bytes.len()
-        || table_end > header.string_blob_offset as usize
-    {
-        return None;
-    }
-    Some(header)
-}
-
-impl DictBinIndex {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let header = parse_dict_bin_header(&mmap)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid dict.bin v2"))?;
-        Ok(Self { mmap, header })
-    }
-
-    fn table_entry(&self, index: usize) -> Option<(usize, usize, usize, usize)> {
-        if index >= self.header.exact_count as usize {
-            return None;
-        }
-        let offset = (self.header.exact_table_offset as usize)
-            .checked_add(index.checked_mul(DICT_BIN_TABLE_ENTRY_LEN)?)?;
-        Some((
-            read_u32(&self.mmap, offset)? as usize,
-            read_u32(&self.mmap, offset + 4)? as usize,
-            read_u32(&self.mmap, offset + 8)? as usize,
-            read_u32(&self.mmap, offset + 12)? as usize,
-        ))
-    }
-
-    fn blob_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let blob_start = self.header.string_blob_offset as usize;
-        let start = blob_start.checked_add(offset)?;
-        let end = start.checked_add(len)?;
-        let blob_end = blob_start.checked_add(self.header.string_blob_len as usize)?;
-        if end > blob_end {
-            return None;
-        }
-        self.mmap.get(start..end)
-    }
-
-    fn key_bytes(&self, index: usize) -> Option<&[u8]> {
-        let (key_offset, key_len, _, _) = self.table_entry(index)?;
-        self.blob_slice(key_offset, key_len)
-    }
-
-    fn value_string(&self, index: usize) -> Option<String> {
-        let (_, _, value_offset, value_len) = self.table_entry(index)?;
-        std::str::from_utf8(self.blob_slice(value_offset, value_len)?)
-            .ok()
-            .map(str::to_string)
-    }
-
-    fn lookup(&self, source: &str) -> Option<String> {
-        let needle = source.as_bytes();
-        let mut low = 0usize;
-        let mut high = self.header.exact_count as usize;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let key = self.key_bytes(mid)?;
-            match key.cmp(needle) {
-                Ordering::Less => low = mid + 1,
-                Ordering::Greater => high = mid,
-                Ordering::Equal => return self.value_string(mid),
-            }
-        }
-        None
-    }
 }
 
 fn ensure_bom_file(path: &Path) {

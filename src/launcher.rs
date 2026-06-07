@@ -4,15 +4,17 @@ pub mod app_config;
 mod app_launcher;
 mod backend_detector;
 mod config_preflight;
-mod launcher_ui;
+pub(crate) mod download;
 mod migration;
 mod progress;
 pub(crate) mod runtime_downloader;
+mod setup_ui;
 mod translation_profile;
 
-pub use app_launcher::{check_ready_detail, AppLauncher, CheckReadyReason};
+pub use app_launcher::{AppLauncher, CheckReadyReason, VerifiedBackendCandidate};
 pub use config_preflight::preflight_runtime_config_for_startup;
-pub use launcher_ui::{show_launcher_screen, LauncherEntryIntent, LauncherStep, LauncherUiState};
+pub use download::check_ready_detail;
+pub use setup_ui::{show_launcher_screen, LauncherEntryIntent, LauncherStep, LauncherUiState};
 pub use progress::LaunchProgress;
 
 use std::path::PathBuf;

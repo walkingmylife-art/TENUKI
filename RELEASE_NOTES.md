@@ -1,6 +1,13 @@
 # TENUKI - Release Notes
 
 ---
+
+## Version 1.2.5
+
+- **Model Change**: Changed the default model to HY-MT2.
+- **Background Text**: As the system has become slightly more instruction-following capable, a background text field has been added to TOML (now supporting styles such as martial arts fantasy).
+- **Batch Removal**: Removed batch processing because it had settings that wasted VRAM without actually functioning.
+
 ### Version 1.2.0
 - **Dictionary system overhaul**
  Changed to register entries containing variables (Attack +5%) in a separate dictionary.
@@ -135,6 +142,13 @@
 # TENUKI - リリースノート
 
 ---
+
+### Version 1.2.5
+  モデル変更　　DefaultのモデルをHY-MT2へ変更。
+  背景テキスト　指示が少しできるようになったのに伴い、バックグラウンドテキスト欄をTOMLに追加（武侠風などが可能に）
+  バッチ廃止　　実際に機能が働いてないのに設定だけありVRAMを無駄にしていたので廃止。
+
+
 ### Version 1.2.0
   **辞書システム改修**　　　
   攻撃+5％など変数があるものを別辞書にまとめて登録するように変更

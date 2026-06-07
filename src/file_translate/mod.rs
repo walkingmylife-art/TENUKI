@@ -20,6 +20,7 @@
 
 pub mod asset_intake;
 pub mod commands;
+pub mod controller;
 pub mod preview;
 pub mod runner;
 pub mod state;

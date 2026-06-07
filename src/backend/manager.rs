@@ -2,10 +2,8 @@
 
 //! バックエンド管理モジュール
 
-use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -17,7 +15,7 @@ use tokio::sync::RwLock;
 
 use crate::backend::analysis::{self, SharedInputReplayState};
 use crate::backend::dictionary::Dictionary;
-use crate::backend::process::LlamaProcess;
+use crate::backend::engine::{self, EngineManager, EngineWaitKind};
 use crate::backend::server;
 use crate::backend::translator::TranslationSettings;
 use crate::backend::translator::{HttpLlmClient, LlmClient, NewEntriesCache, TranslationCache};
@@ -26,165 +24,7 @@ use crate::config::{Config, GameTextOptions};
 use crate::launcher::app_config::ServerConfig;
 use crate::messages::{BackendEvent, LogLevel, LogSource, ProcessType};
 
-// ============================================================
-// スロット管理ユーティリティ
-// ============================================================
-
-fn max_existing_slot_num(text_dir: &Path, lang: &str) -> Option<u32> {
-    std::fs::read_dir(text_dir)
-        .ok()?
-        .filter_map(|e| {
-            let e = e.ok()?;
-            if !e.file_type().ok()?.is_dir() {
-                return None;
-            }
-
-            let name = e.file_name().to_string_lossy().into_owned();
-            current_slot_num_from_name(&name, lang)
-        })
-        .max()
-}
-
-fn is_slot_dir_name_for_lang(name: &str, lang: &str) -> bool {
-    compatible_slot_num_from_name(name, lang).is_some()
-}
-
-fn current_slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
-    let (prefix, suffix) = name.rsplit_once('_')?;
-    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-
-    let is_current_lang_slot = !lang.is_empty() && prefix == lang;
-
-    if is_current_lang_slot {
-        suffix.parse::<u32>().ok()
-    } else if lang.is_empty()
-        && !prefix.is_empty()
-        && prefix
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        suffix.parse::<u32>().ok()
-    } else {
-        None
-    }
-}
-
-fn compatible_slot_num_from_name(name: &str, lang: &str) -> Option<u32> {
-    let current = current_slot_num_from_name(name, lang);
-    if current.is_some() {
-        return current;
-    }
-
-    let (prefix, suffix) = name.rsplit_once('_')?;
-    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-
-    let is_legacy_slot = prefix == "S" && suffix.len() == 4;
-    if !lang.is_empty() && is_legacy_slot {
-        suffix.parse::<u32>().ok()
-    } else {
-        None
-    }
-}
-
-fn find_slot_ancestor(path: &Path, lang: &str) -> Option<PathBuf> {
-    path.ancestors()
-        .filter(|ancestor| {
-            ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| is_slot_dir_name_for_lang(name, lang))
-        })
-        .last()
-        .map(Path::to_path_buf)
-}
-
-pub fn dict_slot_matches_target(slot: &Path, target_lang: &str) -> bool {
-    let target_lang = target_lang.trim();
-    if target_lang.is_empty() {
-        return false;
-    }
-
-    slot.ancestors().any(|candidate| {
-        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        if compatible_slot_num_from_name(name, target_lang).is_none() {
-            return false;
-        }
-
-        let Some(text_dir) = candidate.parent() else {
-            return false;
-        };
-        let Some(lang_dir) = text_dir.parent() else {
-            return false;
-        };
-        let Some(dicts_dir) = lang_dir.parent() else {
-            return false;
-        };
-
-        text_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.eq_ignore_ascii_case("text"))
-            .unwrap_or(false)
-            && lang_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name == target_lang)
-                .unwrap_or(false)
-            && dicts_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.eq_ignore_ascii_case("dicts"))
-                .unwrap_or(false)
-    })
-}
-
-pub fn is_slot_dir(p: &Path) -> bool {
-    let parent_is_text = p
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .map(|name| name.eq_ignore_ascii_case("text"))
-        .unwrap_or(false);
-
-    parent_is_text
-        && p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|name| compatible_slot_num_from_name(name, "").is_some())
-            .unwrap_or(false)
-}
-
-fn find_existing_slot_under(container: &Path, lang: &str) -> Option<PathBuf> {
-    find_slot_ancestor(container, lang)
-}
-
-pub fn provision_slot_under(container: &Path, lang: &str) -> PathBuf {
-    if let Some(existing_slot) = find_existing_slot_under(container, lang) {
-        let _ = std::fs::create_dir_all(&existing_slot);
-        return existing_slot;
-    }
-
-    let _ = std::fs::create_dir_all(container);
-    if let Some(max) = max_existing_slot_num(container, lang) {
-        let next_num = max + 1;
-        let slot = container.join(format!("{}_{:03}", lang, next_num));
-        let _ = std::fs::create_dir_all(&slot);
-        slot
-    } else {
-        let slot = container.join(format!("{}_001", lang));
-        let _ = std::fs::create_dir_all(&slot);
-        slot
-    }
-}
-
-pub fn find_or_create_slot_under(container: &Path, lang: &str) -> PathBuf {
-    provision_slot_under(container, lang)
-}
+pub use crate::backend::slot::*;
 
 #[cfg(test)]
 mod tests {
@@ -417,126 +257,6 @@ mod tests {
     }
 }
 
-pub fn create_new_slot(tgt_lang: &str, base_dir: &PathBuf) -> PathBuf {
-    let text_dir = base_dir.join("dicts").join(tgt_lang).join("text");
-    let _ = std::fs::create_dir_all(&text_dir);
-    let next_num = max_existing_slot_num(&text_dir, tgt_lang)
-        .map(|n| n + 1)
-        .unwrap_or(1);
-    let slot = text_dir.join(format!("{}_{:03}", tgt_lang, next_num));
-    let _ = std::fs::create_dir_all(&slot);
-    slot
-}
-
-/// Resolve the dict_slot authority for a target language.
-///
-/// When an existing committed slot matches the target language, it is reused.
-/// Otherwise, a new slot is created for the target.
-/// The caller is responsible for downstream commit; this function does not save.
-pub fn resolve_lang_pair_dict_slot(
-    dict_slot: Option<&str>,
-    target_lang: &str,
-    base_dir: &PathBuf,
-) -> String {
-    dict_slot
-        .map(str::trim)
-        .filter(|slot| !slot.is_empty())
-        .filter(|slot| dict_slot_matches_target(Path::new(slot), target_lang))
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            create_new_slot(target_lang, base_dir)
-                .to_string_lossy()
-                .to_string()
-        })
-}
-
-fn resolve_explicit_slot_dir(config: &Config) -> Option<PathBuf> {
-    if let Some(slot) = &config.dict_slot {
-        if !slot.is_empty() {
-            return Some(PathBuf::from(slot));
-        }
-    }
-    None
-}
-
-pub fn provision_slot_dir(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    if let Some(p) = resolve_explicit_slot_dir(config) {
-        let _ = std::fs::create_dir_all(&p);
-        return p;
-    }
-
-    let text_dir = base_dir.join("dicts").join(&config.tgt_lang).join("text");
-    provision_slot_under(&text_dir, &config.tgt_lang)
-}
-
-pub fn resolve_slot_dir(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    if resolve_explicit_slot_dir(config).is_none() {
-        log::error!(
-            "[manager] dict_slot が未確定のまま resolve_slot_dir が呼ばれました。preflight が通っていない可能性があります。tgt_lang={}",
-            config.tgt_lang
-        );
-    }
-    provision_slot_dir(config, base_dir)
-}
-
-pub fn get_exact_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    resolve_slot_dir(config, base_dir).join("Tenuki.dict.txt")
-}
-
-pub fn get_regex_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    resolve_slot_dir(config, base_dir).join("Tenuki.regex.txt")
-}
-
-pub fn get_split_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    resolve_slot_dir(config, base_dir).join("Tenuki.split.txt")
-}
-
-pub fn get_dict_path(config: &Config, base_dir: &PathBuf) -> PathBuf {
-    get_exact_dict_path(config, base_dir)
-}
-
-/// dict.bin は常に起動時に再生成されるため dicts/ 直下に1つだけ置く
-pub fn get_bin_path(_config: &Config, base_dir: &PathBuf) -> PathBuf {
-    let dir = base_dir.join("dicts");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("dict.bin")
-}
-
-fn is_port_open(port: u16) -> bool {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
-}
-
-fn is_local_llama_host(host: &str) -> bool {
-    matches!(host.trim(), "127.0.0.1" | "localhost" | "0.0.0.0" | "")
-}
-
-fn llama_connect_host(host: &str) -> &str {
-    match host.trim() {
-        "" | "0.0.0.0" | "localhost" => "127.0.0.1",
-        other => other,
-    }
-}
-
-fn llama_base_url(host: &str, port: u16) -> String {
-    format!("http://{}:{}", llama_connect_host(host), port)
-}
-
-pub fn get_local_ip() -> String {
-    // シンプルな方法: UDPソケットで外部に接続尝试してローカルIPを取得
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0");
-    match socket {
-        Ok(s) => {
-            // ループバック以外のIPを取得するため、外部アドレスに接続尝试
-            let _ = s.connect("8.8.8.8:80");
-            s.local_addr()
-                .map(|addr| addr.ip().to_string())
-                .unwrap_or_else(|_| "127.0.0.1".to_string())
-        }
-        Err(_) => "127.0.0.1".to_string(),
-    }
-}
-
 // ============================================================
 // RestartScope
 // ============================================================
@@ -553,43 +273,10 @@ pub enum RestartScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EngineWaitKind {
-    NormalStartup,
-    ModelSwitch,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EngineWaitPolicy {
-    max_attempts: u32,
-    log_interval_attempts: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-}
-
-impl EngineWaitKind {
-    fn policy(self) -> EngineWaitPolicy {
-        match self {
-            Self::NormalStartup => EngineWaitPolicy {
-                max_attempts: 24,
-                log_interval_attempts: 2,
-                initial_backoff: Duration::from_millis(500),
-                max_backoff: Duration::from_secs(3),
-            },
-            Self::ModelSwitch => EngineWaitPolicy {
-                max_attempts: 12,
-                log_interval_attempts: 1,
-                initial_backoff: Duration::from_millis(500),
-                max_backoff: Duration::from_secs(3),
-            },
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::NormalStartup => "normal startup",
-            Self::ModelSwitch => "model switch",
-        }
-    }
+enum LifecycleOp {
+    Stop,
+    SleepMs(u64),
+    Start(EngineWaitKind),
 }
 
 // ============================================================
@@ -597,12 +284,10 @@ impl EngineWaitKind {
 // ============================================================
 
 pub struct ProcessManager {
+    engine: EngineManager,
     config: Config,
-    /// llama-server 起動条件（launcher_config.toml 由来・唯一の権威）
-    server_cfg: ServerConfig,
     base_dir: PathBuf,
     dictionary: Arc<RwLock<Dictionary>>,
-    llama_process: Option<LlamaProcess>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
     server_shutdown_tx: Option<Vec<tokio::sync::oneshot::Sender<()>>>,
     server_runtime: Runtime,
@@ -613,205 +298,15 @@ pub struct ProcessManager {
     t_cache: Arc<TranslationCache>,
     n_cache: Arc<NewEntriesCache>,
     input_replay: SharedInputReplayState,
-    pub ctx_size: u32,
-    pub selected_model: Option<PathBuf>,
     pub server_port: u16,
-    llm_slots: usize,
     /// 起動中フラグ（再起動時の重複防止）
     starting: bool,
-    shutdown: Arc<AtomicBool>,
     #[cfg(target_os = "windows")]
     pdh: Option<pdh_vram::PdhQuery>,
 }
 
-// ============================================================
-// ヘルパー関数
-// ============================================================
-
-/// base_dir から llama-server 実行ファイルを探す。
-/// launcher_config.toml の backend が権威。対応 runtime/<backend>/ のみを探索する。
-/// backend に対応する runtime が存在しない場合は None を返す（起動失敗）。
-fn find_llama_exe(base_dir: &Path) -> Option<PathBuf> {
-    let install_root = crate::launcher::resolve_install_root();
-    let launcher_config_path = install_root.join("launcher_config.toml");
-    let config = crate::launcher::app_config::AppConfig::load(&launcher_config_path).ok()?;
-    let backend = config.backend;
-
-    let backend_dir = base_dir.join("runtime").join(&backend);
-    if !crate::launcher::runtime_downloader::runtime_is_complete(&backend_dir, &backend) {
-        return None;
-    }
-    crate::launcher::runtime_downloader::find_llama_server_exe(&backend_dir)
-}
-
-fn emit_engine_wait_notice(
-    event_tx: &mpsc::Sender<BackendEvent>,
-    ui_lang: &str,
-    kind: EngineWaitKind,
-    attempt: u32,
-    status_en: &str,
-    status_ja: &str,
-) {
-    let status = if ui_lang == "en" {
-        status_en
-    } else {
-        status_ja
-    };
-    let msg = format!("llama-server {}: {} ({})", kind.label(), status, attempt);
-    let _ = event_tx.send(BackendEvent::Log(
-        LogSource::Tenuki,
-        msg,
-        LogLevel::Info,
-        crate::messages::current_timestamp(),
-    ));
-}
-
-fn parse_metric_value(body: &str, metric_name: &str) -> Option<f32> {
-    body.lines().find_map(|line| {
-        if line.starts_with('#') {
-            return None;
-        }
-
-        let (name, value) = line.split_once(' ')?;
-        if name == metric_name {
-            return value.trim().parse::<f32>().ok();
-        }
-
-        None
-    })
-}
-
 #[cfg(target_os = "windows")]
-mod pdh_vram {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::Performance::{
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-        PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE,
-    };
-
-    pub struct PdhQuery {
-        query: isize,
-        dedicated_counter: isize,
-        shared_counter: Option<isize>,
-    }
-
-    impl PdhQuery {
-        pub fn open() -> Option<Self> {
-            unsafe {
-                let mut query: isize = 0;
-                if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
-                    return None;
-                }
-
-                let dedicated_path: Vec<u16> = "\\GPU Adapter Memory(*)\\Dedicated Usage\0"
-                    .encode_utf16()
-                    .collect();
-                let shared_path: Vec<u16> = "\\GPU Adapter Memory(*)\\Shared Usage\0"
-                    .encode_utf16()
-                    .collect();
-
-                let mut dedicated_counter: isize = 0;
-                if PdhAddEnglishCounterW(
-                    query,
-                    PCWSTR::from_raw(dedicated_path.as_ptr()),
-                    0,
-                    &mut dedicated_counter,
-                ) != 0
-                {
-                    PdhCloseQuery(query);
-                    return None;
-                }
-
-                let mut shared_counter: isize = 0;
-                let shared_counter = if PdhAddEnglishCounterW(
-                    query,
-                    PCWSTR::from_raw(shared_path.as_ptr()),
-                    0,
-                    &mut shared_counter,
-                ) == 0
-                {
-                    Some(shared_counter)
-                } else {
-                    None
-                };
-
-                let _ = PdhCollectQueryData(query);
-
-                Some(Self {
-                    query,
-                    dedicated_counter,
-                    shared_counter,
-                })
-            }
-        }
-
-        fn collect_counter_mb(&self, counter: isize) -> Option<f32> {
-            unsafe {
-                if PdhCollectQueryData(self.query) != 0 {
-                    return None;
-                }
-
-                let mut buffer_size: u32 = 0;
-                let mut item_count: u32 = 0;
-
-                let _ = PdhGetFormattedCounterArrayW(
-                    counter,
-                    PDH_FMT_LARGE,
-                    &mut buffer_size,
-                    &mut item_count,
-                    None,
-                );
-
-                if buffer_size == 0 || item_count == 0 {
-                    return None;
-                }
-
-                let mut buffer = vec![0u8; buffer_size as usize];
-                if PdhGetFormattedCounterArrayW(
-                    counter,
-                    PDH_FMT_LARGE,
-                    &mut buffer_size,
-                    &mut item_count,
-                    Some(buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W),
-                ) != 0
-                {
-                    return None;
-                }
-
-                let items = std::slice::from_raw_parts(
-                    buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
-                    item_count as usize,
-                );
-
-                let bytes = items
-                    .iter()
-                    .map(|item| item.FmtValue.Anonymous.largeValue)
-                    .max()
-                    .unwrap_or(0)
-                    .max(0) as f32;
-
-                Some(bytes / (1024.0 * 1024.0))
-            }
-        }
-
-        pub fn collect_dedicated_mb(&self) -> Option<f32> {
-            self.collect_counter_mb(self.dedicated_counter)
-        }
-
-        pub fn collect_shared_mb(&self) -> Option<f32> {
-            self.shared_counter
-                .and_then(|counter| self.collect_counter_mb(counter))
-        }
-    }
-
-    impl Drop for PdhQuery {
-        fn drop(&mut self) {
-            unsafe {
-                PdhCloseQuery(self.query);
-            }
-        }
-    }
-}
+use crate::backend::pdh_vram;
 
 impl ProcessManager {
     fn emit_rebuilt_input_snapshot(&self, mark_result_stale: bool) {
@@ -862,6 +357,7 @@ impl ProcessManager {
                 || self.config.tgt_lang != new_config.tgt_lang
                 || self.config.custom_lang_name != new_config.custom_lang_name;
             self.server_port = new_config.server_port;
+            self.engine.set_ui_lang(new_config.ui_lang.clone());
             self.config = new_config;
 
             if dict_changed {
@@ -874,197 +370,8 @@ impl ProcessManager {
         }
     }
 
-    fn wait_for_port_closed(&self, port: u16, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            if !is_port_open(port) {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        !is_port_open(port)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn terminate_stray_llama_server(&self) -> bool {
-        use std::os::windows::process::CommandExt;
-        match Command::new("taskkill")
-            .args(["/IM", "llama-server.exe", "/F"])
-            .creation_flags(0x08000000)
-            .status()
-        {
-            Ok(status) => status.success(),
-            Err(_) => false,
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn terminate_stray_llama_server(&self) -> bool {
-        false
-    }
-
-    fn has_live_llama_process(&mut self) -> bool {
-        if !is_local_llama_host(&self.server_cfg.host) {
-            return self.check_remote_llama_endpoint();
-        }
-
-        let is_alive = self
-            .llama_process
-            .as_mut()
-            .map(|proc| proc.is_alive())
-            .unwrap_or(false);
-
-        if !is_alive && self.llama_process.is_some() {
-            self.llama_process = None;
-            let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-                ProcessType::InferenceEngine,
-                false,
-            ));
-        }
-
-        is_alive
-    }
-
     fn llama_base_url(&self) -> String {
-        llama_base_url(&self.server_cfg.host, self.server_cfg.port)
-    }
-
-    fn check_remote_llama_endpoint(&self) -> bool {
-        let health_url = format!("{}/health", self.llama_base_url());
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(500))
-            .timeout_read(Duration::from_secs(2))
-            .build();
-
-        let alive = agent
-            .get(&health_url)
-            .call()
-            .ok()
-            .is_some_and(|response| response.status() == 200);
-
-        let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-            ProcessType::InferenceEngine,
-            alive,
-        ));
-        alive
-    }
-
-    /// Normal startup waits are intentionally shorter than setup verification.
-    /// Setup still uses AppLauncher::test_backend_exe and its long verification path.
-    fn wait_for_llama_server(&mut self, kind: EngineWaitKind) -> bool {
-        let policy = kind.policy();
-        let connect_host = llama_connect_host(&self.server_cfg.host);
-        let addr: SocketAddr = format!("{}:{}", connect_host, self.server_cfg.port)
-            .parse()
-            .unwrap();
-        let health_url = format!(
-            "{}/health",
-            llama_base_url(&self.server_cfg.host, self.server_cfg.port)
-        );
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(500))
-            .timeout_read(Duration::from_secs(5))
-            .build();
-
-        let mut backoff = policy.initial_backoff;
-        emit_engine_wait_notice(
-            &self.event_tx,
-            &self.config.ui_lang,
-            kind,
-            0,
-            "starting",
-            "開始中",
-        );
-
-        for attempt in 0..policy.max_attempts {
-            if self.shutdown.load(Ordering::Relaxed) {
-                return false;
-            }
-
-            let display_attempt = attempt + 1;
-            if !self.has_live_llama_process() {
-                emit_engine_wait_notice(
-                    &self.event_tx,
-                    &self.config.ui_lang,
-                    kind,
-                    display_attempt,
-                    "process exited",
-                    "プロセスが終了しました",
-                );
-                return false;
-            }
-
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
-                if attempt % policy.log_interval_attempts == 0 {
-                    emit_engine_wait_notice(
-                        &self.event_tx,
-                        &self.config.ui_lang,
-                        kind,
-                        display_attempt,
-                        "waiting for port",
-                        "ポート待機中",
-                    );
-                }
-                thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, policy.max_backoff);
-                continue;
-            }
-
-            match agent.get(&health_url).call() {
-                Ok(response) if response.status() == 200 => {
-                    let is_ok = response
-                        .into_string()
-                        .map(|s| s.contains("\"ok\""))
-                        .unwrap_or(true);
-                    if is_ok {
-                        return true;
-                    }
-                    emit_engine_wait_notice(
-                        &self.event_tx,
-                        &self.config.ui_lang,
-                        kind,
-                        display_attempt,
-                        "loading model",
-                        "モデルロード中",
-                    );
-                }
-                Ok(_) => {
-                    emit_engine_wait_notice(
-                        &self.event_tx,
-                        &self.config.ui_lang,
-                        kind,
-                        display_attempt,
-                        "loading model",
-                        "モデルロード中",
-                    );
-                }
-                Err(_) => {
-                    if attempt % policy.log_interval_attempts == 0 {
-                        emit_engine_wait_notice(
-                            &self.event_tx,
-                            &self.config.ui_lang,
-                            kind,
-                            display_attempt,
-                            "waiting for health",
-                            "health待機中",
-                        );
-                    }
-                }
-            }
-
-            thread::sleep(backoff);
-            backoff = std::cmp::min(backoff * 2, policy.max_backoff);
-        }
-
-        emit_engine_wait_notice(
-            &self.event_tx,
-            &self.config.ui_lang,
-            kind,
-            policy.max_attempts,
-            "timeout",
-            "タイムアウト",
-        );
-        false
+        self.engine.llama_base_url()
     }
 
     pub fn new(
@@ -1098,11 +405,19 @@ impl ProcessManager {
             bin_file,
             event_tx.clone(),
         )));
-        let ctx_size = server_cfg.ctx_size;
-        let llm_slots = server_cfg.parallel_slots.max(1) as usize;
+
+        let engine = EngineManager::new(
+            server_cfg.clone(),
+            base_dir.clone(),
+            event_tx.clone(),
+            selected_model,
+            shutdown,
+            config.ui_lang.clone(),
+        );
+
         let llm_client = Arc::new(HttpLlmClient::new(format!(
             "{}/chat/completions",
-            llama_base_url(&server_cfg.host, server_cfg.port)
+            engine::llama_base_url(&server_cfg.host, server_cfg.port)
         )));
         let server_runtime = Runtime::new().expect("Failed to create Tokio runtime");
         let initial_server_port = config.server_port;
@@ -1110,11 +425,10 @@ impl ProcessManager {
         let pdh = pdh_vram::PdhQuery::open();
 
         Self {
+            engine,
             config,
-            server_cfg,
             base_dir,
             dictionary,
-            llama_process: None,
             server_handle: None,
             server_shutdown_tx: None,
             server_runtime,
@@ -1125,76 +439,35 @@ impl ProcessManager {
             t_cache: Arc::new(TranslationCache::default()),
             n_cache: Arc::new(NewEntriesCache::default()),
             input_replay,
-            ctx_size,
-            selected_model,
             server_port: initial_server_port,
-            llm_slots,
             starting: false,
-            shutdown,
             #[cfg(target_os = "windows")]
             pdh,
         }
     }
 
     pub fn is_engine_running(&self) -> bool {
-        self.llama_process.is_some()
+        self.engine.is_engine_running()
     }
 
     pub fn is_translation_server_running(&self) -> bool {
         self.server_handle.is_some()
     }
 
-    fn dedicated_vram_mb(&self) -> Option<f32> {
-        #[cfg(target_os = "windows")]
-        {
-            return self
-                .pdh
-                .as_ref()
-                .and_then(|query| query.collect_dedicated_mb());
-        }
+    pub fn set_selected_model(&mut self, model: Option<PathBuf>) {
+        self.engine.set_selected_model(model);
+    }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            None
-        }
+    fn dedicated_vram_mb(&self) -> Option<f32> {
+        crate::backend::metrics::dedicated_vram_mb(&self.pdh)
     }
 
     fn shared_memory_mb(&self) -> Option<f32> {
-        #[cfg(target_os = "windows")]
-        {
-            return self
-                .pdh
-                .as_ref()
-                .and_then(|query| query.collect_shared_mb());
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            None
-        }
+        crate::backend::metrics::shared_memory_mb(&self.pdh)
     }
 
-    /// llama-server の /metrics から tokens/s を取得する。
     pub fn poll_metrics(&self) -> Option<(Option<f32>, Option<f32>, Option<f32>)> {
-        if self.llama_process.is_none() {
-            return None;
-        }
-
-        let vram_mb = self.dedicated_vram_mb();
-        let shared_mb = self.shared_memory_mb();
-        let metrics_url = format!("{}/metrics", self.llama_base_url());
-        let tokens_per_second = ureq::get(&metrics_url)
-            .timeout(Duration::from_millis(500))
-            .call()
-            .ok()
-            .and_then(|response| response.into_string().ok())
-            .and_then(|body| parse_metric_value(&body, "llamacpp:predicted_tokens_seconds"));
-
-        if tokens_per_second.is_none() && vram_mb.is_none() && shared_mb.is_none() {
-            return None;
-        }
-
-        Some((tokens_per_second, vram_mb, shared_mb))
+        crate::backend::metrics::poll_metrics(self.engine.is_engine_running(), &self.llama_base_url(), &self.pdh)
     }
 
     pub fn set_game_text_options(&mut self, options: GameTextOptions) {
@@ -1228,6 +501,23 @@ impl ProcessManager {
         self.reload_config_internal(config_path, false);
     }
 
+    fn lifecycle_sequence(&mut self, ops: &[LifecycleOp]) {
+        for op in ops {
+            match op {
+                LifecycleOp::Stop => {
+                    self.stop_translation_server();
+                    self.engine.stop_llama_server();
+                }
+                LifecycleOp::SleepMs(ms) => {
+                    thread::sleep(Duration::from_millis(*ms));
+                }
+                LifecycleOp::Start(wait_kind) => {
+                    self.start_all_with_wait_kind(*wait_kind);
+                }
+            }
+        }
+    }
+
     pub fn start_all(&mut self) {
         self.start_all_with_wait_kind(EngineWaitKind::NormalStartup);
     }
@@ -1239,10 +529,10 @@ impl ProcessManager {
 
         self.starting = true;
 
-        let engine_success = if self.has_live_llama_process() {
+        let engine_success = if self.engine.has_live_llama_process() {
             true
         } else {
-            self.start_llama_server(wait_kind)
+            self.engine.start_llama_server(wait_kind)
         };
 
         let translator_success = if engine_success {
@@ -1275,21 +565,22 @@ impl ProcessManager {
     }
 
     pub fn restart_for_model_switch(&mut self) {
-        self.stop_all();
-        self.start_all_with_wait_kind(EngineWaitKind::ModelSwitch);
+        self.lifecycle_sequence(&[
+            LifecycleOp::Stop,
+            LifecycleOp::Start(EngineWaitKind::ModelSwitch),
+        ]);
     }
 
     pub fn stop_all(&mut self) {
-        self.stop_translation_server();
-        self.stop_llama_server();
-        thread::sleep(Duration::from_millis(500));
+        self.lifecycle_sequence(&[LifecycleOp::Stop, LifecycleOp::SleepMs(500)]);
     }
 
     pub fn restart_all(&mut self) {
-        self.stop_all();
-        // 完全に停止してから起動
-        thread::sleep(Duration::from_millis(1000));
-        self.start_all();
+        self.lifecycle_sequence(&[
+            LifecycleOp::Stop,
+            LifecycleOp::SleepMs(1000),
+            LifecycleOp::Start(EngineWaitKind::NormalStartup),
+        ]);
     }
 
     /// 設定変更後の再起動を scope に従って実行する。
@@ -1360,7 +651,7 @@ impl ProcessManager {
     }
 
     pub fn check_alive(&mut self) {
-        let engine_alive = self.has_live_llama_process();
+        let engine_alive = self.engine.has_live_llama_process();
 
         let server_finished = self
             .server_handle
@@ -1387,123 +678,6 @@ impl ProcessManager {
 
     // ----------------------------------------------------------
 
-    fn start_llama_server(&mut self, wait_kind: EngineWaitKind) -> bool {
-        if self.has_live_llama_process() {
-            return true;
-        }
-
-        if !is_local_llama_host(&self.server_cfg.host) {
-            return self.check_remote_llama_endpoint();
-        }
-
-        let model = match self.resolve_model() {
-            Some(m) => m,
-            None => {
-                let msg = if self.config.ui_lang == "en" {
-                    "No startup model could be resolved. Select a model from the list.".to_string()
-                } else {
-                    "models/ ディレクトリにモデルファイルが見つかりません".to_string()
-                };
-                let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki,
-                    msg,
-                    LogLevel::Error,
-                    crate::messages::current_timestamp(),
-                ));
-                return false;
-            }
-        };
-
-        let exe = match find_llama_exe(&self.base_dir) {
-            Some(e) => e,
-            None => {
-                let msg = if self.config.ui_lang == "en" {
-                    "llama-server executable not found".to_string()
-                } else {
-                    "llama-server 実行ファイルが見つかりません".to_string()
-                };
-                let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki,
-                    msg,
-                    LogLevel::Error,
-                    crate::messages::current_timestamp(),
-                ));
-                return false;
-            }
-        };
-
-        if is_port_open(self.server_cfg.port) {
-            if !self.terminate_stray_llama_server()
-                || !self.wait_for_port_closed(self.server_cfg.port, Duration::from_secs(5))
-            {
-                return false;
-            }
-        }
-
-        match LlamaProcess::start(
-            &exe,
-            &model,
-            self.server_cfg.ngl,
-            self.ctx_size,
-            self.llm_slots.max(1) as u32,
-            self.server_cfg.port,
-            &self.server_cfg.extra_args,
-            self.event_tx.clone(),
-        ) {
-            Ok(proc) => {
-                self.llama_process = Some(proc);
-                let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-                    ProcessType::InferenceEngine,
-                    true,
-                ));
-                if self.wait_for_llama_server(wait_kind) {
-                    self.selected_model = Some(model);
-                    return true;
-                }
-                self.stop_llama_server();
-            }
-            Err(e) => {
-                let msg = if self.config.ui_lang == "en" {
-                    format!("Failed to launch inference engine: {e}")
-                } else {
-                    format!("推論エンジンの起動に失敗しました: {e}")
-                };
-                let _ = self.event_tx.send(BackendEvent::Log(
-                    LogSource::Tenuki,
-                    msg,
-                    LogLevel::Error,
-                    crate::messages::current_timestamp(),
-                ));
-                return false;
-            }
-        }
-
-        false
-    }
-
-    fn stop_llama_server(&mut self) {
-        if !is_local_llama_host(&self.server_cfg.host) {
-            let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-                ProcessType::InferenceEngine,
-                false,
-            ));
-            return;
-        }
-
-        let port = self.server_cfg.port;
-        if let Some(mut proc) = self.llama_process.take() {
-            proc.stop();
-        }
-        if is_port_open(port) {
-            let _ = self.terminate_stray_llama_server();
-            let _ = self.wait_for_port_closed(port, Duration::from_secs(5));
-        }
-        let _ = self.event_tx.send(BackendEvent::ProcessStatus(
-            ProcessType::InferenceEngine,
-            false,
-        ));
-    }
-
     fn start_translation_server(&mut self) -> bool {
         if self.server_handle.is_some() {
             return true;
@@ -1526,7 +700,7 @@ impl ProcessManager {
         let t_cache = self.t_cache.clone();
         let n_cache = self.n_cache.clone();
         let input_replay = self.input_replay.clone();
-        let llm_slots = self.llm_slots.max(1);
+        let llm_slots = self.engine.llm_slots().max(1);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -1682,8 +856,8 @@ impl ProcessManager {
 
         // ポートが解放されるまで待つ（最大5秒）
         let port = self.server_port;
-        if is_port_open(port) {
-            let closed = self.wait_for_port_closed(port, Duration::from_secs(5));
+        if engine::is_port_open(port) {
+            let closed = engine::wait_for_port_closed(port, Duration::from_secs(5));
             if !closed {
                 let _ = self.event_tx.send(BackendEvent::Log(
                     LogSource::Tenuki,
@@ -1698,17 +872,6 @@ impl ProcessManager {
         }
 
         backend_info!(self.event_tx, "Translation server stopped");
-    }
-
-    /// 権威モデルパスを返す。selected_model（= launcher_config.toml の authority filename）が
-    /// 存在しない場合は None。他の .gguf への fallback は行わない。
-    fn resolve_model(&self) -> Option<PathBuf> {
-        let m = self.selected_model.as_ref()?;
-        if m.exists() {
-            Some(m.clone())
-        } else {
-            None
-        }
     }
 }
 

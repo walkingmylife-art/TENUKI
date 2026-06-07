@@ -10,11 +10,15 @@
 
 mod analysis;
 mod dictionary;
+pub(crate) mod engine;
 mod logger;
 pub mod manager;
+pub(crate) mod metrics;
 mod normalize;
+pub(crate) mod pdh_vram;
 pub(crate) mod process;
 mod server;
+pub(crate) mod slot;
 pub mod translator;
 
 use std::path::PathBuf;
@@ -226,7 +230,7 @@ pub fn start_backend(
                                     ));
                                     manager.check_alive();
                                     let engine_was_running = manager.is_engine_running();
-                                    manager.selected_model = selected;
+                                    manager.set_selected_model(selected);
 
                                     let title = if ui_lang == "en" {
                                         "Model selected".to_string()

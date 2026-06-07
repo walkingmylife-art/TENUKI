@@ -6,4 +6,5 @@ pub mod fonts;
 pub mod list_text;
 pub mod normal;
 pub mod normal_text;
+pub(crate) mod panels;
 pub mod work_result_text;

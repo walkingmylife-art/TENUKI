@@ -1,4 +1,4 @@
-// src/launcher/launcher_ui.rs
+// src/launcher/setup_ui.rs
 
 use eframe::egui::{self, CentralPanel, Context, ProgressBar};
 use std::sync::atomic::{AtomicBool, Ordering};

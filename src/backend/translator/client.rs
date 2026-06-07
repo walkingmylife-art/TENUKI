@@ -2,7 +2,6 @@
 
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// LLMクライアントトレイト
 pub trait LlmClient: Send + Sync {
@@ -13,8 +12,7 @@ pub trait LlmClient: Send + Sync {
 #[derive(Clone)]
 pub struct HttpLlmClient {
     endpoint: Arc<String>,
-    timeout_connect: Duration,
-    timeout_read: Duration,
+    agent: ureq::Agent,
 }
 
 fn build_translation_message(prefix: &str, text: &str) -> String {
@@ -29,8 +27,7 @@ impl HttpLlmClient {
     pub fn new(endpoint: String) -> Self {
         Self {
             endpoint: Arc::new(endpoint),
-            timeout_connect: Duration::from_secs(10),
-            timeout_read: Duration::from_secs(60),
+            agent: ureq::Agent::new(),
         }
     }
 
@@ -40,11 +37,6 @@ impl HttpLlmClient {
         }
 
         let prompt = build_translation_message(prefix, text);
-
-        let client = ureq::AgentBuilder::new()
-            .timeout_connect(self.timeout_connect)
-            .timeout_read(self.timeout_read)
-            .build();
 
         let payload = json!({
             "messages": [
@@ -58,7 +50,7 @@ impl HttpLlmClient {
             "cache_prompt": true
         });
 
-        match client.post(self.endpoint.as_str()).send_json(payload) {
+        match self.agent.post(self.endpoint.as_str()).send_json(payload) {
             Ok(resp) => {
                 let body = resp.into_string().unwrap_or_default();
                 serde_json::from_str::<serde_json::Value>(&body)
